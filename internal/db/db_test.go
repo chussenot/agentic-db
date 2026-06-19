@@ -8,8 +8,8 @@ import (
 	"github.com/zor/claude-status/internal/state"
 )
 
-func newInt(i int64) sql.NullInt64    { return sql.NullInt64{Int64: i, Valid: true} }
-func newStr(s string) sql.NullString  { return sql.NullString{String: s, Valid: true} }
+func newInt(i int64) sql.NullInt64   { return sql.NullInt64{Int64: i, Valid: true} }
+func newStr(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
 
 func TestOpenUpsertGetDelete(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "claude.sqlite")
