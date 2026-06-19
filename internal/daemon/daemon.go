@@ -277,7 +277,7 @@ func (d *daemon) pollTick(ctx context.Context, out chan<- struct{}) {
 // goroutine (reads the model safely). The reaped rows vanish from the next DB
 // snapshot, which clears their dots via the normal reconcile path.
 func (d *daemon) gc() {
-	pred := deadPredicate(d.model, db.Now())
+	pred := deadPredicate(d.model)
 	if n, err := d.db.ReapDead(pred); err != nil {
 		logf("gc: %v", err)
 	} else if n > 0 {

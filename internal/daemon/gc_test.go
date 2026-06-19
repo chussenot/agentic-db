@@ -3,7 +3,6 @@ package daemon
 import (
 	"database/sql"
 	"testing"
-	"time"
 
 	"github.com/mrzor/claude-status/internal/db"
 )
@@ -13,8 +12,8 @@ type presenceSet map[int]bool
 
 func (p presenceSet) HasWindow(id int) bool { return p[id] }
 
-func gcSess(windowID, termPID int, lastSeen int64) db.Session {
-	s := db.Session{LastSeenTS: lastSeen}
+func gcSess(windowID, termPID int) db.Session {
+	var s db.Session
 	if windowID >= 0 {
 		s.WindowID = sql.NullInt64{Int64: int64(windowID), Valid: true}
 	}
@@ -25,10 +24,6 @@ func gcSess(windowID, termPID int, lastSeen int64) db.Session {
 }
 
 func TestDeadPredicate(t *testing.T) {
-	now := time.UnixMilli(1_000_000_000_000)
-	freshSeen := now.UnixMilli()
-	staleSeen := now.Add(-2 * staleThreshold).UnixMilli()
-
 	// Stub /proc existence: pids in this set are "alive".
 	alive := map[int]bool{42: true, 43: true}
 	orig := procExists
@@ -43,38 +38,39 @@ func TestDeadPredicate(t *testing.T) {
 		dead bool
 	}{
 		{
-			name: "live: known window, live pid, fresh heartbeat",
-			s:    gcSess(100, 42, freshSeen),
+			name: "live: known window + live pid",
+			s:    gcSess(100, 42),
 			dead: false,
 		},
 		{
-			name: "dead: window absent from model",
-			s:    gcSess(101, 42, freshSeen),
+			name: "dead: window closed (absent from model)",
+			s:    gcSess(101, 42),
 			dead: true,
 		},
 		{
 			name: "dead: terminal pid gone",
-			s:    gcSess(100, 999, freshSeen),
+			s:    gcSess(100, 999),
 			dead: true,
 		},
 		{
-			name: "dead: stale heartbeat (kill -9 net)",
-			s:    gcSess(100, 42, staleSeen),
-			dead: true,
-		},
-		{
-			name: "remote: no window, no pid, fresh -> alive",
-			s:    gcSess(-1, -1, freshSeen),
+			// The whole point of the simplification: a live local session is NOT
+			// reaped no matter how long it has been quiet (idle Claudes emit no
+			// hooks and must be allowed to fade fully).
+			name: "live: known window + live pid, quiet forever -> still alive",
+			s:    gcSess(100, 42),
 			dead: false,
 		},
 		{
-			name: "remote: no window, no pid, stale -> reaped",
-			s:    gcSess(-1, -1, staleSeen),
-			dead: true,
+			// Unresolved (neither window nor pid) shouldn't happen for a local
+			// session, but if it does it's untrackable and invisible (maps to no
+			// workspace) — never reaped here; SessionEnd clears it on clean exit.
+			name: "unresolved: no window, no pid -> not reaped",
+			s:    gcSess(-1, -1),
+			dead: false,
 		},
 	}
 
-	pred := deadPredicate(model, now)
+	pred := deadPredicate(model)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := pred(tt.s); got != tt.dead {
