@@ -1,2 +1,47 @@
 [tools]
 go = "1.26.4"
+
+[tasks.build]
+description = "Build the static claude-status binary to ./claude-status"
+run = "CGO_ENABLED=0 go build -o claude-status ."
+
+[tasks.install]
+description = "Build, install to ~/.local/bin, and flip a running daemon to the new build"
+depends = ["build"]
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+dest="$HOME/.local/bin/claude-status"
+log="$HOME/.local/state/claude-status/daemon.log"
+mkdir -p "$HOME/.local/bin" "$HOME/.local/state/claude-status"
+
+# Atomic replace: copy then rename over $dest. rename swaps the directory entry,
+# so it is safe even if a daemon is currently exec'ing the old inode (no ETXTBSY).
+cp claude-status "$dest.tmp"
+chmod 0755 "$dest.tmp"
+mv -f "$dest.tmp" "$dest"
+echo "installed -> $dest"
+
+# Find a running daemon by its argv via /proc (NOT the process list), so this
+# never matches the task's own shell. Transient `hook` invocations are skipped.
+daemon_pid=""
+for p in $(pgrep -x claude-status 2>/dev/null || true); do
+  if tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q 'claude-status daemon'; then
+    daemon_pid="$p"
+    break
+  fi
+done
+
+if [ -n "$daemon_pid" ]; then
+  kill "$daemon_pid" 2>/dev/null || true
+  # Bounded wait for the old daemon to exit before starting the new one, so they
+  # don't briefly both reconcile. No sleep (keeps it harness-friendly).
+  i=0
+  while kill -0 "$daemon_pid" 2>/dev/null && [ "$i" -lt 5000 ]; do i=$((i + 1)); done
+  setsid bash -c "exec '$dest' daemon >> '$log' 2>&1" </dev/null & disown
+  echo "flipped running daemon (was pid $daemon_pid) -> new build"
+else
+  echo "no daemon running; binary updated (niri spawns it on next start)"
+fi
+'''
