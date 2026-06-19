@@ -39,6 +39,23 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_ts    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_window ON sessions(window_id);
+
+-- events is a bounded append-only audit log: one row per hook invocation,
+-- recording what arrived and what state we derived. The daemon prunes it to a
+-- fixed row count (PruneEvents) so it can never grow unbounded. It exists to
+-- diagnose state drift (e.g. a session stuck in 'prompt') after the fact, since
+-- the sessions table only holds current state.
+CREATE TABLE IF NOT EXISTS events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts          INTEGER NOT NULL,   -- unix ms
+  session_id  TEXT NOT NULL,
+  event       TEXT NOT NULL,      -- hook_event_name as received
+  message     TEXT,               -- Notification message (truncated); NULL otherwise
+  matched     INTEGER,            -- 1/0 = prompt filter matched (Notification only); NULL otherwise
+  new_state   TEXT NOT NULL,      -- resulting state, or 'unchanged' / 'deleted'
+  window_id   INTEGER             -- resolved niri window id at the time, if any
+);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 `
 
 // Session mirrors one row of the sessions table. NULLable columns use the
@@ -72,10 +89,79 @@ type Session struct {
 	CreatedTS int64
 }
 
+// Event is one row of the bounded audit log: a single hook invocation and the
+// state we derived from it. See the events table in schema.
+type Event struct {
+	ID        int64
+	TS        int64          // unix ms
+	SessionID string         // Claude session_id
+	Event     string         // hook_event_name as received
+	Message   sql.NullString // Notification message (truncated); NULL otherwise
+	Matched   sql.NullBool   // prompt filter result (Notification only); NULL otherwise
+	NewState  string         // resulting state, or "unchanged" / "deleted"
+	WindowID  sql.NullInt64  // resolved niri window id at the time, if any
+}
+
 // DB wraps the *sql.DB handle. It is safe for concurrent use (database/sql
 // pools connections); WAL lets readers proceed without blocking the writer.
 type DB struct {
 	sql *sql.DB
+}
+
+// InsertEvent appends one audit row. It is a single short write on the shared
+// handle (no transaction needed — append-only, no read-modify-write). Best
+// effort: callers on the hook hot path log-and-swallow any error.
+func (d *DB) InsertEvent(e Event) error {
+	_, err := d.sql.Exec(`
+INSERT INTO events (ts, session_id, event, message, matched, new_state, window_id)
+VALUES (?,?,?,?,?,?,?)`,
+		e.TS, e.SessionID, e.Event, e.Message, e.Matched, e.NewState, e.WindowID)
+	if err != nil {
+		return fmt.Errorf("insert event: %w", err)
+	}
+	return nil
+}
+
+// RecentEvents returns up to limit audit rows, newest first. When sessionID is
+// non-empty it filters to that session.
+func (d *DB) RecentEvents(limit int, sessionID string) ([]Event, error) {
+	q := `SELECT id, ts, session_id, event, message, matched, new_state, window_id FROM events`
+	args := []any{}
+	if sessionID != "" {
+		q += ` WHERE session_id = ?`
+		args = append(args, sessionID)
+	}
+	q += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := d.sql.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("recent events: %w", err)
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.ID, &e.TS, &e.SessionID, &e.Event, &e.Message,
+			&e.Matched, &e.NewState, &e.WindowID); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// PruneEvents keeps only the newest keep rows, deleting older ones. It returns
+// the number deleted. The daemon calls this on its GC tick so the log stays
+// bounded without burdening the hook hot path.
+func (d *DB) PruneEvents(keep int) (int, error) {
+	res, err := d.sql.Exec(
+		`DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - ?`, keep)
+	if err != nil {
+		return 0, fmt.Errorf("prune events: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 // SQL exposes the underlying *sql.DB for callers (e.g. the daemon) that need

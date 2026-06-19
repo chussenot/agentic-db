@@ -205,6 +205,60 @@ func TestNotificationFiltering(t *testing.T) {
 	}
 }
 
+// recentEvents opens dbPath and returns its audit rows, newest first.
+func recentEvents(t *testing.T, dbPath string) []db.Event {
+	t.Helper()
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer database.Close()
+	evs, err := database.RecentEvents(100, "")
+	if err != nil {
+		t.Fatalf("recent events: %v", err)
+	}
+	return evs
+}
+
+// TestAuditLogCapturesNotification is the regression for the "stuck ? while
+// idle" defect: every hook invocation must leave an audit row, and a Notification
+// that flips the state must record its message + matched=true so we can later
+// see exactly what fired.
+func TestAuditLogCapturesNotification(t *testing.T) {
+	dbPath := tempDBPath(t)
+	fixedClock(t, time.UnixMilli(1_700_000_000_000))
+	drive(t, dbPath, `{"session_id":"s1","hook_event_name":"Stop"}`)
+	fixedClock(t, time.UnixMilli(1_700_000_001_000))
+	drive(t, dbPath, `{"session_id":"s1","hook_event_name":"Notification","message":"Claude is waiting for your input"}`)
+
+	evs := recentEvents(t, dbPath)
+	if len(evs) != 2 {
+		t.Fatalf("audit rows = %d, want 2 (Stop + Notification)", len(evs))
+	}
+	// Newest first: the Notification.
+	n := evs[0]
+	if n.Event != "Notification" {
+		t.Fatalf("newest event = %q, want Notification", n.Event)
+	}
+	if !n.Matched.Valid || !n.Matched.Bool {
+		t.Errorf("matched = %v, want true (idle nudge flipped it to prompt)", n.Matched)
+	}
+	if n.Message.String != "Claude is waiting for your input" {
+		t.Errorf("message = %q, want the nudge text", n.Message.String)
+	}
+	if n.NewState != string(state.Prompt) {
+		t.Errorf("new_state = %q, want prompt", n.NewState)
+	}
+	// The Stop row records the resulting idle state and no message.
+	stop := evs[1]
+	if stop.Event != "Stop" || stop.NewState != string(state.Idle) {
+		t.Errorf("oldest = %q/%q, want Stop/idle", stop.Event, stop.NewState)
+	}
+	if stop.Message.Valid {
+		t.Errorf("Stop should have no message, got %q", stop.Message.String)
+	}
+}
+
 func TestNotificationCaseInsensitive(t *testing.T) {
 	dbPath := tempDBPath(t)
 	fixedClock(t, time.UnixMilli(1_700_000_000_000))

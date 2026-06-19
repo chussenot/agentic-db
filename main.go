@@ -29,6 +29,7 @@ commands:
   gc           run a single dead-session reap pass
   gen-waybar   emit waybar format-icons + style.css fragments
   doctor       dump the DB and live niri windows (debugging)
+  events       print the bounded audit log (--session, --limit)
 `
 
 func main() {
@@ -54,6 +55,8 @@ func main() {
 		err = waybar.Run(args)
 	case "doctor":
 		err = doctor.Run(args)
+	case "events":
+		err = doctor.RunEvents(args)
 	default:
 		fmt.Fprintf(os.Stderr, "claude-status: unknown command %q\n\n", os.Args[1])
 		fmt.Fprint(os.Stderr, usage)

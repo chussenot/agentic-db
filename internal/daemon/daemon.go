@@ -273,15 +273,24 @@ func (d *daemon) pollTick(ctx context.Context, out chan<- struct{}) {
 	}
 }
 
-// gc reaps dead sessions from the DB using the live model. Runs on the actor
-// goroutine (reads the model safely). The reaped rows vanish from the next DB
-// snapshot, which clears their dots via the normal reconcile path.
+// auditKeep is how many audit-log rows the daemon retains. The events table is
+// append-only on the hook hot path; the daemon prunes it here on the GC tick so
+// it stays bounded without burdening hooks.
+const auditKeep = 5000
+
+// gc reaps dead sessions from the DB using the live model, then prunes the audit
+// log. Runs on the actor goroutine (reads the model safely). The reaped rows
+// vanish from the next DB snapshot, which clears their dots via the normal
+// reconcile path.
 func (d *daemon) gc() {
 	pred := deadPredicate(d.model)
 	if n, err := d.db.ReapDead(pred); err != nil {
 		logf("gc: %v", err)
 	} else if n > 0 {
 		logf("gc: reaped %d dead session(s)", n)
+	}
+	if _, err := d.db.PruneEvents(auditKeep); err != nil {
+		logf("prune events: %v", err)
 	}
 }
 

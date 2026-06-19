@@ -97,8 +97,14 @@ func run(r io.Reader, dbPath string, startPID int) error {
 	now := db.Now().UnixMilli()
 	t := state.MapEvent(ev.HookEventName)
 
+	// Audit scaffold: one bounded-log row per invocation, filled in per path.
+	// Best-effort — an audit write must never fail the hook.
+	evt := db.Event{TS: now, SessionID: ev.SessionID, Event: ev.HookEventName}
+
 	// SessionEnd: clean teardown, delete the row and stop.
 	if t.Delete {
+		evt.NewState = "deleted"
+		_ = database.InsertEvent(evt)
 		return database.Delete(ev.SessionID)
 	}
 
@@ -106,14 +112,21 @@ func run(r io.Reader, dbPath string, startPID int) error {
 	if err != nil {
 		return err
 	}
+	if found {
+		evt.WindowID = existing.WindowID
+	}
 
 	// Unknown event: still bump last_seen for an existing row (liveness
 	// heartbeat), otherwise no-op. Never create a row for an unknown event.
 	if !t.Known {
 		if found {
 			existing.LastSeenTS = now
+			evt.NewState = "unchanged"
+			_ = database.InsertEvent(evt)
 			return database.Upsert(existing)
 		}
+		evt.NewState = "ignored"
+		_ = database.InsertEvent(evt)
 		return nil
 	}
 
@@ -149,9 +162,13 @@ func run(r io.Reader, dbPath string, startPID int) error {
 
 	// Status change. Notification is special: MapEvent always reports Prompt,
 	// but only permission/idle messages actually qualify (see notifyPatterns).
+	prevState := s.State
 	if ev.HookEventName == "Notification" {
+		matched := isPromptNotification(ev.Message)
 		s.NotifyKind = nullString(classifyNotify(ev.Message))
-		if isPromptNotification(ev.Message) {
+		evt.Message = nullString(truncate(ev.Message, 300))
+		evt.Matched = sql.NullBool{Bool: matched, Valid: true}
+		if matched {
 			s.State = string(state.Prompt)
 		}
 		// Non-qualifying notifications leave the prior state untouched.
@@ -159,7 +176,31 @@ func run(r io.Reader, dbPath string, startPID int) error {
 		s.State = string(t.NewStatus)
 	}
 
+	// Record the audit row. For a brand-new session record the established state
+	// (prevState is only the construction default, so a first Stop would falsely
+	// read as "unchanged"); for an existing row, "unchanged" when the event
+	// didn't move it. evt.WindowID reflects the (possibly just-resolved) window.
+	evt.WindowID = s.WindowID
+	switch {
+	case !found:
+		evt.NewState = s.State
+	case s.State == prevState:
+		evt.NewState = "unchanged"
+	default:
+		evt.NewState = s.State
+	}
+	_ = database.InsertEvent(evt)
+
 	return database.Upsert(s)
+}
+
+// truncate caps a string at n bytes (Notification messages can be long; the
+// audit log only needs enough to recognize what fired).
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // isPromptNotification reports whether a Notification message matches one of the
