@@ -6,7 +6,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/zor/claude-status/internal/state"
+	"github.com/mrzor/claude-status/internal/state"
 )
 
 // writeIcons emits the complete niri/workspaces format-icons map as a

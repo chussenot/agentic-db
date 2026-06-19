@@ -10,11 +10,11 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/zor/claude-status/internal/daemon"
-	"github.com/zor/claude-status/internal/doctor"
-	"github.com/zor/claude-status/internal/hook"
-	"github.com/zor/claude-status/internal/install"
-	"github.com/zor/claude-status/internal/waybar"
+	"github.com/mrzor/claude-status/internal/daemon"
+	"github.com/mrzor/claude-status/internal/doctor"
+	"github.com/mrzor/claude-status/internal/hook"
+	"github.com/mrzor/claude-status/internal/install"
+	"github.com/mrzor/claude-status/internal/waybar"
 )
 
 const usage = `claude-status — per-workspace Claude activity indicator for waybar/niri

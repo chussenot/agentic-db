@@ -1,4 +1,4 @@
-module github.com/zor/claude-status
+module github.com/mrzor/claude-status
 
 go 1.26
 

@@ -4,8 +4,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/zor/claude-status/internal/db"
-	"github.com/zor/claude-status/internal/state"
+	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/state"
 )
 
 // workspaceResolver maps a niri window id to the workspace it currently sits on.

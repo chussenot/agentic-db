@@ -11,8 +11,8 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/zor/claude-status/internal/db"
-	"github.com/zor/claude-status/internal/niri"
+	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/niri"
 )
 
 // Run executes the doctor subcommand. args is os.Args[2:]. It accepts an

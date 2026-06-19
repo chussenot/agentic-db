@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/zor/claude-status/internal/state"
+	"github.com/mrzor/claude-status/internal/state"
 )
 
 // writeCSS emits the three generated style.css sections, all enumerated per

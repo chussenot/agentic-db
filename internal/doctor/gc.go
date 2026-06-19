@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/zor/claude-status/internal/db"
-	"github.com/zor/claude-status/internal/niri"
+	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/niri"
 )
 
 // RunGC executes the `gc` subcommand: a single dead-session reap pass. args is

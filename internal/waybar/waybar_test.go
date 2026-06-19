@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zor/claude-status/internal/state"
+	"github.com/mrzor/claude-status/internal/state"
 )
 
 // iconsOutput runs the generator in --icons mode and returns its stdout.

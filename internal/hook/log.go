@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/zor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/db"
 )
 
 // maxLogBytes caps the hook error log. When the file would exceed this, it is

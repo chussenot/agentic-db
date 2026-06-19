@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zor/claude-status/internal/db"
-	"github.com/zor/claude-status/internal/niri"
+	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/niri"
 )
 
 // fakeActuator records the niri rename calls the reconciler would make, instead

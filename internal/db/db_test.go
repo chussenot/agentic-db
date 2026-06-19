@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/zor/claude-status/internal/state"
+	"github.com/mrzor/claude-status/internal/state"
 )
 
 func newInt(i int64) sql.NullInt64   { return sql.NullInt64{Int64: i, Valid: true} }

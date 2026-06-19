@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/db"
 )
 
 // presenceSet is a test windowPresence: the set of window ids the model knows.

@@ -9,12 +9,13 @@
 // last set). Three feeder goroutines never touch that state; they only send on
 // channels the actor selects over:
 //
-//	A: niri.StreamEvents  -> Event channel       (topology changes)
-//	B: db.LoadLive  every ~250ms -> []Session    (the source of truth)
+//	A: niri.StreamEvents  -> Event channel        (topology changes)
+//	B: db.LoadLive  every --poll (default 13ms) -> []Session  (source of truth)
 //	C: a 1s ticker  -> tick                       (decay recompute + GC)
 //
 // The actor folds events/snapshots into state, marks itself dirty, and after a
-// 150ms debounce runs the reconciler: aggregate desired per-workspace state,
+// --debounce window (default 13ms) runs the reconciler: aggregate desired
+// per-workspace state,
 // diff against `managed`, and emit niri renames ONLY where the name changed
 // (redundant-IPC suppression). Tick C additionally runs GC. This single-mutator
 // design means no locks and faithfully reproduces the Python's behavior.
@@ -30,9 +31,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/zor/claude-status/internal/db"
-	"github.com/zor/claude-status/internal/niri"
-	"github.com/zor/claude-status/internal/state"
+	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/niri"
+	"github.com/mrzor/claude-status/internal/state"
 )
 
 const (

@@ -17,9 +17,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/zor/claude-status/internal/db"
-	"github.com/zor/claude-status/internal/niri"
-	"github.com/zor/claude-status/internal/state"
+	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/niri"
+	"github.com/mrzor/claude-status/internal/state"
 )
 
 // notifyPatterns is the tunable list of case-insensitive substrings that mark a

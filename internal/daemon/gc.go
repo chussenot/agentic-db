@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/zor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/db"
 )
 
 // staleThreshold is how long a session may go without any hook heartbeat

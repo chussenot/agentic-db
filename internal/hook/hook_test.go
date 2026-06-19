@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/zor/claude-status/internal/db"
-	"github.com/zor/claude-status/internal/state"
+	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/state"
 )
 
 // fixedClock installs a deterministic db.Now for the duration of a test and
