@@ -36,15 +36,25 @@ import (
 )
 
 const (
-	// dbPollInterval is goroutine B's cadence: re-read the session set. WAL makes
-	// this cheap; SQLite has no change-notify, so we poll.
-	dbPollInterval = 250 * time.Millisecond
+	// defaultPollInterval is goroutine B's default cadence: re-read the session
+	// set. Overridable with --poll. WAL makes this cheap; SQLite has no
+	// change-notify, so we poll. At 13ms (~60Hz) the bar reflects a hook write
+	// near-instantly; LoadLive on this tiny WAL DB is sub-millisecond, so ~77
+	// polls/sec is still negligible CPU. Lower bound clamps protect against
+	// 0/negative.
+	defaultPollInterval = 13 * time.Millisecond
+	// defaultDebounce is the default debounce window (overridable with
+	// --debounce): how long the actor waits, after going dirty, for a burst of
+	// events to settle before reconciling. Kept at/near the poll interval so the
+	// poll rate is actually felt while still coalescing niri event bursts.
+	// Reconcile is in-memory and emits niri IPC only on an actual name change, so
+	// a higher reconcile rate adds no IPC churn.
+	defaultDebounce = 13 * time.Millisecond
+	// minInterval clamps --poll/--debounce away from 0 (which would busy-spin).
+	minInterval = 1 * time.Millisecond
 	// tickInterval is goroutine C's cadence: drives decay-bucket recompute and
 	// GC. Decay buckets are minutes wide, so 1s is ample resolution.
 	tickInterval = 1 * time.Second
-	// debounce is how long the actor waits, after going dirty, for a burst of
-	// events to settle before reconciling. Matches the Python's 150ms.
-	debounce = 150 * time.Millisecond
 )
 
 // Run executes the daemon subcommand. args is os.Args[2:]. It blocks until the
@@ -52,6 +62,8 @@ const (
 func Run(args []string) error {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	dbPath := fs.String("db", db.DefaultDBPath(), "path to the sessions SQLite database")
+	poll := fs.Duration("poll", defaultPollInterval, "DB poll interval (how often the bar refreshes from hook state)")
+	deb := fs.Duration("debounce", defaultDebounce, "reconcile debounce window (coalesces event bursts; keep <= poll to feel the poll rate)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -71,7 +83,9 @@ func Run(args []string) error {
 		act:   niri.IPCActuator{},
 		slots: newSlotAllocator(),
 		// managed mirrors the Python's State.managed: ws id -> the name we set.
-		managed: make(map[int]string),
+		managed:      make(map[int]string),
+		pollInterval: clampInterval(*poll),
+		debounce:     clampInterval(*deb),
 	}
 	return d.run(ctx)
 }
@@ -94,6 +108,20 @@ type daemon struct {
 	// adopted guards the one-time startup adoption of pre-existing names, done
 	// the first time the model has a workspace snapshot.
 	adopted bool
+
+	// pollInterval and debounce are the (clamped) configured cadences, set from
+	// the --poll/--debounce flags. Read only by run()/pollDB on the actor side.
+	pollInterval time.Duration
+	debounce     time.Duration
+}
+
+// clampInterval floors a configured duration at minInterval so a stray
+// --poll=0 (or negative) can't turn the poller/debounce into a busy-spin.
+func clampInterval(d time.Duration) time.Duration {
+	if d < minInterval {
+		return minInterval
+	}
+	return d
 }
 
 // run is the actor goroutine: it owns all mutable state and is the sole mutator
@@ -123,7 +151,7 @@ func (d *daemon) run(ctx context.Context) error {
 	markDirty := func() {
 		if !dirty {
 			dirty = true
-			debTimer.Reset(debounce)
+			debTimer.Reset(d.debounce)
 		}
 	}
 
@@ -187,12 +215,12 @@ func (d *daemon) adoptExistingNames() {
 	}
 }
 
-// pollDB is goroutine B: every dbPollInterval, snapshot the session set and send
+// pollDB is goroutine B: every d.pollInterval, snapshot the session set and send
 // it (coalescing: a stale snapshot in the buffer is dropped for the fresh one).
 func (d *daemon) pollDB(ctx context.Context, out chan []db.Session) {
-	t := time.NewTicker(dbPollInterval)
+	t := time.NewTicker(d.pollInterval)
 	defer t.Stop()
-	// Prime immediately so the first reconcile has data without a 250ms wait.
+	// Prime immediately so the first reconcile has data without a poll-interval wait.
 	d.sendSnapshot(ctx, out)
 	for {
 		select {
