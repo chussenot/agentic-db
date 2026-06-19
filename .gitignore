@@ -1,0 +1,6 @@
+/claude-status
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.log
