@@ -170,7 +170,9 @@ func TestNotificationFiltering(t *testing.T) {
 		wantNotify bool // notify_kind == "prompt"
 	}{
 		{"permission", "Claude needs your permission to run a command", string(state.Prompt), true},
-		{"waiting", "Claude is waiting for your input", string(state.Prompt), true},
+		// The idle-nudge text is no longer a prompt pattern: even arriving while
+		// working it must not flip to prompt (it normally fires post-Stop).
+		{"waiting", "Claude is waiting for your input", string(state.Working), false},
 		{"approve", "Approve this action?", string(state.Prompt), true},
 		{"confirm", "Please confirm", string(state.Prompt), true},
 		{"build finished", "build finished successfully", string(state.Working), false},
@@ -220,42 +222,92 @@ func recentEvents(t *testing.T, dbPath string) []db.Event {
 	return evs
 }
 
-// TestAuditLogCapturesNotification is the regression for the "stuck ? while
-// idle" defect: every hook invocation must leave an audit row, and a Notification
-// that flips the state must record its message + matched=true so we can later
-// see exactly what fired.
-func TestAuditLogCapturesNotification(t *testing.T) {
+// TestIdleNudgeDoesNotFlipWhileIdle is the regression for the "stuck ? while
+// idle" defect: an idle session that gets Claude Code's post-Stop nudge
+// ("waiting for your input") must STAY idle (and keep decaying), not jump to a
+// non-decaying prompt. The notification is still audited — with matched=false
+// and the prior state unchanged — so the decision is diagnosable via `events`.
+func TestIdleNudgeDoesNotFlipWhileIdle(t *testing.T) {
 	dbPath := tempDBPath(t)
 	fixedClock(t, time.UnixMilli(1_700_000_000_000))
 	drive(t, dbPath, `{"session_id":"s1","hook_event_name":"Stop"}`)
 	fixedClock(t, time.UnixMilli(1_700_000_001_000))
 	drive(t, dbPath, `{"session_id":"s1","hook_event_name":"Notification","message":"Claude is waiting for your input"}`)
 
+	s, found := getRow(t, dbPath, "s1")
+	if !found {
+		t.Fatal("row missing")
+	}
+	if s.State != string(state.Idle) {
+		t.Errorf("state = %q, want idle (nudge must not strand it at prompt)", s.State)
+	}
+	if s.NotifyKind.Valid && s.NotifyKind.String != "" {
+		t.Errorf("notify_kind = %v, want empty/NULL for a non-qualifying nudge", s.NotifyKind)
+	}
+
 	evs := recentEvents(t, dbPath)
 	if len(evs) != 2 {
 		t.Fatalf("audit rows = %d, want 2 (Stop + Notification)", len(evs))
 	}
-	// Newest first: the Notification.
-	n := evs[0]
+	n := evs[0] // newest first
+	if n.Event != "Notification" {
+		t.Fatalf("newest event = %q, want Notification", n.Event)
+	}
+	if !n.Matched.Valid || n.Matched.Bool {
+		t.Errorf("matched = %v, want false (idle nudge does not qualify)", n.Matched)
+	}
+	if n.Message.String != "Claude is waiting for your input" {
+		t.Errorf("message = %q, want the nudge text recorded for diagnosis", n.Message.String)
+	}
+	if n.NewState != "unchanged" {
+		t.Errorf("new_state = %q, want unchanged (stayed idle)", n.NewState)
+	}
+}
+
+// TestAuditLogCapturesPermissionPrompt covers the genuine path: a permission
+// request arriving mid-work flips to prompt, and the audit row records the
+// message + matched=true + new_state=prompt so what fired is later visible.
+func TestAuditLogCapturesPermissionPrompt(t *testing.T) {
+	dbPath := tempDBPath(t)
+	fixedClock(t, time.UnixMilli(1_700_000_000_000))
+	drive(t, dbPath, `{"session_id":"s1","hook_event_name":"UserPromptSubmit"}`)
+	fixedClock(t, time.UnixMilli(1_700_000_001_000))
+	drive(t, dbPath, `{"session_id":"s1","hook_event_name":"Notification","message":"Claude needs your permission"}`)
+
+	s, _ := getRow(t, dbPath, "s1")
+	if s.State != string(state.Prompt) {
+		t.Errorf("state = %q, want prompt", s.State)
+	}
+
+	evs := recentEvents(t, dbPath)
+	n := evs[0] // newest first: the Notification
 	if n.Event != "Notification" {
 		t.Fatalf("newest event = %q, want Notification", n.Event)
 	}
 	if !n.Matched.Valid || !n.Matched.Bool {
-		t.Errorf("matched = %v, want true (idle nudge flipped it to prompt)", n.Matched)
+		t.Errorf("matched = %v, want true (permission request mid-work)", n.Matched)
 	}
-	if n.Message.String != "Claude is waiting for your input" {
-		t.Errorf("message = %q, want the nudge text", n.Message.String)
+	if n.Message.String != "Claude needs your permission" {
+		t.Errorf("message = %q, want the permission text", n.Message.String)
 	}
 	if n.NewState != string(state.Prompt) {
 		t.Errorf("new_state = %q, want prompt", n.NewState)
 	}
-	// The Stop row records the resulting idle state and no message.
-	stop := evs[1]
-	if stop.Event != "Stop" || stop.NewState != string(state.Idle) {
-		t.Errorf("oldest = %q/%q, want Stop/idle", stop.Event, stop.NewState)
-	}
-	if stop.Message.Valid {
-		t.Errorf("Stop should have no message, got %q", stop.Message.String)
+}
+
+// TestPermissionPatternIgnoredWhileIdle guards the state gate directly: even a
+// genuine permission-matching message can't create a prompt from an idle
+// session (a real permission request only occurs mid-work).
+func TestPermissionPatternIgnoredWhileIdle(t *testing.T) {
+	dbPath := tempDBPath(t)
+	fixedClock(t, time.UnixMilli(1_700_000_000_000))
+	drive(t, dbPath, `{"session_id":"s1","hook_event_name":"Stop"}`) // -> idle
+	fixedClock(t, time.UnixMilli(1_700_000_001_000))
+	drive(t, dbPath, `{"session_id":"s1","hook_event_name":"Notification","message":"Claude needs your permission"}`)
+
+	s, _ := getRow(t, dbPath, "s1")
+	if s.State != string(state.Idle) {
+		t.Errorf("state = %q, want idle (state gate suppresses prompt while idle)", s.State)
 	}
 }
 

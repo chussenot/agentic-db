@@ -23,15 +23,18 @@ import (
 )
 
 // notifyPatterns is the tunable list of case-insensitive substrings that mark a
-// Notification as a genuine "Claude needs the user" prompt (permission request
-// or idle nudge). Notification fires for plenty of other things (e.g. "build
-// finished"), so only messages containing one of these flip the session into
-// the Prompt state. Everything else records the notification but leaves the
-// prior status untouched. Retune by editing this list.
+// Notification as a genuine permission/approval request — the only kind of
+// Notification that means Claude is BLOCKED waiting on the user. It deliberately
+// EXCLUDES the idle-nudge text ("waiting for your input"): that fires ~60s after
+// Stop while the session is already idle and decaying, and treating it as a
+// prompt stranded the session at a steady "?" that never decayed (the bug this
+// list once caused). Notification fires for plenty of other things too (e.g.
+// "build finished", "Claude Code login successful"), so a message flips the
+// session into Prompt only when it contains one of these AND the session is
+// mid-work (see the state gate in run). Everything else records the notification
+// but leaves the prior status untouched. Retune by editing this list.
 var notifyPatterns = []string{
 	"permission",
-	"waiting for your input",
-	"needs your",
 	"approve",
 	"confirm",
 }
@@ -164,8 +167,16 @@ func run(r io.Reader, dbPath string, startPID int) error {
 	// but only permission/idle messages actually qualify (see notifyPatterns).
 	prevState := s.State
 	if ev.HookEventName == "Notification" {
-		matched := isPromptNotification(ev.Message)
-		s.NotifyKind = nullString(classifyNotify(ev.Message))
+		// A Notification means "Claude wants the user" but covers two cases: a
+		// permission/approval request (a genuine prompt) and the post-Stop idle
+		// nudge. Distinguish them by BOTH the message (permission patterns) AND the
+		// current state: a real permission request only happens mid-work, so a
+		// matching message while the session is idle is the nudge and must NOT
+		// strand it at a non-decaying "?". See notifyPatterns.
+		matched := isPromptNotification(ev.Message) && prevState != string(state.Idle)
+		if matched {
+			s.NotifyKind = nullString("prompt")
+		}
 		evt.Message = nullString(truncate(ev.Message, 300))
 		evt.Matched = sql.NullBool{Bool: matched, Valid: true}
 		if matched {
@@ -213,15 +224,6 @@ func isPromptNotification(message string) bool {
 		}
 	}
 	return false
-}
-
-// classifyNotify returns a short notify_kind classification for the message, or
-// "" for a non-qualifying notification.
-func classifyNotify(message string) string {
-	if isPromptNotification(message) {
-		return "prompt"
-	}
-	return ""
 }
 
 func nullString(s string) sql.NullString {
