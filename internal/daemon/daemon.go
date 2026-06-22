@@ -31,6 +31,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
 	"github.com/mrzor/claude-status/internal/niri"
 	"github.com/mrzor/claude-status/internal/state"
@@ -65,6 +66,7 @@ func Run(args []string) error {
 	dbPath := fs.String("db", db.DefaultDBPath(), "path to the sessions SQLite database")
 	poll := fs.Duration("poll", defaultPollInterval, "DB poll interval (how often the bar refreshes from hook state)")
 	deb := fs.Duration("debounce", defaultDebounce, "reconcile debounce window (coalesces event bursts; keep <= poll to feel the poll rate)")
+	sessionsDir := fs.String("sessions-dir", clauded.DefaultDir(), "Claude Code sessions dir for first-party status overlay (empty disables the overlay)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -87,6 +89,7 @@ func Run(args []string) error {
 		managed:      make(map[int]string),
 		pollInterval: clampInterval(*poll),
 		debounce:     clampInterval(*deb),
+		sessionsDir:  *sessionsDir,
 	}
 	return d.run(ctx)
 }
@@ -114,6 +117,11 @@ type daemon struct {
 	// the --poll/--debounce flags. Read only by run()/pollDB on the actor side.
 	pollInterval time.Duration
 	debounce     time.Duration
+
+	// sessionsDir is Claude Code's first-party sessions directory. Each DB
+	// snapshot is overlaid with the status found there (see overlayFirstParty).
+	// Empty disables the overlay (hook-derived state only).
+	sessionsDir string
 }
 
 // clampInterval floors a configured duration at minInterval so a stray
@@ -238,6 +246,15 @@ func (d *daemon) sendSnapshot(ctx context.Context, out chan []db.Session) {
 	if err != nil {
 		logf("db poll: %v", err)
 		return
+	}
+	// Refine each session's state with Claude Code's first-party status. Best
+	// effort: a read error (or empty dir) leaves the hook-derived state intact.
+	if d.sessionsDir != "" {
+		if fp, ferr := clauded.Read(d.sessionsDir); ferr != nil {
+			logf("first-party status read: %v", ferr)
+		} else {
+			overlayFirstParty(sessions, fp)
+		}
 	}
 	select {
 	case out <- sessions:

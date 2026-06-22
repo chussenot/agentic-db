@@ -4,9 +4,51 @@ import (
 	"sort"
 	"time"
 
+	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
 	"github.com/mrzor/claude-status/internal/state"
 )
+
+// firstPartyState maps Claude Code's first-party status to our activity state.
+// ok is false for an unrecognized value (caller keeps the hook-derived state).
+// Mapping rationale (see package clauded): busy = taking a turn, waiting =
+// blocked on the user (the genuine "?"), idle = finished turn at rest (decays).
+func firstPartyState(s clauded.Status) (state.Status, bool) {
+	switch s {
+	case clauded.Busy:
+		return state.Working, true
+	case clauded.Waiting:
+		return state.Prompt, true
+	case clauded.Idle:
+		return state.Idle, true
+	default:
+		return "", false
+	}
+}
+
+// overlayFirstParty refines each session's State with Claude Code's first-party
+// status when available, in place. First-party status is authoritative for the
+// activity state because it updates on Claude's own cadence, independent of our
+// hooks: it fixes stale hook state (e.g. a missed Stop leaving a session stuck
+// "working", or the idle-nudge "?" defect) and makes the "?"/decay decision
+// language-independent rather than reliant on Notification text matching.
+//
+// Sessions absent from fp (remote/ssh/tmux, or no file yet) keep their
+// hook-derived State — so the (now-fixed) notification path remains the fallback.
+// Unrecognized first-party status values are left to the hook state as well.
+// Only State is overridden; window_id, last_talk_ts (decay level), etc. are
+// untouched, so the decay bar still reads its timing from the DB row.
+func overlayFirstParty(sessions []db.Session, fp map[string]clauded.Session) {
+	for i := range sessions {
+		f, ok := fp[sessions[i].SessionID]
+		if !ok {
+			continue
+		}
+		if st, ok := firstPartyState(f.Status); ok {
+			sessions[i].State = string(st)
+		}
+	}
+}
 
 // workspaceResolver maps a niri window id to the workspace it currently sits on.
 // The live *niri.Model satisfies this; tests inject a map-backed fake so the
