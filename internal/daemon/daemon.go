@@ -256,7 +256,7 @@ func (d *daemon) sendSnapshot(ctx context.Context, out chan []db.Session) {
 	// Refine each session's state with Claude Code's first-party status. Best
 	// effort: a read error (or empty dir) leaves the hook-derived state intact.
 	if d.sessionsDir != "" {
-		if fp, ferr := clauded.Read(d.sessionsDir); ferr != nil {
+		if fp, ferr := clauded.ReadLive(d.sessionsDir); ferr != nil {
 			logf("first-party status read: %v", ferr)
 		} else {
 			overlayFirstParty(sessions, fp)
@@ -314,7 +314,7 @@ func (d *daemon) gc() {
 	var fp map[string]clauded.Session
 	fpAvailable := false
 	if d.sessionsDir != "" {
-		if m, err := clauded.Read(d.sessionsDir); err != nil {
+		if m, err := clauded.ReadLive(d.sessionsDir); err != nil {
 			logf("gc first-party read: %v", err)
 		} else if len(m) > 0 {
 			fp, fpAvailable = m, true

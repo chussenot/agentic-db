@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -110,6 +111,45 @@ func Read(dir string) (map[string]Session, error) {
 		out[s.SessionID] = s
 	}
 	return out, nil
+}
+
+// procExists reports whether /proc/<pid> exists (the owning process is alive).
+// Package var so tests can stub it; mirrors the daemon's identical seam.
+var procExists = func(pid int) bool {
+	_, err := os.Stat("/proc/" + strconv.Itoa(pid))
+	return err == nil
+}
+
+// Alive reports whether the Claude process that owns this session file is still
+// running. Claude Code removes <pid>.json on a clean exit, but a hard kill
+// (SIGKILL/crash) leaves the file behind with a now-dead pid frozen at its last
+// status; Alive distinguishes that crash-zombie from a live session. A file with
+// no usable pid (pid <= 0) is treated as alive — it cannot be checked and must
+// not be dropped on a guess.
+func (s Session) Alive() bool {
+	if s.PID <= 0 {
+		return true
+	}
+	return procExists(s.PID)
+}
+
+// ReadLive is Read filtered to sessions whose owning process is still alive (see
+// Alive). The daemon reads through ReadLive so "present in the first-party set"
+// means the file exists AND its Claude process is running: a crash-zombie file
+// (present, pid dead) is treated as absent, letting the daemon's
+// first-party-absence reap clear it even while its terminal lingers. doctor uses
+// raw Read so the zombie stays visible for debugging.
+func ReadLive(dir string) (map[string]Session, error) {
+	all, err := Read(dir)
+	if err != nil {
+		return nil, err
+	}
+	for id, s := range all {
+		if !s.Alive() {
+			delete(all, id)
+		}
+	}
+	return all, nil
 }
 
 // readFile parses one session file. ok is false (skip it) on a read/parse error

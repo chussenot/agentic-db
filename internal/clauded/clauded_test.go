@@ -125,3 +125,59 @@ func TestReadOmittedStatusUpdatedAtIsZeroTime(t *testing.T) {
 		t.Errorf("missing statusUpdatedAt should be zero time, got %v", got["s"].StatusUpdatedAt)
 	}
 }
+
+// stubProc stubs the /proc liveness seam: only the listed pids are "alive".
+func stubProc(t *testing.T, alive ...int) {
+	t.Helper()
+	set := make(map[int]bool, len(alive))
+	for _, p := range alive {
+		set[p] = true
+	}
+	orig := procExists
+	procExists = func(pid int) bool { return set[pid] }
+	t.Cleanup(func() { procExists = orig })
+}
+
+func TestAlive(t *testing.T) {
+	stubProc(t, 42)
+	if !(Session{PID: 42}).Alive() {
+		t.Error("pid 42 stubbed alive but Alive()=false")
+	}
+	if (Session{PID: 99}).Alive() {
+		t.Error("pid 99 not alive but Alive()=true")
+	}
+	// No usable pid -> treated as alive (cannot check, must not drop on a guess).
+	if !(Session{PID: 0}).Alive() {
+		t.Error("pid 0 should be treated as alive")
+	}
+}
+
+func TestReadLiveDropsDeadPidEntries(t *testing.T) {
+	dir := t.TempDir()
+	// live: process running. zombie: file present but its claude pid is dead
+	// (hard kill left the file behind).
+	write(t, dir, "10.json", `{"pid":10,"sessionId":"live","status":"idle","statusUpdatedAt":1}`)
+	write(t, dir, "20.json", `{"pid":20,"sessionId":"zombie","status":"busy","statusUpdatedAt":1}`)
+	stubProc(t, 10) // only pid 10 alive
+
+	// Raw Read keeps both (doctor needs the zombie visible).
+	raw, err := Read(dir)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(raw) != 2 {
+		t.Fatalf("raw Read should keep both files, got %d", len(raw))
+	}
+
+	// ReadLive drops the dead-pid zombie.
+	live, err := ReadLive(dir)
+	if err != nil {
+		t.Fatalf("ReadLive: %v", err)
+	}
+	if _, ok := live["zombie"]; ok {
+		t.Error("ReadLive kept a dead-pid (crash-zombie) entry")
+	}
+	if _, ok := live["live"]; !ok {
+		t.Error("ReadLive dropped a live session")
+	}
+}
