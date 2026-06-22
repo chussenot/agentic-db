@@ -127,20 +127,20 @@ func printFirstParty(w io.Writer, sessions []db.Session) {
 	tw.Flush()
 }
 
-// effectiveState mirrors daemon.overlayFirstParty's mapping for display. The
+// effectiveState mirrors daemon.firstPartyState's mapping for display. The
 // daemon is the runtime authority; this copy keeps doctor free of a daemon
-// import. busy->working, waiting->prompt, idle->idle; unknown -> not ok.
+// import. busy->working, idle->idle, shell->shell; waiting is deferred to the
+// hook state (NOT mapped to prompt — it is overloaded; see firstPartyState), so
+// a `waiting` session shows SOURCE=hook. Unknown -> not ok.
 func effectiveState(s clauded.Status) (state.Status, bool) {
 	switch s {
 	case clauded.Busy:
 		return state.Working, true
-	case clauded.Waiting:
-		return state.Prompt, true
 	case clauded.Idle:
 		return state.Idle, true
 	case clauded.Shell:
 		return state.Shell, true
-	default:
+	default: // waiting (deferred to hooks) and unrecognized values
 		return "", false
 	}
 }

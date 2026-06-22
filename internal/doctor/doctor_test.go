@@ -19,8 +19,9 @@ func TestEffectiveStateMapping(t *testing.T) {
 		ok   bool
 	}{
 		{clauded.Busy, state.Working, true},
-		{clauded.Waiting, state.Prompt, true},
+		{clauded.Waiting, "", false}, // deferred to hooks (overloaded), not prompt
 		{clauded.Idle, state.Idle, true},
+		{clauded.Shell, state.Shell, true},
 		{clauded.Status("compacting"), "", false},
 	}
 	for _, c := range cases {
@@ -33,8 +34,9 @@ func TestEffectiveStateMapping(t *testing.T) {
 
 // TestPrintFirstPartyShowsDriftAndSource points CLAUDE_CONFIG_DIR at a fixture
 // dir and checks the side-by-side render: a fresh first-party status overrides
-// the hook state (SOURCE=first-party), while a session with no first-party file
-// keeps the hook state.
+// the hook state (SOURCE=first-party), `waiting` defers to the hook
+// (SOURCE=hook, since waiting is overloaded), and a session with no first-party
+// file keeps the hook state.
 func TestPrintFirstPartyShowsDriftAndSource(t *testing.T) {
 	dir := t.TempDir()
 	sessDir := filepath.Join(dir, "sessions")
@@ -43,31 +45,47 @@ func TestPrintFirstPartyShowsDriftAndSource(t *testing.T) {
 	}
 	t.Setenv("CLAUDE_CONFIG_DIR", dir)
 
-	// first-party says waiting; our hook row (below) still says working -> drift.
+	// first-party says idle; our hook row (below) still says prompt -> drift.
+	// first-party idle clears the stuck "?" and wins as SOURCE=first-party.
 	if err := os.WriteFile(filepath.Join(sessDir, "1.json"),
-		[]byte(`{"pid":1,"sessionId":"drifter","status":"waiting","statusUpdatedAt":1}`), 0o644); err != nil {
+		[]byte(`{"pid":1,"sessionId":"drifter","status":"idle","statusUpdatedAt":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// first-party says waiting; it is overloaded, so it defers to the hook state
+	// (SOURCE=hook), NOT mapped to prompt.
+	if err := os.WriteFile(filepath.Join(sessDir, "2.json"),
+		[]byte(`{"pid":2,"sessionId":"waiter","status":"waiting","statusUpdatedAt":1}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	sessions := []db.Session{
-		{SessionID: "drifter", State: "working"}, // stale hook state
-		{SessionID: "remote", State: "prompt"},   // no first-party file
+		{SessionID: "drifter", State: "prompt"}, // stale "?" hook state
+		{SessionID: "waiter", State: "working"}, // mid-turn per hooks
+		{SessionID: "remote", State: "prompt"},  // no first-party file
 	}
 
 	var buf bytes.Buffer
 	printFirstParty(&buf, sessions)
 	out := buf.String()
 
-	if !strings.Contains(out, "1 session file(s)") {
-		t.Errorf("expected one first-party file reported; got:\n%s", out)
+	if !strings.Contains(out, "2 session file(s)") {
+		t.Errorf("expected two first-party files reported; got:\n%s", out)
 	}
-	// The drifting session must resolve to prompt via first-party, not working.
+	// drifter: first-party idle wins over the stale prompt -> SOURCE=first-party.
 	line := lineContaining(out, "drifter")
 	if line == "" {
 		t.Fatalf("no drifter row in:\n%s", out)
 	}
-	if !strings.Contains(line, "waiting") || !strings.Contains(line, "first-party") {
-		t.Errorf("drifter row should show waiting + first-party source: %q", line)
+	if !strings.Contains(line, "idle") || !strings.Contains(line, "first-party") {
+		t.Errorf("drifter row should show idle + first-party source: %q", line)
+	}
+	// waiter: waiting defers to the hook -> EFFECTIVE working, SOURCE=hook.
+	wline := lineContaining(out, "waiter")
+	if wline == "" {
+		t.Fatalf("no waiter row in:\n%s", out)
+	}
+	if !strings.Contains(wline, "waiting") || !strings.Contains(wline, "hook") {
+		t.Errorf("waiter row should show waiting (first-party col) but SOURCE=hook: %q", wline)
 	}
 	// "remote" has no first-party file, so it isn't listed in this section.
 	if strings.Contains(out, "remote") {

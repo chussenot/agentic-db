@@ -10,20 +10,30 @@ import (
 )
 
 // firstPartyState maps Claude Code's first-party status to our activity state.
-// ok is false for an unrecognized value (caller keeps the hook-derived state).
-// Mapping rationale (see package clauded): busy = taking a turn, waiting =
-// blocked on the user (the genuine "?"), idle = finished turn at rest (decays).
+// ok is false for an unrecognized OR deliberately-deferred value, in which case
+// the caller keeps the hook-derived state. Mapping (see package clauded): busy =
+// taking a turn -> working; idle = finished turn at rest -> idle (decays); shell
+// = background-monitor -> shell.
+//
+// `waiting` is DELIBERATELY NOT mapped to Prompt. It looked like the genuine
+// "?" signal, but observation proved it overloaded: it fires whenever the main
+// loop is suspended on ANYTHING — a subagent/tool wait as much as a real
+// user-prompt — so mapping it to "?" produced false positives (e.g. a `/btw`
+// turn sat at `waiting` for minutes with no question; see memory
+// first-party-status-waiting-is-not-a-reliable). There is no finer first-party
+// field to disambiguate. So we defer `waiting` to the hook state: the genuine
+// "?" comes from the permission-Notification hook path (precise), plus prose-
+// question detection on Stop (see the transcript-parse work). Returning ok=false
+// here means a `waiting` session keeps whatever the hooks last derived.
 func firstPartyState(s clauded.Status) (state.Status, bool) {
 	switch s {
 	case clauded.Busy:
 		return state.Working, true
-	case clauded.Waiting:
-		return state.Prompt, true
 	case clauded.Idle:
 		return state.Idle, true
 	case clauded.Shell:
 		return state.Shell, true
-	default:
+	default: // waiting (deferred to hooks) and unrecognized values
 		return "", false
 	}
 }

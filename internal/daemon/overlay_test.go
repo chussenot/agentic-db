@@ -15,8 +15,9 @@ func TestFirstPartyStateMapping(t *testing.T) {
 		ok   bool
 	}{
 		{clauded.Busy, state.Working, true},
-		{clauded.Waiting, state.Prompt, true},
+		{clauded.Waiting, "", false}, // deferred to hooks: waiting is overloaded, not "?"
 		{clauded.Idle, state.Idle, true},
+		{clauded.Shell, state.Shell, true},
 		{clauded.Status("compacting"), "", false},
 		{clauded.Status(""), "", false},
 	}
@@ -31,7 +32,7 @@ func TestFirstPartyStateMapping(t *testing.T) {
 func TestOverlayPrefersFirstPartyState(t *testing.T) {
 	sessions := []db.Session{
 		{SessionID: "a", State: "idle"},    // first-party says busy -> working
-		{SessionID: "b", State: "working"}, // first-party says waiting -> prompt
+		{SessionID: "b", State: "working"}, // first-party says waiting -> DEFERRED, hook "working" kept
 		{SessionID: "c", State: "prompt"},  // first-party says idle -> idle (clears a stuck "?")
 	}
 	fp := map[string]clauded.Session{
@@ -41,11 +42,35 @@ func TestOverlayPrefersFirstPartyState(t *testing.T) {
 	}
 	overlayFirstParty(sessions, fp)
 
-	want := map[string]string{"a": "working", "b": "prompt", "c": "idle"}
+	// "b": waiting no longer overrides — the hook-derived "working" is preserved,
+	// because waiting is overloaded (subagent/tool wait, not necessarily "?").
+	want := map[string]string{"a": "working", "b": "working", "c": "idle"}
 	for _, s := range sessions {
 		if s.State != want[s.SessionID] {
 			t.Errorf("session %s state = %q, want %q", s.SessionID, s.State, want[s.SessionID])
 		}
+	}
+}
+
+func TestOverlayWaitingDoesNotForcePrompt(t *testing.T) {
+	// Regression for the /btw false "?" (memory
+	// first-party-status-waiting-is-not-a-reliable): a session whose turn ended
+	// (hook -> idle) but whose first-party sat at `waiting` (a subagent/tool wait,
+	// not a question) must NOT be flipped to prompt. It stays on the hook state.
+	sessions := []db.Session{
+		{SessionID: "btw", State: "idle"},    // Stop fired; hook says idle
+		{SessionID: "mid", State: "working"}, // still mid-turn per hooks
+	}
+	fp := map[string]clauded.Session{
+		"btw": {SessionID: "btw", Status: clauded.Waiting},
+		"mid": {SessionID: "mid", Status: clauded.Waiting},
+	}
+	overlayFirstParty(sessions, fp)
+	if sessions[0].State != "idle" {
+		t.Errorf("btw state = %q, want idle (waiting must not force prompt)", sessions[0].State)
+	}
+	if sessions[1].State != "working" {
+		t.Errorf("mid state = %q, want working preserved", sessions[1].State)
 	}
 }
 
