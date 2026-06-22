@@ -21,6 +21,8 @@ func firstPartyState(s clauded.Status) (state.Status, bool) {
 		return state.Prompt, true
 	case clauded.Idle:
 		return state.Idle, true
+	case clauded.Shell:
+		return state.Shell, true
 	default:
 		return "", false
 	}
@@ -75,6 +77,7 @@ type desired struct {
 //
 //	any working  -> working
 //	else any prompt -> prompt
+//	else any shell -> shell (background-monitor pulse)
 //	else idle, level = DecayLevel(now - max(last_talk_ts over idle sessions))
 //
 // "most-recent talk wins" means the brightest (lowest) level: we take the
@@ -85,6 +88,7 @@ func aggregate(sessions []db.Session, resolve workspaceResolver, now time.Time) 
 	type acc struct {
 		hasWorking bool
 		hasPrompt  bool
+		hasShell   bool
 		hasIdle    bool
 		// maxIdleTalk is the most recent last_talk_ts (unix ms) across idle
 		// sessions on this workspace; 0 if none had one.
@@ -111,6 +115,8 @@ func aggregate(sessions []db.Session, resolve workspaceResolver, now time.Time) 
 			a.hasWorking = true
 		case state.Prompt:
 			a.hasPrompt = true
+		case state.Shell:
+			a.hasShell = true
 		default: // idle (and any unexpected value treated as idle, per precedence floor)
 			a.hasIdle = true
 			if s.LastTalkTS.Valid {
@@ -130,6 +136,8 @@ func aggregate(sessions []db.Session, resolve workspaceResolver, now time.Time) 
 			out[wsID] = desired{status: state.Working}
 		case a.hasPrompt:
 			out[wsID] = desired{status: state.Prompt}
+		case a.hasShell:
+			out[wsID] = desired{status: state.Shell}
 		default:
 			level := state.DecayLevels - 1 // no talk timestamp -> dimmest
 			if a.idleTalkSet {

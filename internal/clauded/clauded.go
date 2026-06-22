@@ -34,12 +34,14 @@ const (
 	// Waiting: Claude is blocked waiting on the user (permission/interactive
 	// prompt) — the genuine "needs you" signal.
 	Waiting Status = "waiting"
+	// Shell: Claude is passively monitoring a background shell/command.
+	Shell Status = "shell"
 )
 
 // Known reports whether s is one of the recognized status values.
 func (s Status) Known() bool {
 	switch s {
-	case Busy, Idle, Waiting:
+	case Busy, Idle, Waiting, Shell:
 		return true
 	default:
 		return false

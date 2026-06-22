@@ -21,9 +21,11 @@ import (
 func writeCSS(w io.Writer) error {
 	var b strings.Builder
 
-	// @define-color block: reuse the existing claude-orange, add claude-prompt.
+	// @define-color block: reuse the existing claude-orange, add claude-prompt
+	// and claude-shell.
 	b.WriteString("@define-color claude-orange " + state.WorkingColor + ";\n")
-	b.WriteString("@define-color claude-prompt " + state.PromptColor + ";\n\n")
+	b.WriteString("@define-color claude-prompt " + state.PromptColor + ";\n")
+	b.WriteString("@define-color claude-shell " + state.ShellColor + ";\n\n")
 
 	// --- Section 1: working blink (orange) ---
 	b.WriteString("/* Claude \"actively working\" workspaces (named cw<slot> by the daemon):\n")
@@ -54,7 +56,22 @@ func writeCSS(w io.Writer) error {
 	b.WriteString("    animation: claude-prompt-blink 1.0s ease-in-out infinite;\n")
 	b.WriteString("}\n\n")
 
-	// --- Section 3: idle decay (static per level) ---
+	// --- Section 3: shell-monitor pulse (cyan) ---
+	b.WriteString("/* Claude \"passively monitoring a background shell\" workspaces (named cs<slot>):\n")
+	b.WriteString("   a gentle cyan opacity pulse — distinct from the working/prompt color blinks.\n")
+	b.WriteString("   First-party-only status (Claude Code's \"shell\"); our hooks never set it. */\n")
+	b.WriteString("@keyframes claude-shell-pulse {\n")
+	b.WriteString("    from { opacity: 1; }\n")
+	b.WriteString("    50%  { opacity: 0.4; }\n")
+	b.WriteString("    to   { opacity: 1; }\n")
+	b.WriteString("}\n\n")
+	b.WriteString(workspaceSelectors(slotNames(state.EncodeShell)))
+	b.WriteString(" {\n")
+	b.WriteString("    color: @claude-shell;\n")
+	b.WriteString("    animation: claude-shell-pulse 1.6s ease-in-out infinite;\n")
+	b.WriteString("}\n\n")
+
+	// --- Section 4: idle decay (static per level) ---
 	b.WriteString("/* Claude idle workspaces (named ci<slot>l<level>): a static per-level color\n")
 	b.WriteString("   encoding recency of the last talk (brightest just-stopped -> dim stale).\n")
 	b.WriteString("   Grouped by level: all slots at a level share one color. */\n")

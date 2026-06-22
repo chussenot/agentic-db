@@ -138,6 +138,8 @@ func effectiveState(s clauded.Status) (state.Status, bool) {
 		return state.Prompt, true
 	case clauded.Idle:
 		return state.Idle, true
+	case clauded.Shell:
+		return state.Shell, true
 	default:
 		return "", false
 	}

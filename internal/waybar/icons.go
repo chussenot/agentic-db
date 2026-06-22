@@ -15,7 +15,8 @@ import (
 //
 // It is laid out by hand (rather than json.MarshalIndent of a map, which would
 // alphabetize keys) so the grouping mirrors the existing config.jsonc: per slot
-// the working name, then the prompt name, then the seven idle decay levels.
+// the working name, the prompt name, the shell name, then the seven idle decay
+// levels.
 func writeIcons(w io.Writer) error {
 	// A leading comment line showing the surrounding context the user pastes into.
 	if _, err := fmt.Fprintln(w, `// "niri/workspaces": { "format": "{index}{icon}", "format-icons": <this> }`); err != nil {
@@ -27,6 +28,7 @@ func writeIcons(w io.Writer) error {
 	for slot := 1; slot <= state.MaxSlots; slot++ {
 		writeIconLine(&b, state.EncodeWorking(slot), state.WorkingIcon())
 		writeIconLine(&b, state.EncodePrompt(slot), state.PromptIcon())
+		writeIconLine(&b, state.EncodeShell(slot), state.ShellIcon())
 		for level := 0; level < state.DecayLevels; level++ {
 			writeIconLine(&b, state.EncodeIdle(slot, level), state.IdleIcon(level))
 		}

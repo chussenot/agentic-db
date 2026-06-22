@@ -51,7 +51,7 @@ func TestIconsValidJSON(t *testing.T) {
 	}
 
 	// Expected keys present.
-	wantKeys := []string{"cw20", "cp1", "ci1l0", "ci20l6", "default"}
+	wantKeys := []string{"cw20", "cp1", "cs1", "cs20", "ci1l0", "ci20l6", "default"}
 	for _, k := range wantKeys {
 		if _, ok := m[k]; !ok {
 			t.Errorf("missing key %q in icons map", k)
@@ -65,6 +65,9 @@ func TestIconsValidJSON(t *testing.T) {
 	if got := m["cp1"]; got != state.PromptIcon() {
 		t.Errorf("cp1 = %q, want %q", got, state.PromptIcon())
 	}
+	if got := m["cs1"]; got != state.ShellIcon() {
+		t.Errorf("cs1 = %q, want %q", got, state.ShellIcon())
+	}
 	if got := m["ci1l0"]; got != state.IdleIcon(0) {
 		t.Errorf("ci1l0 = %q, want %q", got, state.IdleIcon(0))
 	}
@@ -76,7 +79,7 @@ func TestIconsValidJSON(t *testing.T) {
 	}
 
 	// Completeness: every generated key for every slot/level is present.
-	wantCount := state.MaxSlots*(2+state.DecayLevels) + 1 // working + prompt + levels, + default
+	wantCount := state.MaxSlots*(3+state.DecayLevels) + 1 // working + prompt + shell + levels, + default
 	if len(m) != wantCount {
 		t.Errorf("icons map has %d keys, want %d", len(m), wantCount)
 	}
@@ -88,12 +91,16 @@ func TestCSSContents(t *testing.T) {
 	wantSubstrings := []string{
 		"@keyframes claude-working-blink",
 		"@keyframes claude-prompt-blink",
+		"@keyframes claude-shell-pulse",
 		"#niri-workspace-cw20",
 		"#niri-workspace-cp20",
+		"#niri-workspace-cs20",
 		"#niri-workspace-ci1l0",
 		"#niri-workspace-ci20l6",
 		"animation: claude-working-blink 1.1s ease-in-out infinite;",
+		"animation: claude-shell-pulse 1.6s ease-in-out infinite;",
 		"@define-color claude-prompt " + state.PromptColor + ";",
+		"@define-color claude-shell " + state.ShellColor + ";",
 	}
 	for _, s := range wantSubstrings {
 		if !strings.Contains(out, s) {

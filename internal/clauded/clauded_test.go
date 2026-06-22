@@ -51,6 +51,15 @@ func TestReadCapturesWaitingStatus(t *testing.T) {
 	}
 }
 
+func TestReadCapturesShellStatus(t *testing.T) {
+	dir := t.TempDir()
+	write(t, dir, "1.json", `{"pid":1,"sessionId":"s","status":"shell","statusUpdatedAt":1782114927705}`)
+	got, _ := Read(dir)
+	if got["s"].Status != Shell || !got["s"].Status.Known() {
+		t.Errorf("status = %q (known=%v), want shell/known", got["s"].Status, got["s"].Status.Known())
+	}
+}
+
 func TestReadMissingDirIsEmptyNotError(t *testing.T) {
 	got, err := Read(filepath.Join(t.TempDir(), "does-not-exist"))
 	if err != nil {

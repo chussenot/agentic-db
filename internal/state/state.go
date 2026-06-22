@@ -41,12 +41,16 @@ const (
 	// Idle means Claude is not working and not waiting; the decay bar encodes how
 	// long ago it last talked. Set on SessionStart and Stop.
 	Idle Status = "idle"
+	// Shell means Claude is passively monitoring a background shell/command
+	// (rendered as a pulsating cyan dot). It comes only from Claude Code's
+	// first-party status (the "shell" value); our hooks never set it.
+	Shell Status = "shell"
 )
 
-// Valid reports whether s is one of the three known statuses.
+// Valid reports whether s is one of the known statuses.
 func (s Status) Valid() bool {
 	switch s {
-	case Working, Prompt, Idle:
+	case Working, Prompt, Idle, Shell:
 		return true
 	default:
 		return false
@@ -54,10 +58,10 @@ func (s Status) Valid() bool {
 }
 
 // nameRE matches the waybar workspace-name grammar. Group 1 is the status sigil
-// (w|p|i), group 2 is the slot number, group 3 (optional, idle only) is the
+// (w|p|i|s), group 2 is the slot number, group 3 (optional, idle only) is the
 // decay level. This is also the "adopt" regex the daemon uses to reclaim slots
 // from pre-existing workspace names on startup.
-var nameRE = regexp.MustCompile(`^c(w|p|i)(\d+)(?:l(\d+))?$`)
+var nameRE = regexp.MustCompile(`^c(w|p|i|s)(\d+)(?:l(\d+))?$`)
 
 // EncodeWorking returns the workspace name for a working session in the given
 // slot, e.g. EncodeWorking(3) == "cw3".
@@ -77,15 +81,23 @@ func EncodeIdle(slot, level int) string {
 	return "ci" + strconv.Itoa(slot) + "l" + strconv.Itoa(level)
 }
 
+// EncodeShell returns the workspace name for a shell-monitoring session in the
+// given slot, e.g. EncodeShell(3) == "cs3".
+func EncodeShell(slot int) string {
+	return "cs" + strconv.Itoa(slot)
+}
+
 // Encode returns the workspace name for the given status, slot, and (idle-only)
-// decay level. level is ignored for Working and Prompt. It is the inverse of
-// ParseName.
+// decay level. level is ignored for Working, Prompt, and Shell. It is the
+// inverse of ParseName.
 func Encode(status Status, slot, level int) string {
 	switch status {
 	case Working:
 		return EncodeWorking(slot)
 	case Prompt:
 		return EncodePrompt(slot)
+	case Shell:
+		return EncodeShell(slot)
 	default:
 		return EncodeIdle(slot, level)
 	}
@@ -110,6 +122,8 @@ func ParseName(name string) (slot int, status Status, level int, ok bool) {
 		status = Working
 	case "p":
 		status = Prompt
+	case "s":
+		status = Shell
 	case "i":
 		status = Idle
 		if m[3] != "" {
@@ -216,6 +230,8 @@ const (
 	WorkingColor = "#d97757"
 	// PromptColor is the yellow used for the prompt blink.
 	PromptColor = "#ebcb8b"
+	// ShellColor is the cyan used for the shell-monitoring pulse.
+	ShellColor = "#5ccfe6"
 )
 
 // idleGlyphs is the two-cell shade bar per decay level (the shape axis).
@@ -234,6 +250,10 @@ func WorkingIcon() string { return " ●" }
 
 // PromptIcon returns the waybar glyph for a prompting session.
 func PromptIcon() string { return " ?" }
+
+// ShellIcon returns the waybar glyph for a shell-monitoring session (a dot, like
+// working — the cyan pulse distinguishes it).
+func ShellIcon() string { return " ●" }
 
 // IdleIcon returns the waybar two-cell shade glyph for the given decay level.
 // Out-of-range levels clamp to the nearest valid level.

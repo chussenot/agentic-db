@@ -60,6 +60,34 @@ func TestAggregatePrecedence(t *testing.T) {
 	}
 }
 
+func TestAggregateShellPrecedence(t *testing.T) {
+	now := time.UnixMilli(1_000_000)
+	resolve := mapResolver{10: 1, 11: 1, 20: 2, 21: 2, 30: 3, 31: 3}
+
+	sessions := []db.Session{
+		// Workspace 1: shell + idle -> shell wins (more alive than idle).
+		sess("shell", 10, 0),
+		sess("idle", 11, now.UnixMilli()),
+		// Workspace 2: shell + prompt -> prompt wins (needs-you outranks monitor).
+		sess("shell", 20, 0),
+		sess("prompt", 21, 0),
+		// Workspace 3: shell + working -> working wins.
+		sess("shell", 30, 0),
+		sess("working", 31, 0),
+	}
+	got := aggregate(sessions, resolve, now)
+
+	if got[1].status != state.Shell {
+		t.Errorf("ws1 = %v, want shell (beats idle)", got[1].status)
+	}
+	if got[2].status != state.Prompt {
+		t.Errorf("ws2 = %v, want prompt (beats shell)", got[2].status)
+	}
+	if got[3].status != state.Working {
+		t.Errorf("ws3 = %v, want working (beats shell)", got[3].status)
+	}
+}
+
 func TestAggregateDecayMostRecentWins(t *testing.T) {
 	now := time.UnixMilli(100 * 60 * 1000) // t = 100 min in ms
 	resolve := mapResolver{1: 7, 2: 7}

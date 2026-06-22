@@ -14,6 +14,8 @@ func TestParseNameRoundTrip(t *testing.T) {
 		{Working, 1, 0},
 		{Working, 20, 0},
 		{Prompt, 7, 0},
+		{Shell, 5, 0},
+		{Shell, 20, 0},
 		{Idle, 3, 0},
 		{Idle, 12, 6},
 		{Idle, 1, 4},
@@ -50,6 +52,9 @@ func TestEncodeForms(t *testing.T) {
 	}
 	if got := EncodePrompt(3); got != "cp3" {
 		t.Errorf("EncodePrompt(3) = %q; want cp3", got)
+	}
+	if got := EncodeShell(3); got != "cs3" {
+		t.Errorf("EncodeShell(3) = %q; want cs3", got)
 	}
 	if got := EncodeIdle(3, 2); got != "ci3l2" {
 		t.Errorf("EncodeIdle(3,2) = %q; want ci3l2", got)
@@ -123,6 +128,12 @@ func TestMapEvent(t *testing.T) {
 func TestRenderTables(t *testing.T) {
 	if WorkingIcon() != " ●" || PromptIcon() != " ?" {
 		t.Errorf("working/prompt icons wrong: %q %q", WorkingIcon(), PromptIcon())
+	}
+	if ShellIcon() != " ●" {
+		t.Errorf("shell icon wrong: %q", ShellIcon())
+	}
+	if ShellColor != "#5ccfe6" {
+		t.Errorf("shell color wrong: %q", ShellColor)
 	}
 	if IdleIcon(0) != " ██" || IdleIcon(6) != " ░░" {
 		t.Errorf("idle icon ends wrong: %q %q", IdleIcon(0), IdleIcon(6))
