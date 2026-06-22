@@ -9,10 +9,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"text/tabwriter"
+	"time"
 
+	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
 	"github.com/mrzor/claude-status/internal/niri"
+	"github.com/mrzor/claude-status/internal/state"
 )
 
 // Run executes the doctor subcommand. args is os.Args[2:]. It accepts an
@@ -57,6 +61,8 @@ func run(w io.Writer, path string) error {
 		tw.Flush()
 	}
 
+	printFirstParty(w, sessions)
+
 	fmt.Fprintf(w, "\nniri windows:\n")
 	windows, err := niri.ListWindows()
 	if err != nil {
@@ -72,6 +78,77 @@ func run(w io.Writer, path string) error {
 	}
 	tw.Flush()
 	return nil
+}
+
+// printFirstParty dumps Claude Code's first-party per-session status alongside
+// our hook-derived state, so drift between the two is visible at a glance. This
+// is the live view of the signal the daemon overlays (see
+// daemon.overlayFirstParty); EFFECTIVE is what the daemon actually uses.
+func printFirstParty(w io.Writer, sessions []db.Session) {
+	dir := clauded.DefaultDir()
+	fmt.Fprintf(w, "\nfirst-party status (%s):\n", dir)
+	fp, err := clauded.Read(dir)
+	if err != nil {
+		fmt.Fprintf(w, "  ERROR: %v\n", err)
+		return
+	}
+	fmt.Fprintf(w, "  %d session file(s)\n", len(fp))
+	if len(fp) == 0 {
+		return
+	}
+
+	hookState := make(map[string]string, len(sessions))
+	for _, s := range sessions {
+		hookState[s.SessionID] = s.State
+	}
+
+	ids := make([]string, 0, len(fp))
+	for id := range fp {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "  SESSION\tPID\tFIRST_PARTY\tAGE\tHOOK_STATE\tEFFECTIVE\tSOURCE")
+	for _, id := range ids {
+		f := fp[id]
+		hs, inDB := hookState[id]
+		if !inDB {
+			hs = "—" // first-party file with no live DB row (no window resolved yet)
+		}
+		effective, source := hs, "hook"
+		if st, ok := effectiveState(f.Status); ok {
+			effective, source = string(st), "first-party"
+		}
+		fmt.Fprintf(tw, "  %s\t%d\t%s\t%s\t%s\t%s\t%s\n",
+			shortID(id), f.PID, string(f.Status), statusAge(f.StatusUpdatedAt),
+			hs, effective, source)
+	}
+	tw.Flush()
+}
+
+// effectiveState mirrors daemon.overlayFirstParty's mapping for display. The
+// daemon is the runtime authority; this copy keeps doctor free of a daemon
+// import. busy->working, waiting->prompt, idle->idle; unknown -> not ok.
+func effectiveState(s clauded.Status) (state.Status, bool) {
+	switch s {
+	case clauded.Busy:
+		return state.Working, true
+	case clauded.Waiting:
+		return state.Prompt, true
+	case clauded.Idle:
+		return state.Idle, true
+	default:
+		return "", false
+	}
+}
+
+// statusAge renders how long ago the first-party status was updated.
+func statusAge(t time.Time) string {
+	if t.IsZero() {
+		return "?"
+	}
+	return db.Now().Sub(t).Truncate(time.Second).String()
 }
 
 func nullInt(v int64, valid bool) string {
