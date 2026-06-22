@@ -90,6 +90,7 @@ func Run(args []string) error {
 		pollInterval: clampInterval(*poll),
 		debounce:     clampInterval(*deb),
 		sessionsDir:  *sessionsDir,
+		fpMiss:       make(map[string]int),
 	}
 	return d.run(ctx)
 }
@@ -122,6 +123,11 @@ type daemon struct {
 	// snapshot is overlaid with the status found there (see overlayFirstParty).
 	// Empty disables the overlay (hook-derived state only).
 	sessionsDir string
+
+	// fpMiss counts consecutive GC ticks each local session has been absent from
+	// the first-party set; a session reaching firstPartyMissThreshold is reaped.
+	// Actor-owned (touched only by gc via firstPartyDead). See firstPartyDead.
+	fpMiss map[string]int
 }
 
 // clampInterval floors a configured duration at minInterval so a stray
@@ -300,7 +306,23 @@ const auditKeep = 5000
 // vanish from the next DB snapshot, which clears their dots via the normal
 // reconcile path.
 func (d *daemon) gc() {
-	pred := deadPredicate(d.model)
+	// Read the first-party set (best effort). A read error or empty result means
+	// "not available" — firstPartyDead then reaps nothing and the predicate falls
+	// back to window/pid liveness only. This is a second read, independent of the
+	// overlay read in goroutine B; on this tiny set of files it is negligible and
+	// keeps fpMiss accounting on the actor goroutine.
+	var fp map[string]clauded.Session
+	fpAvailable := false
+	if d.sessionsDir != "" {
+		if m, err := clauded.Read(d.sessionsDir); err != nil {
+			logf("gc first-party read: %v", err)
+		} else if len(m) > 0 {
+			fp, fpAvailable = m, true
+		}
+	}
+	fpDead := d.firstPartyDead(d.sessions, fp, fpAvailable)
+
+	pred := deadPredicate(d.model, fpDead)
 	if n, err := d.db.ReapDead(pred); err != nil {
 		logf("gc: %v", err)
 	} else if n > 0 {

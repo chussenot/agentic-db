@@ -86,7 +86,7 @@ func TestIdleDecayRendersFullFade(t *testing.T) {
 		now := t0.Add(c.elapsed)
 
 		// Real pipeline step 1: GC reaps dead rows.
-		pred := deadPredicate(model)
+		pred := deadPredicate(model, nil)
 		var live []db.Session
 		if !pred(idle) {
 			live = append(live, idle)
