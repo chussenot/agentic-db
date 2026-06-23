@@ -14,6 +14,7 @@ import (
 	"github.com/mrzor/claude-status/internal/doctor"
 	"github.com/mrzor/claude-status/internal/hook"
 	"github.com/mrzor/claude-status/internal/install"
+	"github.com/mrzor/claude-status/internal/tile"
 	"github.com/mrzor/claude-status/internal/waybar"
 )
 
@@ -30,6 +31,7 @@ commands:
   gen-waybar   emit waybar format-icons + style.css fragments
   doctor       dump the DB and live niri windows (debugging)
   events       print the bounded audit log (--session, --limit)
+  tile-data    emit pwetty claude-tile JSON for one niri desktop (--output)
 `
 
 func main() {
@@ -57,6 +59,8 @@ func main() {
 		err = doctor.Run(args)
 	case "events":
 		err = doctor.RunEvents(args)
+	case "tile-data":
+		err = tile.Run(args)
 	default:
 		fmt.Fprintf(os.Stderr, "claude-status: unknown command %q\n\n", os.Args[1])
 		fmt.Fprint(os.Stderr, usage)
