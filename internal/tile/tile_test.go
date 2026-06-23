@@ -99,6 +99,20 @@ func TestBuildAllKeysByOutputAndIdx(t *testing.T) {
 	}
 }
 
+func TestPayloadForDeterministicWindowPick(t *testing.T) {
+	now := time.UnixMilli(1_000_000)
+	w := ws(1, "HDMI-A-1", 2, false)
+	// Same two windows, opposite input orders (mimics randomized map iteration).
+	a := PayloadFor(w, []niri.Window{win(15, 2, "keepassxc", "KeePassXC"), win(9, 2, "firefox", "FF")}, map[int]db.Session{}, now)
+	b := PayloadFor(w, []niri.Window{win(9, 2, "firefox", "FF"), win(15, 2, "keepassxc", "KeePassXC")}, map[int]db.Session{}, now)
+	if a.App != b.App || a.Title != b.Title {
+		t.Fatalf("window pick not deterministic: %q/%q vs %q/%q", a.App, a.Title, b.App, b.Title)
+	}
+	if a.App != "firefox" { // lowest id (9) wins
+		t.Errorf("expected lowest-id window (firefox), got %q", a.App)
+	}
+}
+
 func TestCacheRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tiles.json")
 	in := map[string]Payload{

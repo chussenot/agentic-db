@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
@@ -81,6 +82,13 @@ func emptyPayload(idx int, active bool) Payload {
 func PayloadFor(ws niri.Workspace, winsOnWs []niri.Window, byWin map[int]db.Session, now time.Time) Payload {
 	if len(winsOnWs) == 0 {
 		return emptyPayload(ws.Idx, ws.IsFocused)
+	}
+	// Stable order: the daemon groups windows from a map (randomized iteration),
+	// so without this the chosen window (and thus the app-layout tile) flips on
+	// every cache rebuild — a desktop with 2+ windows visibly blinks between
+	// them. Sort by the stable window id so the pick is deterministic.
+	if len(winsOnWs) > 1 {
+		sort.Slice(winsOnWs, func(i, j int) bool { return winsOnWs[i].ID < winsOnWs[j].ID })
 	}
 	p := Payload{Shortcut: ws.Idx, Active: ws.IsFocused}
 	for _, w := range winsOnWs {
