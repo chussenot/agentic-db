@@ -65,8 +65,40 @@ func TestPayloadForAppDesktop(t *testing.T) {
 	if p.IsClaude == nil || *p.IsClaude != false {
 		t.Fatalf("app desktop must set is_claude=false: %+v", p)
 	}
-	if p.App != "org.keepassxc.KeePassXC" || p.AppIcon != "org.keepassxc.KeePassXC" {
-		t.Errorf("app fields wrong: %+v", p)
+	if p.App != "KeePassXC" { // reverse-DNS app_id cleaned to its last component
+		t.Errorf("app label = %q, want KeePassXC", p.App)
+	}
+	if p.AppIcon == "" { // resolved to an svg path or the bundled "app" fallback
+		t.Errorf("app_icon should never be empty: %+v", p)
+	}
+}
+
+func TestCleanAppLabel(t *testing.T) {
+	cases := map[string]string{
+		"firefox":                 "Firefox",   // all-lower -> capitalized
+		"org.keepassxc.KeePassXC": "KeePassXC", // reverse-DNS -> last comp, intact
+		"kitty":                   "Kitty",
+		"":                        "",
+	}
+	for in, want := range cases {
+		if got := cleanAppLabel(in); got != want {
+			t.Errorf("cleanAppLabel(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestIconCandidatesCoversReverseDNS(t *testing.T) {
+	c := iconCandidates("org.keepassxc.KeePassXC")
+	has := func(s string) bool {
+		for _, x := range c {
+			if x == s {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("keepassxc") { // the lowercased last component finds keepassxc.svg
+		t.Errorf("candidates %v missing 'keepassxc'", c)
 	}
 }
 
@@ -108,8 +140,8 @@ func TestPayloadForDeterministicWindowPick(t *testing.T) {
 	if a.App != b.App || a.Title != b.Title {
 		t.Fatalf("window pick not deterministic: %q/%q vs %q/%q", a.App, a.Title, b.App, b.Title)
 	}
-	if a.App != "firefox" { // lowest id (9) wins
-		t.Errorf("expected lowest-id window (firefox), got %q", a.App)
+	if a.App != "Firefox" { // lowest id (9) wins, label cleaned
+		t.Errorf("expected lowest-id window (Firefox), got %q", a.App)
 	}
 }
 

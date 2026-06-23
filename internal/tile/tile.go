@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/mrzor/claude-status/internal/db"
@@ -112,10 +114,89 @@ func PayloadFor(ws niri.Workspace, winsOnWs []niri.Window, byWin map[int]db.Sess
 	isClaude := false
 	p.IsClaude = &isClaude
 	w0 := winsOnWs[0]
-	p.App = w0.AppID     // MOCK: a human label would be nicer (bead r1d)
-	p.AppIcon = w0.AppID // MOCK: needs app_id -> icon mapping (bead r1d)
+	p.App = cleanAppLabel(w0.AppID)
+	p.AppIcon = resolveAppIcon(w0.AppID)
 	p.Title = w0.Title
 	return p
+}
+
+// iconMemo caches app_id -> resolved app_icon so repeated cache rebuilds don't
+// re-stat the icon themes. Concurrency-safe (the CLI and daemon are separate
+// processes; within the daemon only the actor goroutine touches it).
+var iconMemo sync.Map
+
+// appIconDirs are the scalable (SVG) app-icon directories searched, in
+// preference order. pwetty's <icon src> is SVG-only (resvg), so only .svg is
+// considered — a sized PNG can't render.
+func appIconDirs() []string {
+	var dirs []string
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".local/share/icons/hicolor/scalable/apps"))
+	}
+	return append(dirs,
+		"/usr/share/icons/hicolor/scalable/apps",
+		"/usr/share/icons/Papirus/scalable/apps",
+		"/usr/local/share/icons/hicolor/scalable/apps",
+	)
+}
+
+// resolveAppIcon maps a niri app_id to the tile's app_icon: an absolute .svg
+// path (drawn as the big hero icon) when a matching freedesktop icon exists,
+// else the bundled generic "app" glyph. Memoized.
+func resolveAppIcon(appID string) string {
+	if appID == "" {
+		return "app"
+	}
+	if v, ok := iconMemo.Load(appID); ok {
+		return v.(string)
+	}
+	res := findAppSVG(appID)
+	if res == "" {
+		res = "app"
+	}
+	iconMemo.Store(appID, res)
+	return res
+}
+
+func findAppSVG(appID string) string {
+	for _, dir := range appIconDirs() {
+		for _, c := range iconCandidates(appID) {
+			p := filepath.Join(dir, c+".svg")
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// iconCandidates are the icon basenames to try for an app_id, e.g.
+// "org.keepassxc.KeePassXC" -> [the full id, lowercased, "KeePassXC",
+// "keepassxc"], so a reverse-DNS app_id still finds keepassxc.svg.
+func iconCandidates(appID string) []string {
+	out := []string{appID, strings.ToLower(appID)}
+	if i := strings.LastIndex(appID, "."); i >= 0 && i+1 < len(appID) {
+		last := appID[i+1:]
+		out = append(out, last, strings.ToLower(last))
+	}
+	return out
+}
+
+// cleanAppLabel turns an app_id into a display label: the last dotted component,
+// with an all-lowercase name capitalized ("firefox" -> "Firefox") and a
+// mixed-case one left intact ("KeePassXC").
+func cleanAppLabel(appID string) string {
+	s := appID
+	if i := strings.LastIndex(s, "."); i >= 0 && i+1 < len(s) {
+		s = s[i+1:]
+	}
+	if s == "" {
+		return appID
+	}
+	if s == strings.ToLower(s) {
+		return strings.ToUpper(s[:1]) + s[1:]
+	}
+	return s
 }
 
 // BuildAll computes payloads for every workspace, keyed by Key(output, idx). The
