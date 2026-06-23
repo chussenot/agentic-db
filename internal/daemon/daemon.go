@@ -35,6 +35,7 @@ import (
 	"github.com/mrzor/claude-status/internal/db"
 	"github.com/mrzor/claude-status/internal/niri"
 	"github.com/mrzor/claude-status/internal/state"
+	"github.com/mrzor/claude-status/internal/tile"
 )
 
 const (
@@ -91,6 +92,7 @@ func Run(args []string) error {
 		debounce:     clampInterval(*deb),
 		sessionsDir:  *sessionsDir,
 		fpMiss:       make(map[string]int),
+		tilePath:     tile.CachePath(*dbPath),
 	}
 	return d.run(ctx)
 }
@@ -128,6 +130,10 @@ type daemon struct {
 	// the first-party set; a session reaching firstPartyMissThreshold is reaped.
 	// Actor-owned (touched only by gc via firstPartyDead). See firstPartyDead.
 	fpMiss map[string]int
+
+	// tilePath is where the daemon writes the precomputed pwetty tile cache (see
+	// writeTiles); the `tile-data` subcommand reads it instead of querying niri.
+	tilePath string
 }
 
 // clampInterval floors a configured duration at minInterval so a stray
@@ -193,8 +199,10 @@ func (d *daemon) run(ctx context.Context) error {
 
 		case <-ticks:
 			// Tick drives GC and forces a reconcile so decay buckets advance even
-			// with no niri/DB events (the bucket-crossing rename path).
+			// with no niri/DB events (the bucket-crossing rename path). It also
+			// refreshes the pwetty tile cache so `tile-data` stays a cheap file read.
 			d.gc()
+			d.writeTiles()
 			markDirty()
 
 		case <-debTimer.C:
@@ -330,6 +338,26 @@ func (d *daemon) gc() {
 	}
 	if _, err := d.db.PruneEvents(auditKeep); err != nil {
 		logf("prune events: %v", err)
+	}
+}
+
+// writeTiles refreshes the pwetty tile cache from the daemon's in-memory niri
+// model + latest (first-party-overlaid) session snapshot, so the `tile-data`
+// subcommand is a single file read with no `niri msg` spawn or DB open — the
+// fix for the desktop-switch lag the per-tile IPC churn caused. Runs on the
+// actor goroutine (1s tick), best-effort. Decay/idle_ago advance each tick, so
+// the cache is rewritten every tick; one small file write/sec is negligible.
+func (d *daemon) writeTiles() {
+	if d.tilePath == "" {
+		return
+	}
+	windows := make([]niri.Window, 0, len(d.model.Windows()))
+	for _, w := range d.model.Windows() {
+		windows = append(windows, w)
+	}
+	tiles := tile.BuildAll(d.model.Workspaces(), windows, d.sessions, db.Now())
+	if err := tile.WriteCache(d.tilePath, tiles); err != nil {
+		logf("write tile cache: %v", err)
 	}
 }
 

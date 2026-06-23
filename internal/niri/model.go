@@ -137,6 +137,11 @@ func (m *Model) Workspace(id int) (Workspace, bool) {
 	return w, ok
 }
 
+// Windows returns the current window snapshot (id -> Window). The returned map
+// is the model's own; callers must not mutate it. Used by the tile-cache writer
+// to group windows per workspace without a fresh `niri msg` query.
+func (m *Model) Windows() map[int]Window { return m.windows }
+
 // SetName records the name the daemon assigned to a workspace locally, keeping
 // the model's view consistent with the IPC call the reconciler just made
 // (mirrors the Python writing ws["name"] = name after each action). This avoids

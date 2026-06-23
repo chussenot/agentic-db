@@ -1,15 +1,20 @@
 // Package tile implements `claude-status tile-data <index>` — the producer that
-// bridges claude-status-db + niri to the pwetty `claude` waybar tile.
+// bridges claude-status-db + niri to the pwetty `claude` waybar tile — plus the
+// shared payload model and the daemon-written tile cache.
 //
 // It emits, on stdout, the JSON data object the bundled pwetty `claude` tile
 // expects (contract: ~/Perso/pwetty-box-rs/tiles/claude/schema.json) for ONE
-// niri desktop, identified by its per-output workspace index. A waybar
-// `cffi/pwetty#i` module configured `exec: claude-status tile-data i` then
-// renders a rich per-desktop tile, replacing the old niri/workspaces glyph.
+// niri desktop, identified by its per-output workspace index.
 //
-// Like the hook, this is on a user-facing path (waybar reruns it every
-// interval): it ALWAYS prints valid JSON and returns nil, degrading to a
-// minimal payload rather than failing the bar.
+// HOT PATH: a waybar `cffi/pwetty#i` module reruns this every interval, once per
+// tile. To keep that cheap (a regression once hammered niri with `niri msg` IPC
+// and stuttered desktop switches), the long-lived daemon — which already holds
+// the niri model + sessions live — precomputes every desktop's payload and
+// writes them to a cache file (WriteCache) on its tick. `tile-data` then just
+// reads that file (ReadCache): no `niri msg` spawn, no DB open. The live path
+// (BuildLive) remains only as a fallback when the cache is absent (no daemon).
+//
+// Like the hook, the CLI ALWAYS prints valid JSON and returns nil.
 package tile
 
 import (
@@ -29,14 +34,13 @@ import (
 
 // defaultOutput is the niri connector the second bar lives on. The producer is
 // scoped to one output so a bare desktop index uniquely identifies a workspace
-// (indexes repeat across outputs). Overridable with --output. Multi-output
-// support is tracked separately (see the pwetty epic).
+// (indexes repeat across outputs). Overridable with --output.
 const defaultOutput = "HDMI-A-1"
 
-// payload is the pwetty `claude` tile data object. Fields use omitempty so an
+// Payload is the pwetty `claude` tile data object. Fields use omitempty so an
 // absent value falls back to the tile's schema default. See schema.json for the
 // REAL (from claude-status-db) vs MOCK (synthesized) provenance of each field.
-type payload struct {
+type Payload struct {
 	Shortcut  int    `json:"shortcut"`
 	State     string `json:"state,omitempty"`
 	IdleLevel int    `json:"idle_level,omitempty"`
@@ -50,10 +54,114 @@ type payload struct {
 	AppIcon   string `json:"app_icon,omitempty"`
 }
 
-// Run executes the tile-data subcommand. args is os.Args[2:]. It parses an
-// optional --output/--db and a single positional desktop index, builds the
-// payload, prints it as JSON, and ALWAYS returns nil (a bad arg or any error
-// degrades to a minimal payload; the bar must never break).
+// Key is the tile-cache key for a desktop: "<output>:<idx>". Indexes repeat
+// across outputs, so the output qualifies them.
+func Key(output string, idx int) string { return output + ":" + strconv.Itoa(idx) }
+
+// CachePath is where the daemon writes the precomputed tiles, next to the DB.
+func CachePath(dbPath string) string {
+	return filepath.Join(filepath.Dir(dbPath), "tiles.json")
+}
+
+// emptyPayload is the placeholder for an absent/empty desktop: the shortcut on a
+// fully-faded idle bar. (Polishing this to the bundled `empty` tile is beaded.)
+func emptyPayload(idx int, active bool) Payload {
+	return Payload{Shortcut: idx, State: string(state.Idle), IdleLevel: state.DecayLevels - 1, Active: active}
+}
+
+// PayloadFor computes the tile payload for one workspace from already-gathered
+// state: the workspace, the windows currently on it, sessions indexed by their
+// cached window id, and the clock. PURE (no IPC/DB) so both the daemon and the
+// CLI fallback share it and it is unit-testable.
+//
+// An empty desktop -> emptyPayload. A desktop with a window mapping to a tracked
+// session -> the Claude layout (state/folder/decay/title). Otherwise -> the app
+// layout (leftmost window's app + icon). Note: the daemon passes its first-party
+// overlaid sessions, so the cached State is the effective state, not raw hooks.
+func PayloadFor(ws niri.Workspace, winsOnWs []niri.Window, byWin map[int]db.Session, now time.Time) Payload {
+	if len(winsOnWs) == 0 {
+		return emptyPayload(ws.Idx, ws.IsFocused)
+	}
+	p := Payload{Shortcut: ws.Idx, Active: ws.IsFocused}
+	for _, w := range winsOnWs {
+		s, ok := byWin[w.ID]
+		if !ok {
+			continue
+		}
+		p.State = s.State
+		if s.Cwd.Valid {
+			p.Folder = filepath.Base(s.Cwd.String)
+		}
+		p.Title = w.Title
+		if state.Status(s.State) == state.Idle && s.LastTalkTS.Valid {
+			elapsed := now.Sub(time.UnixMilli(s.LastTalkTS.Int64))
+			p.IdleLevel = state.DecayLevel(elapsed)
+			p.IdleAgo = fmtAgo(elapsed)
+		}
+		return p
+	}
+	// No tracked session on this desktop: the app layout for the leftmost window.
+	isClaude := false
+	p.IsClaude = &isClaude
+	w0 := winsOnWs[0]
+	p.App = w0.AppID     // MOCK: a human label would be nicer (bead r1d)
+	p.AppIcon = w0.AppID // MOCK: needs app_id -> icon mapping (bead r1d)
+	p.Title = w0.Title
+	return p
+}
+
+// BuildAll computes payloads for every workspace, keyed by Key(output, idx). The
+// daemon calls this with its in-memory model + sessions (no IPC) and writes the
+// result via WriteCache.
+func BuildAll(workspaces map[int]niri.Workspace, windows []niri.Window, sessions []db.Session, now time.Time) map[string]Payload {
+	byWin := make(map[int]db.Session, len(sessions))
+	for _, s := range sessions {
+		if s.WindowID.Valid {
+			byWin[int(s.WindowID.Int64)] = s
+		}
+	}
+	winsByWs := make(map[int][]niri.Window)
+	for _, w := range windows {
+		winsByWs[w.WorkspaceID] = append(winsByWs[w.WorkspaceID], w)
+	}
+	out := make(map[string]Payload, len(workspaces))
+	for _, ws := range workspaces {
+		out[Key(ws.Output, ws.Idx)] = PayloadFor(ws, winsByWs[ws.ID], byWin, now)
+	}
+	return out
+}
+
+// WriteCache atomically writes the tile cache to path (temp file + rename, so a
+// concurrent reader never sees a half-written file).
+func WriteCache(path string, tiles map[string]Payload) error {
+	data, err := json.Marshal(tiles)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// ReadCache loads the tile cache written by the daemon.
+func ReadCache(path string) (map[string]Payload, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var tiles map[string]Payload
+	if err := json.Unmarshal(data, &tiles); err != nil {
+		return nil, err
+	}
+	return tiles, nil
+}
+
+// Run executes the tile-data subcommand. args is os.Args[2:]. It reads the
+// daemon's cache for the desktop (the cheap hot path) and, only if the cache is
+// missing, falls back to a live niri+DB query. It ALWAYS prints valid JSON and
+// returns nil.
 func Run(args []string) error {
 	dbPath := db.DefaultDBPath()
 	output := defaultOutput
@@ -65,23 +173,32 @@ func Run(args []string) error {
 
 	idx, err := strconv.Atoi(fs.Arg(0))
 	if err != nil {
-		// No usable index: emit a harmless empty tile rather than fail.
 		idx = 0
 	}
 
-	p := build(dbPath, output, idx)
+	var p Payload
+	if tiles, rerr := ReadCache(CachePath(dbPath)); rerr == nil {
+		// Cache hit path: a single file read, no niri/DB. Missing key (a desktop
+		// the daemon didn't see) -> empty placeholder.
+		var ok bool
+		if p, ok = tiles[Key(output, idx)]; !ok {
+			p = emptyPayload(idx, false)
+		}
+	} else {
+		// No cache (daemon not running): degrade to a live query.
+		p = BuildLive(dbPath, output, idx)
+	}
 	_ = json.NewEncoder(os.Stdout).Encode(p)
 	return nil
 }
 
-// build assembles the tile payload for desktop `idx` on `output`. It never
-// errors: any failed lookup degrades to the minimal/empty payload.
-func build(dbPath, output string, idx int) payload {
-	empty := payload{Shortcut: idx, State: string(state.Idle), IdleLevel: state.DecayLevels - 1}
-
+// BuildLive gathers state directly from niri + the DB for one desktop. It is the
+// fallback when the daemon's cache is unavailable; the steady state uses the
+// cache instead (BuildAll + WriteCache in the daemon).
+func BuildLive(dbPath, output string, idx int) Payload {
 	wss, err := niri.ListWorkspaces()
 	if err != nil {
-		return empty
+		return emptyPayload(idx, false)
 	}
 	var ws *niri.Workspace
 	for i := range wss {
@@ -91,12 +208,9 @@ func build(dbPath, output string, idx int) payload {
 		}
 	}
 	if ws == nil {
-		return empty // no such desktop on this output
+		return emptyPayload(idx, false)
 	}
 
-	p := payload{Shortcut: idx, Active: ws.IsFocused}
-
-	// Windows currently on this workspace.
 	wins, _ := niri.ListWindows()
 	var onWs []niri.Window
 	for _, w := range wins {
@@ -104,51 +218,19 @@ func build(dbPath, output string, idx int) payload {
 			onWs = append(onWs, w)
 		}
 	}
-	if len(onWs) == 0 {
-		empty.Active = ws.IsFocused
-		return empty // existing but empty desktop
-	}
 
-	// Index live sessions by their cached window id.
-	byWin := map[int]db.Session{}
+	var sessions []db.Session
 	if database, derr := db.Open(dbPath); derr == nil {
 		defer database.Close()
-		if sessions, lerr := database.LoadLive(); lerr == nil {
-			for _, s := range sessions {
-				if s.WindowID.Valid {
-					byWin[int(s.WindowID.Int64)] = s
-				}
-			}
+		sessions, _ = database.LoadLive()
+	}
+	byWin := make(map[int]db.Session, len(sessions))
+	for _, s := range sessions {
+		if s.WindowID.Valid {
+			byWin[int(s.WindowID.Int64)] = s
 		}
 	}
-
-	// A Claude desktop: the first window on it that maps to a tracked session.
-	for _, w := range onWs {
-		s, ok := byWin[w.ID]
-		if !ok {
-			continue
-		}
-		p.State = s.State // REAL hook state (first-party overlay TODO: bead)
-		if s.Cwd.Valid {
-			p.Folder = filepath.Base(s.Cwd.String)
-		}
-		p.Title = w.Title
-		if state.Status(s.State) == state.Idle && s.LastTalkTS.Valid {
-			elapsed := time.Duration(db.Now().UnixMilli()-s.LastTalkTS.Int64) * time.Millisecond
-			p.IdleLevel = state.DecayLevel(elapsed)
-			p.IdleAgo = fmtAgo(elapsed)
-		}
-		return p
-	}
-
-	// An ordinary (non-Claude) desktop: show the leftmost window's app + icon.
-	isClaude := false
-	p.IsClaude = &isClaude
-	w0 := onWs[0]
-	p.App = w0.AppID     // MOCK: a human label would be nicer (bead)
-	p.AppIcon = w0.AppID // MOCK: needs app_id -> icon mapping (bead)
-	p.Title = w0.Title
-	return p
+	return PayloadFor(*ws, onWs, byWin, db.Now())
 }
 
 // fmtAgo renders an elapsed duration as the tile's "time since active" string:
