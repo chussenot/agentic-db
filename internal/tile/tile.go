@@ -138,6 +138,13 @@ func WriteCache(path string, tiles map[string]Payload) error {
 	if err != nil {
 		return err
 	}
+	return WriteCacheBytes(path, data)
+}
+
+// WriteCacheBytes atomically writes pre-marshaled cache bytes to path. The
+// daemon marshals once so it can dedupe (skip the write when nothing changed)
+// before calling this.
+func WriteCacheBytes(path string, data []byte) error {
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err

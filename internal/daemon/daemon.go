@@ -23,7 +23,9 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -134,6 +136,14 @@ type daemon struct {
 	// tilePath is where the daemon writes the precomputed pwetty tile cache (see
 	// writeTiles); the `tile-data` subcommand reads it instead of querying niri.
 	tilePath string
+	// lastTiles is the JSON bytes last written to tilePath, for dedupe: the cache
+	// is rebuilt event-driven but only written when the bytes actually change,
+	// keeping I/O minimal.
+	lastTiles []byte
+	// lastTileBuild throttles cache rebuilds: reconcile runs at ~60Hz but the
+	// tiles poll only once/sec, so rebuilding faster than tileBuildInterval is
+	// wasted CPU. See maybeWriteTiles.
+	lastTileBuild time.Time
 }
 
 // clampInterval floors a configured duration at minInterval so a stray
@@ -202,7 +212,7 @@ func (d *daemon) run(ctx context.Context) error {
 			// with no niri/DB events (the bucket-crossing rename path). It also
 			// refreshes the pwetty tile cache so `tile-data` stays a cheap file read.
 			d.gc()
-			d.writeTiles()
+			d.maybeWriteTiles()
 			markDirty()
 
 		case <-debTimer.C:
@@ -341,6 +351,21 @@ func (d *daemon) gc() {
 	}
 }
 
+// tileBuildInterval caps how often the tile cache is rebuilt. The tiles poll at
+// 1s, so keeping the cache fresh to within 250ms is invisible to the user while
+// sparing the daemon a rebuild on every ~13ms reconcile.
+const tileBuildInterval = 250 * time.Millisecond
+
+// maybeWriteTiles rebuilds the tile cache at most once per tileBuildInterval.
+func (d *daemon) maybeWriteTiles() {
+	now := db.Now()
+	if now.Sub(d.lastTileBuild) < tileBuildInterval {
+		return
+	}
+	d.lastTileBuild = now
+	d.writeTiles()
+}
+
 // writeTiles refreshes the pwetty tile cache from the daemon's in-memory niri
 // model + latest (first-party-overlaid) session snapshot, so the `tile-data`
 // subcommand is a single file read with no `niri msg` spawn or DB open — the
@@ -356,9 +381,19 @@ func (d *daemon) writeTiles() {
 		windows = append(windows, w)
 	}
 	tiles := tile.BuildAll(d.model.Workspaces(), windows, d.sessions, db.Now())
-	if err := tile.WriteCache(d.tilePath, tiles); err != nil {
-		logf("write tile cache: %v", err)
+	data, err := json.Marshal(tiles)
+	if err != nil {
+		logf("marshal tile cache: %v", err)
+		return
 	}
+	if bytes.Equal(data, d.lastTiles) {
+		return // unchanged since last write — skip the file I/O
+	}
+	if err := tile.WriteCacheBytes(d.tilePath, data); err != nil {
+		logf("write tile cache: %v", err)
+		return
+	}
+	d.lastTiles = data
 }
 
 // reconcile is the sole mutator of niri names. It computes desired per-workspace
@@ -366,6 +401,12 @@ func (d *daemon) writeTiles() {
 // emits niri renames only where the name changed. Ports State.reconcile, with
 // the DB-sourced aggregation replacing title-scraping.
 func (d *daemon) reconcile() {
+	// Refresh the tile cache event-driven (on a switch, a state change, a new
+	// window), not just on the 1s tick, so `tile-data` always reads current data.
+	// Throttled (see maybeWriteTiles) since reconcile runs at ~60Hz but the tiles
+	// only poll once/sec; dedupe in writeTiles then elides unchanged writes.
+	d.maybeWriteTiles()
+
 	want := aggregate(d.sessions, d.model, db.Now())
 
 	// 1) Clear names for workspaces we manage that are no longer wanted, or that
