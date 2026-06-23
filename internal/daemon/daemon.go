@@ -201,6 +201,12 @@ func (d *daemon) run(ctx context.Context) error {
 			}
 			if d.applyEvent(ev) {
 				markDirty()
+				// A desktop switch changes which tile is "active" — the latency the
+				// user feels most. Refresh the tile cache immediately (bypassing the
+				// reconcile throttle) so a streaming tile-watch pushes it at once.
+				if ev.Kind == niri.KindWorkspaceActivated {
+					d.writeTiles()
+				}
 			}
 
 		case snap := <-snapshots:

@@ -288,6 +288,60 @@ func Run(args []string) error {
 	return nil
 }
 
+// watchPoll is how often tile-watch re-reads the cache. The cache only changes
+// at human cadence (and the daemon writes it immediately on a switch), so a
+// short poll here keeps detection latency low at negligible cost (a small file
+// read). pwetty then repaints within ~150ms of the printed line.
+const watchPoll = 75 * time.Millisecond
+
+// RunWatch implements `claude-status tile-watch <index>` — the STREAMING
+// producer for pwetty's `stream: true` mode. It prints the desktop's tile JSON
+// line immediately, then prints a fresh newline-delimited JSON line whenever
+// this desktop's cached payload changes. One long-lived process per tile (no
+// per-refresh process spawn, no niri/DB access), so pwetty pushes updates within
+// ~150ms instead of waiting on a 1s poll. Always returns nil after blocking
+// forever; on any read error it emits the empty placeholder.
+func RunWatch(args []string) error {
+	dbPath := db.DefaultDBPath()
+	output := defaultOutput
+	fs := flag.NewFlagSet("tile-watch", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&dbPath, "db", dbPath, "path to the claude-status sqlite database")
+	fs.StringVar(&output, "output", output, "niri output (connector) the tile's desktop lives on")
+	_ = fs.Parse(args)
+	idx, err := strconv.Atoi(fs.Arg(0))
+	if err != nil {
+		idx = 0
+	}
+	key := Key(output, idx)
+	path := CachePath(dbPath)
+
+	var last string
+	emit := func() {
+		p := emptyPayload(idx, false)
+		if tiles, rerr := ReadCache(path); rerr == nil {
+			if cached, ok := tiles[key]; ok {
+				p = cached
+			}
+		}
+		b, merr := json.Marshal(p)
+		if merr != nil {
+			return
+		}
+		if s := string(b); s != last {
+			last = s
+			// One Write of the full line so pwetty's line reader sees it whole.
+			_, _ = os.Stdout.Write(append(b, '\n'))
+		}
+	}
+
+	emit() // initial line so the tile shows immediately
+	for {
+		time.Sleep(watchPoll)
+		emit()
+	}
+}
+
 // BuildLive gathers state directly from niri + the DB for one desktop. It is the
 // fallback when the daemon's cache is unavailable; the steady state uses the
 // cache instead (BuildAll + WriteCache in the daemon).

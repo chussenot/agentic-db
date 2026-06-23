@@ -32,6 +32,7 @@ commands:
   doctor       dump the DB and live niri windows (debugging)
   events       print the bounded audit log (--session, --limit)
   tile-data    emit pwetty claude-tile JSON for one niri desktop (--output)
+  tile-watch   stream tile JSON for one desktop on change (pwetty stream:true)
 `
 
 func main() {
@@ -61,6 +62,8 @@ func main() {
 		err = doctor.RunEvents(args)
 	case "tile-data":
 		err = tile.Run(args)
+	case "tile-watch":
+		err = tile.RunWatch(args)
 	default:
 		fmt.Fprintf(os.Stderr, "claude-status: unknown command %q\n\n", os.Args[1])
 		fmt.Fprint(os.Stderr, usage)
