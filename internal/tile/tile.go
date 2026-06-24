@@ -40,22 +40,39 @@ import (
 // (indexes repeat across outputs). Overridable with --output.
 const defaultOutput = "HDMI-A-1"
 
-// Payload is the pwetty `claude` tile data object. Fields use omitempty so an
-// absent value falls back to the tile's schema default. See schema.json for the
-// REAL (from claude-status-db) vs MOCK (synthesized) provenance of each field.
+// Payload is the pwetty `claude` tile data object for ONE niri desktop. The tile
+// is data-driven (contract: ~/Perso/pwetty-box-rs/tiles/claude/schema.json): a
+// Claude desktop carries `sessions` (1 -> single layout, 2 -> stacked dual), an
+// ordinary window carries is_claude=false + app/app_icon/title. Fields use
+// omitempty so an absent value falls back to the tile's schema default.
 type Payload struct {
-	Shortcut  int    `json:"shortcut"`
-	State     string `json:"state,omitempty"`
-	IdleLevel int    `json:"idle_level,omitempty"`
-	IdleAgo   string `json:"idle_ago,omitempty"`
+	Shortcut int           `json:"shortcut"`
+	Active   bool          `json:"active,omitempty"`
+	Sessions []SessionTile `json:"sessions,omitempty"`
+	IsClaude *bool         `json:"is_claude,omitempty"`
+	App      string        `json:"app,omitempty"`
+	AppIcon  string        `json:"app_icon,omitempty"`
+	Title    string        `json:"title,omitempty"` // is_claude=false (window) only
+}
+
+// SessionTile is one Claude session within a desktop's `sessions` array. State is
+// required (drives the indicator); the rest fall back to schema defaults when
+// omitted. Two sessions sharing one niri window (e.g. two kitty tabs) share that
+// window's Title — niri exposes no per-tab title.
+type SessionTile struct {
+	State     string `json:"state"`
 	Folder    string `json:"folder,omitempty"`
 	Title     string `json:"title,omitempty"`
 	Unpushed  int    `json:"unpushed,omitempty"`
-	Active    bool   `json:"active,omitempty"`
-	IsClaude  *bool  `json:"is_claude,omitempty"`
-	App       string `json:"app,omitempty"`
-	AppIcon   string `json:"app_icon,omitempty"`
+	IdleLevel int    `json:"idle_level,omitempty"`
+	IdleAgo   string `json:"idle_ago,omitempty"`
 }
+
+// maxSessionsPerTile caps the sessions array at the contract's maxItems (2). When
+// a desktop has more, statePriority ordering keeps the most salient two (a prompt
+// is never dropped) so the tile's "any session prompt -> whole tile pulses" alert
+// still fires.
+const maxSessionsPerTile = 2
 
 // Key is the tile-cache key for a desktop: "<output>:<idx>". Indexes repeat
 // across outputs, so the output qualifies them.
@@ -67,9 +84,47 @@ func CachePath(dbPath string) string {
 }
 
 // emptyPayload is the placeholder for an absent/empty desktop: the shortcut on a
-// fully-faded idle bar. (Polishing this to the bundled `empty` tile is beaded.)
+// fully-faded idle bar, expressed as a single dimmed idle session so it satisfies
+// the data-driven `sessions` contract. (Polishing this to the bundled `empty`
+// tile is beaded.)
 func emptyPayload(idx int, active bool) Payload {
-	return Payload{Shortcut: idx, State: string(state.Idle), IdleLevel: state.DecayLevels - 1, Active: active}
+	return Payload{
+		Shortcut: idx,
+		Active:   active,
+		Sessions: []SessionTile{{State: string(state.Idle), IdleLevel: state.DecayLevels - 1}},
+	}
+}
+
+// statePriority orders sessions for the dual layout and the maxSessionsPerTile
+// cap: prompt first (never dropped — it drives the tile pulse), then working,
+// shell, idle. Unknown states sort last.
+func statePriority(s string) int {
+	switch state.Status(s) {
+	case state.Prompt:
+		return 0
+	case state.Working:
+		return 1
+	case state.Shell:
+		return 2
+	case state.Idle:
+		return 3
+	default:
+		return 4
+	}
+}
+
+// sessionTile builds one SessionTile from a DB session and its window title.
+func sessionTile(s db.Session, title string, now time.Time) SessionTile {
+	st := SessionTile{State: s.State, Title: title}
+	if s.Cwd.Valid {
+		st.Folder = filepath.Base(s.Cwd.String)
+	}
+	if state.Status(s.State) == state.Idle && s.LastTalkTS.Valid {
+		elapsed := now.Sub(time.UnixMilli(s.LastTalkTS.Int64))
+		st.IdleLevel = state.DecayLevel(elapsed)
+		st.IdleAgo = fmtAgo(elapsed)
+	}
+	return st
 }
 
 // PayloadFor computes the tile payload for one workspace from already-gathered
@@ -77,43 +132,68 @@ func emptyPayload(idx int, active bool) Payload {
 // cached window id, and the clock. PURE (no IPC/DB) so both the daemon and the
 // CLI fallback share it and it is unit-testable.
 //
-// An empty desktop -> emptyPayload. A desktop with a window mapping to a tracked
-// session -> the Claude layout (state/folder/decay/title). Otherwise -> the app
-// layout (leftmost window's app + icon). Note: the daemon passes its first-party
-// overlaid sessions, so the cached State is the effective state, not raw hooks.
-func PayloadFor(ws niri.Workspace, winsOnWs []niri.Window, byWin map[int]db.Session, now time.Time) Payload {
-	if len(winsOnWs) == 0 {
-		return emptyPayload(ws.Idx, ws.IsFocused)
-	}
-	// Stable order: the daemon groups windows from a map (randomized iteration),
-	// so without this the chosen window (and thus the app-layout tile) flips on
-	// every cache rebuild — a desktop with 2+ windows visibly blinks between
-	// them. Sort by the stable window id so the pick is deterministic.
-	if len(winsOnWs) > 1 {
-		sort.Slice(winsOnWs, func(i, j int) bool { return winsOnWs[i].ID < winsOnWs[j].ID })
-	}
+// An empty desktop -> emptyPayload. A desktop with one or more tracked sessions
+// -> the Claude layout: every session on the desktop as a `sessions[]` entry
+// (capped at maxSessionsPerTile, prompt-priority ordered). Co-resident sessions
+// that share one niri window (two kitty tabs) BOTH appear — they are grouped by
+// workspace, not window, so neither is masked. A desktop with windows but no
+// tracked session -> the app layout (leftmost window's app + icon). Note: the
+// daemon passes its first-party overlaid sessions, so each State is the effective
+// state, not raw hooks.
+func PayloadFor(ws niri.Workspace, winsOnWs []niri.Window, sessionsOnWs []db.Session, now time.Time) Payload {
 	p := Payload{Shortcut: ws.Idx, Active: ws.IsFocused}
-	for _, w := range winsOnWs {
-		s, ok := byWin[w.ID]
-		if !ok {
-			continue
+
+	if len(sessionsOnWs) > 0 {
+		// Title comes from the session's niri window (sessions carry no title of
+		// their own); co-window sessions share it.
+		titleOf := make(map[int]string, len(winsOnWs))
+		for _, w := range winsOnWs {
+			titleOf[w.ID] = w.Title
 		}
-		p.State = s.State
-		if s.Cwd.Valid {
-			p.Folder = filepath.Base(s.Cwd.String)
+		// Deterministic, prompt-first order so the cap keeps the salient sessions
+		// and the layout doesn't flip between cache rebuilds. Tie-break on window
+		// then session id (both stable).
+		ss := append([]db.Session(nil), sessionsOnWs...)
+		sort.Slice(ss, func(i, j int) bool {
+			pi, pj := statePriority(ss[i].State), statePriority(ss[j].State)
+			if pi != pj {
+				return pi < pj
+			}
+			wi, wj := ss[i].WindowID.Int64, ss[j].WindowID.Int64
+			if wi != wj {
+				return wi < wj
+			}
+			return ss[i].SessionID < ss[j].SessionID
+		})
+		if len(ss) > maxSessionsPerTile {
+			ss = ss[:maxSessionsPerTile]
 		}
-		p.Title = w.Title
-		if state.Status(s.State) == state.Idle && s.LastTalkTS.Valid {
-			elapsed := now.Sub(time.UnixMilli(s.LastTalkTS.Int64))
-			p.IdleLevel = state.DecayLevel(elapsed)
-			p.IdleAgo = fmtAgo(elapsed)
+		for _, s := range ss {
+			title := ""
+			if s.WindowID.Valid {
+				title = titleOf[int(s.WindowID.Int64)]
+			}
+			p.Sessions = append(p.Sessions, sessionTile(s, title, now))
 		}
 		return p
 	}
+
+	if len(winsOnWs) == 0 {
+		return emptyPayload(ws.Idx, ws.IsFocused)
+	}
+
 	// No tracked session on this desktop: the app layout for the leftmost window.
+	// Stable order: the daemon groups windows from a map (randomized iteration),
+	// so without this the chosen window flips on every cache rebuild — a desktop
+	// with 2+ windows visibly blinks between them.
+	w0 := winsOnWs[0]
+	for _, w := range winsOnWs[1:] {
+		if w.ID < w0.ID {
+			w0 = w
+		}
+	}
 	isClaude := false
 	p.IsClaude = &isClaude
-	w0 := winsOnWs[0]
 	p.App = cleanAppLabel(w0.AppID)
 	p.AppIcon = resolveAppIcon(w0.AppID)
 	p.Title = w0.Title
@@ -203,19 +283,26 @@ func cleanAppLabel(appID string) string {
 // daemon calls this with its in-memory model + sessions (no IPC) and writes the
 // result via WriteCache.
 func BuildAll(workspaces map[int]niri.Workspace, windows []niri.Window, sessions []db.Session, now time.Time) map[string]Payload {
-	byWin := make(map[int]db.Session, len(sessions))
-	for _, s := range sessions {
-		if s.WindowID.Valid {
-			byWin[int(s.WindowID.Int64)] = s
-		}
-	}
+	winByID := make(map[int]niri.Window, len(windows))
 	winsByWs := make(map[int][]niri.Window)
 	for _, w := range windows {
+		winByID[w.ID] = w
 		winsByWs[w.WorkspaceID] = append(winsByWs[w.WorkspaceID], w)
+	}
+	// Group sessions by WORKSPACE (via their window's workspace), not by window:
+	// two sessions can share one window (kitty tabs), and both must surface.
+	sessByWs := make(map[int][]db.Session)
+	for _, s := range sessions {
+		if !s.WindowID.Valid {
+			continue
+		}
+		if w, ok := winByID[int(s.WindowID.Int64)]; ok {
+			sessByWs[w.WorkspaceID] = append(sessByWs[w.WorkspaceID], s)
+		}
 	}
 	out := make(map[string]Payload, len(workspaces))
 	for _, ws := range workspaces {
-		out[Key(ws.Output, ws.Idx)] = PayloadFor(ws, winsByWs[ws.ID], byWin, now)
+		out[Key(ws.Output, ws.Idx)] = PayloadFor(ws, winsByWs[ws.ID], sessByWs[ws.ID], now)
 	}
 	return out
 }
@@ -374,13 +461,20 @@ func BuildLive(dbPath, output string, idx int) Payload {
 		defer database.Close()
 		sessions, _ = database.LoadLive()
 	}
-	byWin := make(map[int]db.Session, len(sessions))
+	winByID := make(map[int]niri.Window, len(onWs))
+	for _, w := range onWs {
+		winByID[w.ID] = w
+	}
+	var sessOnWs []db.Session
 	for _, s := range sessions {
-		if s.WindowID.Valid {
-			byWin[int(s.WindowID.Int64)] = s
+		if !s.WindowID.Valid {
+			continue
+		}
+		if _, ok := winByID[int(s.WindowID.Int64)]; ok {
+			sessOnWs = append(sessOnWs, s)
 		}
 	}
-	return PayloadFor(*ws, onWs, byWin, db.Now())
+	return PayloadFor(*ws, onWs, sessOnWs, db.Now())
 }
 
 // fmtAgo renders an elapsed duration as the tile's "time since active" string:

@@ -33,14 +33,61 @@ func TestPayloadForClaudeDesktop(t *testing.T) {
 	now := time.UnixMilli(1_000_000)
 	w := ws(5, "HDMI-A-1", 50, true)
 	wins := []niri.Window{win(24, 50, "kitty", "Diagnose bug")}
-	byWin := map[int]db.Session{24: claudeSession(24, "/home/x/claude-status-db", "working", 0)}
+	sessions := []db.Session{claudeSession(24, "/home/x/claude-status-db", "working", 0)}
 
-	p := PayloadFor(w, wins, byWin, now)
-	if p.Shortcut != 5 || p.State != "working" || p.Folder != "claude-status-db" || p.Title != "Diagnose bug" || !p.Active {
+	p := PayloadFor(w, wins, sessions, now)
+	if p.Shortcut != 5 || !p.Active || len(p.Sessions) != 1 {
 		t.Fatalf("claude payload wrong: %+v", p)
+	}
+	s := p.Sessions[0]
+	if s.State != "working" || s.Folder != "claude-status-db" || s.Title != "Diagnose bug" {
+		t.Fatalf("claude session wrong: %+v", s)
 	}
 	if p.IsClaude != nil {
 		t.Errorf("claude desktop should leave is_claude default (nil), got %v", *p.IsClaude)
+	}
+}
+
+func TestPayloadForDualSharedWindow(t *testing.T) {
+	// Two sessions in two kitty tabs of ONE niri window (window 7). Both must
+	// surface as a 2-entry sessions[]; neither is masked. This is the desktop-3/5
+	// multi-session case grouped by workspace, not window.
+	now := time.UnixMilli(1_000_000)
+	w := ws(3, "HDMI-A-1", 30, true)
+	wins := []niri.Window{win(7, 30, "kitty", "ci-base")}
+	sessions := []db.Session{
+		claudeSession(7, "/a/ci-base-idle", "idle", now.UnixMilli()),
+		claudeSession(7, "/a/ci-base-prompt", "prompt", 0),
+	}
+	p := PayloadFor(w, wins, sessions, now)
+	if len(p.Sessions) != 2 {
+		t.Fatalf("want 2 sessions, got %d: %+v", len(p.Sessions), p)
+	}
+	// prompt sorts first (statePriority), so it's never dropped and drives the pulse.
+	if p.Sessions[0].State != "prompt" || p.Sessions[1].State != "idle" {
+		t.Fatalf("dual order wrong (want prompt,idle): %+v", p.Sessions)
+	}
+	// Both share window 7's title.
+	if p.Sessions[0].Title != "ci-base" || p.Sessions[1].Title != "ci-base" {
+		t.Errorf("co-window sessions should share the window title: %+v", p.Sessions)
+	}
+}
+
+func TestPayloadForCapsAtTwo(t *testing.T) {
+	now := time.UnixMilli(1_000_000)
+	w := ws(3, "HDMI-A-1", 30, false)
+	wins := []niri.Window{win(7, 30, "kitty", "t")}
+	sessions := []db.Session{
+		claudeSession(7, "/a/one", "idle", now.UnixMilli()),
+		claudeSession(7, "/a/two", "idle", now.UnixMilli()),
+		claudeSession(7, "/a/three", "prompt", 0),
+	}
+	p := PayloadFor(w, wins, sessions, now)
+	if len(p.Sessions) != 2 {
+		t.Fatalf("want cap of 2, got %d", len(p.Sessions))
+	}
+	if p.Sessions[0].State != "prompt" {
+		t.Errorf("prompt must survive the cap (kept first): %+v", p.Sessions)
 	}
 }
 
@@ -49,11 +96,14 @@ func TestPayloadForIdleDecay(t *testing.T) {
 	talk := now.Add(-12 * time.Minute).UnixMilli()
 	w := ws(3, "HDMI-A-1", 30, false)
 	wins := []niri.Window{win(7, 30, "kitty", "t")}
-	byWin := map[int]db.Session{7: claudeSession(7, "/a/ci-base", "idle", talk)}
+	sessions := []db.Session{claudeSession(7, "/a/ci-base", "idle", talk)}
 
-	p := PayloadFor(w, wins, byWin, now)
-	if p.State != "idle" || p.IdleAgo != "12m" || p.IdleLevel == 0 {
-		t.Fatalf("idle decay wrong: %+v", p)
+	p := PayloadFor(w, wins, sessions, now)
+	if len(p.Sessions) != 1 {
+		t.Fatalf("want 1 session: %+v", p)
+	}
+	if s := p.Sessions[0]; s.State != "idle" || s.IdleAgo != "12m" || s.IdleLevel == 0 {
+		t.Fatalf("idle decay wrong: %+v", s)
 	}
 }
 
@@ -61,7 +111,7 @@ func TestPayloadForAppDesktop(t *testing.T) {
 	now := time.UnixMilli(1_000_000)
 	w := ws(1, "HDMI-A-1", 2, false)
 	wins := []niri.Window{win(15, 2, "org.keepassxc.KeePassXC", "Passbase")}
-	p := PayloadFor(w, wins, map[int]db.Session{}, now) // no tracked session
+	p := PayloadFor(w, wins, nil, now) // no tracked session
 	if p.IsClaude == nil || *p.IsClaude != false {
 		t.Fatalf("app desktop must set is_claude=false: %+v", p)
 	}
@@ -104,9 +154,12 @@ func TestIconCandidatesCoversReverseDNS(t *testing.T) {
 
 func TestPayloadForEmptyDesktop(t *testing.T) {
 	now := time.UnixMilli(1_000_000)
-	p := PayloadFor(ws(8, "HDMI-A-1", 80, true), nil, map[int]db.Session{}, now)
-	if p.State != "idle" || p.IdleLevel == 0 || p.Folder != "" || !p.Active {
+	p := PayloadFor(ws(8, "HDMI-A-1", 80, true), nil, nil, now)
+	if len(p.Sessions) != 1 || !p.Active {
 		t.Fatalf("empty desktop placeholder wrong: %+v", p)
+	}
+	if s := p.Sessions[0]; s.State != "idle" || s.IdleLevel == 0 || s.Folder != "" {
+		t.Fatalf("empty placeholder session wrong: %+v", s)
 	}
 }
 
@@ -123,8 +176,8 @@ func TestBuildAllKeysByOutputAndIdx(t *testing.T) {
 	if _, ok := all[Key("HDMI-A-1", 5)]; !ok {
 		t.Fatalf("missing HDMI-A-1:5 key; got %v", all)
 	}
-	if all[Key("HDMI-A-1", 5)].Folder != "repo" {
-		t.Errorf("HDMI-A-1:5 should be the claude tile: %+v", all[Key("HDMI-A-1", 5)])
+	if got := all[Key("HDMI-A-1", 5)]; len(got.Sessions) != 1 || got.Sessions[0].Folder != "repo" {
+		t.Errorf("HDMI-A-1:5 should be the claude tile: %+v", got)
 	}
 	if _, ok := all[Key("eDP-1", 1)]; !ok {
 		t.Error("eDP-1:1 (empty) should still be present")
@@ -135,8 +188,8 @@ func TestPayloadForDeterministicWindowPick(t *testing.T) {
 	now := time.UnixMilli(1_000_000)
 	w := ws(1, "HDMI-A-1", 2, false)
 	// Same two windows, opposite input orders (mimics randomized map iteration).
-	a := PayloadFor(w, []niri.Window{win(15, 2, "keepassxc", "KeePassXC"), win(9, 2, "firefox", "FF")}, map[int]db.Session{}, now)
-	b := PayloadFor(w, []niri.Window{win(9, 2, "firefox", "FF"), win(15, 2, "keepassxc", "KeePassXC")}, map[int]db.Session{}, now)
+	a := PayloadFor(w, []niri.Window{win(15, 2, "keepassxc", "KeePassXC"), win(9, 2, "firefox", "FF")}, nil, now)
+	b := PayloadFor(w, []niri.Window{win(9, 2, "firefox", "FF"), win(15, 2, "keepassxc", "KeePassXC")}, nil, now)
 	if a.App != b.App || a.Title != b.Title {
 		t.Fatalf("window pick not deterministic: %q/%q vs %q/%q", a.App, a.Title, b.App, b.Title)
 	}
@@ -148,7 +201,7 @@ func TestPayloadForDeterministicWindowPick(t *testing.T) {
 func TestCacheRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tiles.json")
 	in := map[string]Payload{
-		Key("HDMI-A-1", 5): {Shortcut: 5, State: "working", Folder: "repo"},
+		Key("HDMI-A-1", 5): {Shortcut: 5, Sessions: []SessionTile{{State: "working", Folder: "repo"}}},
 	}
 	if err := WriteCache(path, in); err != nil {
 		t.Fatalf("WriteCache: %v", err)
@@ -158,7 +211,7 @@ func TestCacheRoundTrip(t *testing.T) {
 		t.Fatalf("ReadCache: %v", err)
 	}
 	got := out[Key("HDMI-A-1", 5)]
-	if got.State != "working" || got.Folder != "repo" || got.Shortcut != 5 {
+	if got.Shortcut != 5 || len(got.Sessions) != 1 || got.Sessions[0].State != "working" || got.Sessions[0].Folder != "repo" {
 		t.Errorf("round-trip mismatch: %+v", got)
 	}
 }
