@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
@@ -14,20 +15,31 @@ import (
 
 func TestEffectiveStateMapping(t *testing.T) {
 	cases := []struct {
-		in   clauded.Status
-		want state.Status
-		ok   bool
+		in         clauded.Status
+		waitingFor string
+		fpMS       int64 // first-party StatusUpdatedAt (unix ms); 0 => absent
+		hookSeen   int64 // hook LastSeenTS (unix ms)
+		want       state.Status
+		ok         bool
 	}{
-		{clauded.Busy, state.Working, true},
-		{clauded.Waiting, "", false}, // deferred to hooks (overloaded), not prompt
-		{clauded.Idle, state.Idle, true},
-		{clauded.Shell, state.Shell, true},
-		{clauded.Status("compacting"), "", false},
+		{clauded.Busy, "", 0, 0, state.Working, true},                    // no ts -> legacy working
+		{clauded.Busy, "", 5000, 4000, state.Working, true},              // fresh busy -> working
+		{clauded.Busy, "", 4000, 5000, "", false},                        // stale busy -> defer to hook
+		{clauded.Waiting, "", 0, 0, "", false},                           // bare waiting: deferred (overloaded)
+		{clauded.Waiting, "subagent", 0, 0, "", false},                   // internal wait: deferred
+		{clauded.Waiting, "permission prompt", 0, 0, state.Prompt, true}, // genuine user prompt
+		{clauded.Idle, "", 0, 0, state.Idle, true},
+		{clauded.Shell, "", 0, 0, state.Shell, true},
+		{clauded.Status("compacting"), "", 0, 0, "", false},
 	}
 	for _, c := range cases {
-		got, ok := effectiveState(c.in)
+		s := clauded.Session{Status: c.in, WaitingFor: c.waitingFor}
+		if c.fpMS != 0 {
+			s.StatusUpdatedAt = time.UnixMilli(c.fpMS)
+		}
+		got, ok := effectiveState(s, c.hookSeen)
 		if ok != c.ok || got != c.want {
-			t.Errorf("effectiveState(%q) = (%q,%v), want (%q,%v)", c.in, got, ok, c.want, c.ok)
+			t.Errorf("effectiveState(%q,%q,fp=%d,hook=%d) = (%q,%v), want (%q,%v)", c.in, c.waitingFor, c.fpMS, c.hookSeen, got, ok, c.want, c.ok)
 		}
 	}
 }

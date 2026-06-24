@@ -9,31 +9,56 @@ import (
 	"github.com/mrzor/claude-status/internal/state"
 )
 
-// firstPartyState maps Claude Code's first-party status to our activity state.
-// ok is false for an unrecognized OR deliberately-deferred value, in which case
-// the caller keeps the hook-derived state. Mapping (see package clauded): busy =
+// firstPartyState maps one first-party session to our activity state. ok is
+// false for an unrecognized OR deliberately-deferred value, in which case the
+// caller keeps the hook-derived state. Mapping (see package clauded): busy =
 // taking a turn -> working; idle = finished turn at rest -> idle (decays); shell
 // = background-monitor -> shell.
 //
-// `waiting` is DELIBERATELY NOT mapped to Prompt. It looked like the genuine
-// "?" signal, but observation proved it overloaded: it fires whenever the main
-// loop is suspended on ANYTHING — a subagent/tool wait as much as a real
-// user-prompt — so mapping it to "?" produced false positives (e.g. a `/btw`
-// turn sat at `waiting` for minutes with no question; see memory
-// first-party-status-waiting-is-not-a-reliable). There is no finer first-party
-// field to disambiguate. So we defer `waiting` to the hook state: the genuine
-// "?" comes from the permission-Notification hook path (precise), plus prose-
-// question detection on Stop (see the transcript-parse work). Returning ok=false
-// here means a `waiting` session keeps whatever the hooks last derived.
-func firstPartyState(s clauded.Status) (state.Status, bool) {
-	switch s {
+// `waiting` is overloaded — the main loop reports it whenever it is suspended on
+// ANYTHING, an internal subagent/tool wait as much as a real user prompt — so we
+// do NOT map it to Prompt on the status alone (a blanket mapping produced false
+// positives, e.g. a `/btw` turn that sat at `waiting` for minutes with no
+// question; see memory first-party-status-waiting-is-not-a-reliable). Instead we
+// key on the companion `waitingFor` field via Session.IsUserPrompt: an ALLOW-LIST
+// for waits that name a "permission" prompt. An internal wait is never labeled
+// that way, so the false positive cannot recur. A `waiting` session that is NOT a
+// user prompt is deferred to the hook state (ok=false).
+//
+// First-party is the RIGHT signal for a real prompt — not the Notification hook —
+// because `waitingFor` is durable: it stays "permission prompt" the whole time
+// the prompt is up, and the overlay re-evaluates every tick. A Notification is a
+// one-shot event that a later PostToolUse->working clobbers, leaving the prompt
+// unanswered while the DB is stuck "working" (exactly the ezmm 4h-stuck case).
+//
+// `busy` is freshness-gated against hookLastSeen (the session's last hook time).
+// busy is the ONE first-party state whose meaning inverts when stale: "actively
+// taking a turn" cannot be hours old, so a first-party file frozen at `busy`
+// (observed with --resume + long sessions) is garbage. If a hook fired AFTER the
+// busy was written, the hook-derived State is newer and must win — otherwise a
+// stale busy masks a finished turn as "working" (the clickhouse-server case).
+// This asymmetry is deliberate: `waiting` (a real prompt persists) and `idle` (rest
+// persists) stay valid when stale, which is why they are NOT gated — gating them
+// would reopen ezmm. Do not "simplify" the gate onto the other states.
+func firstPartyState(s clauded.Session, hookLastSeen int64) (state.Status, bool) {
+	switch s.Status {
 	case clauded.Busy:
+		// A missing StatusUpdatedAt can't be compared -> keep legacy busy->working
+		// so the overlay still fixes a stale hook (its original purpose).
+		if !s.StatusUpdatedAt.IsZero() && s.StatusUpdatedAt.UnixMilli() < hookLastSeen {
+			return "", false // stale busy: defer to the newer hook state
+		}
 		return state.Working, true
 	case clauded.Idle:
 		return state.Idle, true
 	case clauded.Shell:
 		return state.Shell, true
-	default: // waiting (deferred to hooks) and unrecognized values
+	case clauded.Waiting:
+		if s.IsUserPrompt() {
+			return state.Prompt, true
+		}
+		return "", false // internal wait: defer to hook state
+	default: // unrecognized values
 		return "", false
 	}
 }
@@ -56,7 +81,7 @@ func overlayFirstParty(sessions []db.Session, fp map[string]clauded.Session) {
 		if !ok {
 			continue
 		}
-		if st, ok := firstPartyState(f.Status); ok {
+		if st, ok := firstPartyState(f, sessions[i].LastSeenTS); ok {
 			sessions[i].State = string(st)
 		}
 	}

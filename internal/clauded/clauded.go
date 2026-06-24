@@ -1,12 +1,16 @@
 // Package clauded reads Claude Code's first-party per-session status files,
 // ~/.claude/sessions/<pid>.json. Each file is written by the Claude Code process
 // itself and carries a `status` field — busy / idle / waiting — that updates on
-// Claude's own cadence rather than via our hooks. This is a stronger, language-
-// independent signal for the "is Claude blocked waiting on the user?" question
-// than substring-matching Notification text: `waiting` means Claude is blocked
-// on the user (a permission prompt or interactive question), `busy` means it is
-// taking a turn, and `idle` means a finished turn at rest (observed sitting at
-// `idle` for many minutes, so `idle` — not `waiting` — is the steady done state).
+// Claude's own cadence rather than via our hooks. `busy` means it is taking a
+// turn, `idle` means a finished turn at rest (observed sitting at `idle` for many
+// minutes, so `idle` — not `waiting` — is the steady done state).
+//
+// `waiting` is OVERLOADED: the main loop reports it whenever it is suspended on
+// ANYTHING — a real user-facing prompt as much as an internal subagent/tool wait
+// (a `/btw` turn was observed sitting at `waiting` for minutes mid-turn with no
+// question). The companion `waitingFor` field names the reason for the wait
+// ("permission prompt" for a genuine user prompt), which is what lets callers
+// distinguish a real "needs you" from internal blocking — see WaitingFor.
 //
 // The format is UNDOCUMENTED and may change between Claude versions (observed on
 // v2.1.183). Every function here is therefore tolerant: unparseable or partial
@@ -19,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -32,8 +37,8 @@ const (
 	Busy Status = "busy"
 	// Idle: a finished turn at rest (the steady "done" state; decays on our bar).
 	Idle Status = "idle"
-	// Waiting: Claude is blocked waiting on the user (permission/interactive
-	// prompt) — the genuine "needs you" signal.
+	// Waiting: the main loop is suspended. Overloaded — could be a genuine user
+	// prompt or an internal subagent/tool wait. Disambiguate via WaitingFor.
 	Waiting Status = "waiting"
 	// Shell: Claude is passively monitoring a background shell/command.
 	Shell Status = "shell"
@@ -57,6 +62,22 @@ type Session struct {
 	StatusUpdatedAt time.Time // zero if the file omitted it
 	Cwd             string
 	Version         string
+	// WaitingFor names the reason the main loop is suspended when Status is
+	// Waiting (e.g. "permission prompt"); empty when absent or not waiting.
+	WaitingFor string
+}
+
+// IsUserPrompt reports whether this session is genuinely blocked on the user —
+// status Waiting with a WaitingFor that names a user-facing prompt. It is an
+// ALLOW-LIST keyed on the wait reason naming a "permission" prompt, NOT a
+// block-list of internal waits: a subagent/tool wait (the `/btw` false positive
+// that motivated dropping the blanket waiting->Prompt mapping) is never labeled
+// "permission prompt", so it cannot match here regardless of how it is named.
+// The allow-list is deliberately narrow; broaden it only against observed
+// waitingFor values, never speculatively.
+func (s Session) IsUserPrompt() bool {
+	return s.Status == Waiting &&
+		strings.Contains(strings.ToLower(s.WaitingFor), "permission")
 }
 
 // rawSession mirrors the on-disk JSON. Unknown fields are ignored by the decoder
@@ -68,6 +89,7 @@ type rawSession struct {
 	StatusUpdatedAt int64  `json:"statusUpdatedAt"` // unix milliseconds
 	Cwd             string `json:"cwd"`
 	Version         string `json:"version"`
+	WaitingFor      string `json:"waitingFor"`
 }
 
 // DefaultDir returns Claude Code's sessions directory: $CLAUDE_CONFIG_DIR/sessions
@@ -177,5 +199,6 @@ func readFile(path string) (Session, bool) {
 		StatusUpdatedAt: updated,
 		Cwd:             r.Cwd,
 		Version:         r.Version,
+		WaitingFor:      r.WaitingFor,
 	}, true
 }

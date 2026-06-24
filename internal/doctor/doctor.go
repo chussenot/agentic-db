@@ -98,8 +98,10 @@ func printFirstParty(w io.Writer, sessions []db.Session) {
 	}
 
 	hookState := make(map[string]string, len(sessions))
+	hookSeen := make(map[string]int64, len(sessions))
 	for _, s := range sessions {
 		hookState[s.SessionID] = s.State
+		hookSeen[s.SessionID] = s.LastSeenTS
 	}
 
 	ids := make([]string, 0, len(fp))
@@ -117,7 +119,7 @@ func printFirstParty(w io.Writer, sessions []db.Session) {
 			hs = "—" // first-party file with no live DB row (no window resolved yet)
 		}
 		effective, source := hs, "hook"
-		if st, ok := effectiveState(f.Status); ok {
+		if st, ok := effectiveState(f, hookSeen[id]); ok {
 			effective, source = string(st), "first-party"
 		}
 		fmt.Fprintf(tw, "  %s\t%d\t%s\t%s\t%s\t%s\t%s\n",
@@ -127,20 +129,31 @@ func printFirstParty(w io.Writer, sessions []db.Session) {
 	tw.Flush()
 }
 
-// effectiveState mirrors daemon.firstPartyState's mapping for display. The
-// daemon is the runtime authority; this copy keeps doctor free of a daemon
-// import. busy->working, idle->idle, shell->shell; waiting is deferred to the
-// hook state (NOT mapped to prompt — it is overloaded; see firstPartyState), so
-// a `waiting` session shows SOURCE=hook. Unknown -> not ok.
-func effectiveState(s clauded.Status) (state.Status, bool) {
-	switch s {
+// effectiveState mirrors daemon.firstPartyState's mapping for display (incl. the
+// busy freshness gate against hookLastSeen). The daemon is the runtime authority;
+// this copy keeps doctor free of a daemon import. busy->working UNLESS the busy
+// file is older than the last hook (stale -> defer to hook); idle->idle;
+// shell->shell. `waiting` is deferred to the hook state (it is overloaded; see
+// firstPartyState) UNLESS waitingFor names a genuine permission prompt
+// (Session.IsUserPrompt), which maps to prompt and shows SOURCE=first-party.
+// Unknown -> not ok.
+func effectiveState(s clauded.Session, hookLastSeen int64) (state.Status, bool) {
+	switch s.Status {
 	case clauded.Busy:
+		if !s.StatusUpdatedAt.IsZero() && s.StatusUpdatedAt.UnixMilli() < hookLastSeen {
+			return "", false // stale busy: defer to the newer hook state
+		}
 		return state.Working, true
 	case clauded.Idle:
 		return state.Idle, true
 	case clauded.Shell:
 		return state.Shell, true
-	default: // waiting (deferred to hooks) and unrecognized values
+	case clauded.Waiting:
+		if s.IsUserPrompt() {
+			return state.Prompt, true
+		}
+		return "", false // internal wait: defer to hook state
+	default: // unrecognized values
 		return "", false
 	}
 }
