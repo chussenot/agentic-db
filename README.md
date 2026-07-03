@@ -23,7 +23,7 @@ niri window model and sets niri workspace **names**, which waybar renders as gly
 | `gc` | Run the dead-session reap pass once and report reaped rows. |
 | `gen-waybar` | Emit paste-ready waybar `format-icons` JSON and `style.css` fragments. |
 | `doctor` | Dump the DB schema/rows and the live niri windows list (debugging). |
-| `events` | Print the bounded audit log (one row per hook), newest first. `--session <id>`, `--limit N`. |
+| `events` | Print the audit log (one row per hook), newest first. `--session <id>`, `--limit N`. |
 
 ## Build & install
 
@@ -59,7 +59,7 @@ internal/state       shared name grammar, decay table, event->state mapping, ren
 internal/db          SQLite layer (schema, Session, Open/Upsert/LoadLive/...)
 internal/niri        niri IPC: ListWindows + event-stream client + window/workspace model
 internal/hook        hook subcommand (state derivation, /proc->window resolution, audit row)
-internal/daemon      daemon subcommand (reconciler: aggregate, slots, decay, GC, prune)
+internal/daemon      daemon subcommand (reconciler: aggregate, slots, decay, GC)
 internal/waybar      gen-waybar subcommand (format-icons + style.css generator)
 internal/install     install/uninstall subcommands (settings.json hook merge)
 internal/doctor      doctor + gc + events subcommands
