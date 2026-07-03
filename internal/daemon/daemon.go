@@ -25,13 +25,16 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
@@ -95,6 +98,15 @@ func Run(args []string) error {
 		sessionsDir:  *sessionsDir,
 		fpMiss:       make(map[string]int),
 		tilePath:     tile.CachePath(*dbPath),
+		lastTitle:    make(map[string]string),
+	}
+	// Seed last-recorded titles so a restart only emits TitleChanged rows for
+	// titles that actually drifted while we were down. Best effort: on a read
+	// error we start empty (re-baselining once per session is harmless).
+	if seed, err := database.LatestTitles(); err != nil {
+		logf("seed last titles: %v", err)
+	} else {
+		d.lastTitle = seed
 	}
 	return d.run(ctx)
 }
@@ -144,6 +156,14 @@ type daemon struct {
 	// tiles poll only once/sec, so rebuilding faster than tileBuildInterval is
 	// wasted CPU. See maybeWriteTiles.
 	lastTileBuild time.Time
+
+	// lastTitle maps a live session_id to the niri window title we last recorded
+	// for it in the events log. captureTitleChanges diffs the model's current
+	// titles against this and appends a TitleChanged row only on an actual change,
+	// so the audit log records title history without redundant rows. Seeded from
+	// the DB at startup (so a daemon restart doesn't re-baseline every session)
+	// and pruned of reaped sessions as it runs. Actor-owned.
+	lastTitle map[string]string
 }
 
 // clampInterval floors a configured duration at minInterval so a stray
@@ -320,15 +340,14 @@ func (d *daemon) pollTick(ctx context.Context, out chan<- struct{}) {
 	}
 }
 
-// auditKeep is how many audit-log rows the daemon retains. The events table is
-// append-only on the hook hot path; the daemon prunes it here on the GC tick so
-// it stays bounded without burdening hooks.
-const auditKeep = 5000
-
-// gc reaps dead sessions from the DB using the live model, then prunes the audit
-// log. Runs on the actor goroutine (reads the model safely). The reaped rows
-// vanish from the next DB snapshot, which clears their dots via the normal
-// reconcile path.
+// gc reaps dead sessions from the DB using the live model. Runs on the actor
+// goroutine (reads the model safely). The reaped rows vanish from the next DB
+// snapshot, which clears their dots via the normal reconcile path.
+//
+// The events audit log is NOT pruned here: it is retained indefinitely (one row
+// per hook, append-only) so the full history is always available for diagnosing
+// state drift. db.PruneEvents remains as a manual primitive but is no longer
+// called automatically.
 func (d *daemon) gc() {
 	// Read the first-party set (best effort). A read error or empty result means
 	// "not available" — firstPartyDead then reaps nothing and the predicate falls
@@ -351,9 +370,6 @@ func (d *daemon) gc() {
 		logf("gc: %v", err)
 	} else if n > 0 {
 		logf("gc: reaped %d dead session(s)", n)
-	}
-	if _, err := d.db.PruneEvents(auditKeep); err != nil {
-		logf("prune events: %v", err)
 	}
 }
 
@@ -402,6 +418,82 @@ func (d *daemon) writeTiles() {
 	d.lastTiles = data
 }
 
+// captureTitleChanges appends a TitleChanged event row for every live session
+// whose niri window title differs from the one we last recorded, then writes the
+// rows on the actor goroutine. Title changes are rare, so the InsertEvent write
+// (which may briefly wait on the SQLite write lock under a hook burst) fires
+// seldom; an unchanged title costs only map lookups and emits nothing.
+func (d *daemon) captureTitleChanges() {
+	rows := titleChangeEvents(d.model.Windows(), d.sessions, d.lastTitle, db.Now().UnixMilli())
+	for _, e := range rows {
+		if err := d.db.InsertEvent(e); err != nil {
+			logf("record title change (session %s): %v", e.SessionID, err)
+		}
+	}
+}
+
+// titleChangeEvents is the testable core of captureTitleChanges. For each live
+// session resolved to a window with a non-empty title, it compares that title
+// against lastTitle[session_id] and, on a difference, records the new title in
+// lastTitle and emits a TitleChanged event row. It also prunes lastTitle of any
+// session no longer in the live set so the map can't grow with dead sessions.
+// Empty titles are ignored (treated as "no observation"): they neither emit a
+// row nor overwrite the last meaningful title. lastTitle is mutated in place.
+func titleChangeEvents(windows map[int]niri.Window, sessions []db.Session, lastTitle map[string]string, nowMS int64) []db.Event {
+	live := make(map[string]struct{}, len(sessions))
+	var out []db.Event
+	for _, s := range sessions {
+		live[s.SessionID] = struct{}{}
+		if !s.WindowID.Valid {
+			continue
+		}
+		w, ok := windows[int(s.WindowID.Int64)]
+		if !ok {
+			continue
+		}
+		// Strip the animated status glyph Claude Code prefixes onto the terminal
+		// title (a Braille spinner ⠐/⠂/… that ticks every frame, or a steady
+		// sparkle ✳). Without this the spinner alone churns a TitleChanged row per
+		// second; we want only genuine topic changes. See normalizeTitle.
+		title := normalizeTitle(w.Title)
+		if title == "" {
+			continue
+		}
+		if lastTitle[s.SessionID] == title {
+			continue
+		}
+		lastTitle[s.SessionID] = title
+		out = append(out, db.Event{
+			TS:          nowMS,
+			SessionID:   s.SessionID,
+			Event:       "TitleChanged",
+			NewState:    "unchanged",
+			WindowID:    s.WindowID,
+			WindowTitle: sql.NullString{String: title, Valid: true},
+		})
+	}
+	// Prune entries for sessions that have since been reaped.
+	for sid := range lastTitle {
+		if _, alive := live[sid]; !alive {
+			delete(lastTitle, sid)
+		}
+	}
+	return out
+}
+
+// normalizeTitle strips the leading run of decoration Claude Code puts in front
+// of a terminal title — an animated Braille spinner (⠐/⠂/…, which advances every
+// frame) or a steady status sparkle (✳) — plus the whitespace after it, leaving
+// the stable topic text. It trims only leading Unicode symbol runes (categories
+// So/Sk) and spaces, so ordinary punctuation a real title might start with (a
+// path's ~/ or /, a [tag]) is preserved. Trailing whitespace is trimmed too.
+func normalizeTitle(s string) string {
+	s = strings.TrimLeftFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.In(r, unicode.So, unicode.Sk)
+	})
+	return strings.TrimSpace(s)
+}
+
 // reconcile is the sole mutator of niri names. It computes desired per-workspace
 // state from the latest DB snapshot + live model, diffs against `managed`, and
 // emits niri renames only where the name changed. Ports State.reconcile, with
@@ -412,6 +504,11 @@ func (d *daemon) reconcile() {
 	// Throttled (see maybeWriteTiles) since reconcile runs at ~60Hz but the tiles
 	// only poll once/sec; dedupe in writeTiles then elides unchanged writes.
 	d.maybeWriteTiles()
+
+	// Record any window-title changes for live sessions (rare; one event row per
+	// actual change). Runs here so a niri WindowOpenedOrChanged — which marks the
+	// actor dirty and lands us in reconcile — is observed promptly.
+	d.captureTitleChanges()
 
 	want := aggregate(d.sessions, d.model, db.Now())
 

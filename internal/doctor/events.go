@@ -11,7 +11,7 @@ import (
 	"github.com/mrzor/claude-status/internal/db"
 )
 
-// RunEvents implements `claude-status events` — print the bounded audit log,
+// RunEvents implements `claude-status events` — print the audit log,
 // newest first. Flags: --db <path>, --limit N (default 50), --session <id> to
 // filter to one session. Use it to diagnose state drift (e.g. a session stuck
 // in 'prompt': look for the Notification row with matched=true and read its
@@ -51,8 +51,13 @@ func runEvents(w io.Writer, path string, limit int, session string) error {
 		if e.Matched.Valid {
 			match = fmt.Sprintf("%t", e.Matched.Bool)
 		}
+		// A TitleChanged row carries no Notification message; show the window
+		// title in the MESSAGE column instead so the audit log reads naturally.
 		msg := ""
-		if e.Message.Valid {
+		switch {
+		case e.WindowTitle.Valid:
+			msg = truncate(e.WindowTitle.String, 60)
+		case e.Message.Valid:
 			msg = truncate(e.Message.String, 60)
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",

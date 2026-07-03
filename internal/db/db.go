@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -40,11 +41,14 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_window ON sessions(window_id);
 
--- events is a bounded append-only audit log: one row per hook invocation,
--- recording what arrived and what state we derived. The daemon prunes it to a
--- fixed row count (PruneEvents) so it can never grow unbounded. It exists to
--- diagnose state drift (e.g. a session stuck in 'prompt') after the fact, since
--- the sessions table only holds current state.
+-- events is an append-only audit log retained INDEFINITELY: it is not pruned
+-- automatically (PruneEvents exists as a manual primitive only). Two producers
+-- append here: the hook writes one row per invocation (recording what arrived
+-- and what state we derived), and the daemon writes a synthetic
+-- event='TitleChanged' row (with window_title set, new_state='unchanged')
+-- whenever a live session's niri window title changes. It exists to diagnose
+-- state drift (e.g. a session stuck in 'prompt') after the fact and to datamine
+-- window titles over time, since the sessions table only holds current state.
 CREATE TABLE IF NOT EXISTS events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts          INTEGER NOT NULL,   -- unix ms
@@ -53,7 +57,8 @@ CREATE TABLE IF NOT EXISTS events (
   message     TEXT,               -- Notification message (truncated); NULL otherwise
   matched     INTEGER,            -- 1/0 = prompt filter matched (Notification only); NULL otherwise
   new_state   TEXT NOT NULL,      -- resulting state, or 'unchanged' / 'deleted'
-  window_id   INTEGER             -- resolved niri window id at the time, if any
+  window_id   INTEGER,            -- resolved niri window id at the time, if any
+  window_title TEXT               -- niri window title; set ONLY on event='TitleChanged' rows
 );
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 `
@@ -89,7 +94,7 @@ type Session struct {
 	CreatedTS int64
 }
 
-// Event is one row of the bounded audit log: a single hook invocation and the
+// Event is one row of the audit log: a single hook invocation and the
 // state we derived from it. See the events table in schema.
 type Event struct {
 	ID        int64
@@ -100,6 +105,10 @@ type Event struct {
 	Matched   sql.NullBool   // prompt filter result (Notification only); NULL otherwise
 	NewState  string         // resulting state, or "unchanged" / "deleted"
 	WindowID  sql.NullInt64  // resolved niri window id at the time, if any
+	// WindowTitle is the niri window title. Set only on event="TitleChanged" rows
+	// (written by the daemon when a session's window title changes); NULL on the
+	// hook-written rows, which never capture a title (no niri IPC on the hot path).
+	WindowTitle sql.NullString
 }
 
 // DB wraps the *sql.DB handle. It is safe for concurrent use (database/sql
@@ -113,9 +122,9 @@ type DB struct {
 // effort: callers on the hook hot path log-and-swallow any error.
 func (d *DB) InsertEvent(e Event) error {
 	_, err := d.sql.Exec(`
-INSERT INTO events (ts, session_id, event, message, matched, new_state, window_id)
-VALUES (?,?,?,?,?,?,?)`,
-		e.TS, e.SessionID, e.Event, e.Message, e.Matched, e.NewState, e.WindowID)
+INSERT INTO events (ts, session_id, event, message, matched, new_state, window_id, window_title)
+VALUES (?,?,?,?,?,?,?,?)`,
+		e.TS, e.SessionID, e.Event, e.Message, e.Matched, e.NewState, e.WindowID, e.WindowTitle)
 	if err != nil {
 		return fmt.Errorf("insert event: %w", err)
 	}
@@ -125,7 +134,7 @@ VALUES (?,?,?,?,?,?,?)`,
 // RecentEvents returns up to limit audit rows, newest first. When sessionID is
 // non-empty it filters to that session.
 func (d *DB) RecentEvents(limit int, sessionID string) ([]Event, error) {
-	q := `SELECT id, ts, session_id, event, message, matched, new_state, window_id FROM events`
+	q := `SELECT id, ts, session_id, event, message, matched, new_state, window_id, window_title FROM events`
 	args := []any{}
 	if sessionID != "" {
 		q += ` WHERE session_id = ?`
@@ -143,7 +152,7 @@ func (d *DB) RecentEvents(limit int, sessionID string) ([]Event, error) {
 	for rows.Next() {
 		var e Event
 		if err := rows.Scan(&e.ID, &e.TS, &e.SessionID, &e.Event, &e.Message,
-			&e.Matched, &e.NewState, &e.WindowID); err != nil {
+			&e.Matched, &e.NewState, &e.WindowID, &e.WindowTitle); err != nil {
 			return nil, fmt.Errorf("scan event: %w", err)
 		}
 		out = append(out, e)
@@ -152,8 +161,9 @@ func (d *DB) RecentEvents(limit int, sessionID string) ([]Event, error) {
 }
 
 // PruneEvents keeps only the newest keep rows, deleting older ones. It returns
-// the number deleted. The daemon calls this on its GC tick so the log stays
-// bounded without burdening the hook hot path.
+// the number deleted. The audit log is retained indefinitely by default — the
+// daemon no longer calls this; it remains a manual primitive for a one-off trim
+// if the table ever needs bounding.
 func (d *DB) PruneEvents(keep int) (int, error) {
 	res, err := d.sql.Exec(
 		`DELETE FROM events WHERE id <= (SELECT MAX(id) FROM events) - ?`, keep)
@@ -162,6 +172,35 @@ func (d *DB) PruneEvents(keep int) (int, error) {
 	}
 	n, _ := res.RowsAffected()
 	return int(n), nil
+}
+
+// LatestTitles returns the most recently recorded window title per session,
+// read from the newest event='TitleChanged' row of each session. The daemon
+// seeds its in-memory last-title map with this on startup so a restart does not
+// re-emit a TitleChanged row for every session whose title is unchanged (only
+// titles that drifted while the daemon was down produce a fresh row).
+func (d *DB) LatestTitles() (map[string]string, error) {
+	rows, err := d.sql.Query(`
+SELECT session_id, window_title FROM events
+WHERE id IN (
+  SELECT MAX(id) FROM events WHERE event = 'TitleChanged' GROUP BY session_id
+)`)
+	if err != nil {
+		return nil, fmt.Errorf("latest titles: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var sid string
+		var title sql.NullString
+		if err := rows.Scan(&sid, &title); err != nil {
+			return nil, fmt.Errorf("scan latest title: %w", err)
+		}
+		if title.Valid {
+			out[sid] = title.String
+		}
+	}
+	return out, rows.Err()
 }
 
 // SQL exposes the underlying *sql.DB for callers (e.g. the daemon) that need
@@ -189,7 +228,24 @@ func Open(path string) (*DB, error) {
 		sqldb.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
+	if err := migrate(sqldb); err != nil {
+		sqldb.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
 	return &DB{sql: sqldb}, nil
+}
+
+// migrate applies additive schema changes to a database created by an older
+// version. CREATE TABLE IF NOT EXISTS only builds missing tables, never alters
+// existing ones, so a column added to an existing table needs an explicit ALTER.
+// ADD COLUMN is cheap (no table rewrite) and idempotent here: a "duplicate
+// column name" error means the column already exists, which we swallow.
+func migrate(sqldb *sql.DB) error {
+	if _, err := sqldb.Exec(`ALTER TABLE events ADD COLUMN window_title TEXT`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("add events.window_title: %w", err)
+	}
+	return nil
 }
 
 // Close closes the underlying handle.
