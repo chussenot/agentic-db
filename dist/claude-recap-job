@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# claude-recap-job <daily|weekly> [force] [note…] — produce a recap document.
+#
+# One script, two modes, driven by the systemd user timers:
+#   daily  -> ~/dailies/daily-YYYYMMDD.md   (DAY-1, or Fri–Sun on a Monday)
+#   weekly -> ~/weeklies/weekly-YYYYMMDD.md (trailing 7 days; fires Mondays)
+#
+# It deliberately does NOT run the moment its timer fires: a fresh wakeup is
+# thrashing on startup work, so we wait STARTUP_DELAY before the (heavy, network-
+# bound) LLM call. The weekly unit sets a longer delay so it lands AFTER the daily
+# on Monday mornings rather than competing with it. The retry loop tolerates
+# networking that isn't up yet right after a resume.
+#
+# Iterate on a weak recap with `force`: it skips the wait and the already-present
+# guard (overwriting today's doc), and any trailing words become a revision note
+# woven into the LLM prompt. E.g.
+#   claude-recap-job daily force                       # plain retry (LLM variance)
+#   claude-recap-job weekly force "keep ci-base and datadog-ci as separate threads"
+set -uo pipefail
+
+MODE="${1:-daily}"
+shift || true
+FORCE=0
+if [ "${1:-}" = "force" ]; then
+	FORCE=1
+	shift
+fi
+NOTE="$*"   # any remaining args are freeform revision feedback for the model
+
+# systemd hands us a minimal PATH; pin the two stable tool locations.
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+
+# Pin the data paths EXPLICITLY rather than trusting the binary's env-derived
+# defaults: the hook (which writes the DB) runs in the interactive session, but
+# the systemd user manager that runs this script has a much smaller environment
+# and would NOT see an XDG_STATE_HOME / CLAUDE_CONFIG_DIR set only in a login
+# profile — a silent mismatch that would make recap read an empty DB. Replicate
+# the same resolution here. If you set either in your login env, export it to the
+# user manager (`systemctl --user import-environment XDG_STATE_HOME`) or edit here.
+DB="${XDG_STATE_HOME:-$HOME/.local/state}/claude-status/claude.sqlite"
+TRANSCRIPTS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+
+STARTUP_DELAY="${RECAP_STARTUP_DELAY:-300}"   # seconds to wait after wakeup
+STATE_DIR="$HOME/.local/state/claude-status"
+LOG="$STATE_DIR/recap-job.log"
+
+# Per-mode config: window (a recap flag array), prompt shape, output, title.
+case "$MODE" in
+daily)
+	PERIOD=day
+	OUT_DIR="$HOME/dailies"
+	OUT="$OUT_DIR/daily-$(date +%Y%m%d).md"
+	TITLE="# Daily recap — $(date '+%A %d %B %Y')"
+	# Normally the previous day; on Monday reach back over the weekend to Friday.
+	if [ -n "${RECAP_SINCE:-}" ]; then
+		WINDOW=(--since "$RECAP_SINCE")
+	else
+		back=1
+		[ "$(date +%u)" = 1 ] && back=3   # Monday (ISO weekday 1): include Fri+Sat+Sun
+		WINDOW=(--since "$(date -d "$back days ago" +%Y-%m-%d)")
+	fi
+	;;
+weekly)
+	PERIOD=week
+	OUT_DIR="$HOME/weeklies"
+	OUT="$OUT_DIR/weekly-$(date +%Y%m%d).md"
+	TITLE="# Weekly recap — week of $(date '+%A %d %B %Y')"
+	if [ -n "${RECAP_SINCE:-}" ]; then
+		WINDOW=(--since "$RECAP_SINCE")
+	else
+		WINDOW=(--period week)   # trailing 7 days
+	fi
+	;;
+*)
+	echo "usage: $(basename "$0") <daily|weekly>" >&2
+	exit 2
+	;;
+esac
+
+mkdir -p "$STATE_DIR" "$OUT_DIR"
+log() { printf '%s [%s] %s\n' "$(date -Iseconds)" "$MODE" "$*" >>"$LOG"; }
+
+# Single-instance lock, PER MODE (daily and weekly may run at once, but never two
+# of the same). Without it, two triggers — a timer catch-up and a resume
+# re-trigger, or a redeploy landing mid-run — could both pass the checks below,
+# both sleep, and the one that wakes last clobber the other's doc.
+exec 9>"$STATE_DIR/recap-$MODE.lock"
+if ! flock -n 9; then
+	log "another $MODE run holds the lock; exiting"
+	exit 0
+fi
+
+# Idempotent (scheduled runs): if today's report already exists it's done — a
+# second trigger is a no-op. `force` bypasses this to regenerate on demand.
+if [ "$FORCE" != 1 ] && [ -s "$OUT" ]; then
+	log "skip: $OUT already present"
+	exit 0
+fi
+
+if [ "$FORCE" = 1 ]; then
+	log "force regenerate${NOTE:+ with note: $NOTE}"
+else
+	log "triggered; waiting ${STARTUP_DELAY}s to clear the startup storm"
+	sleep "$STARTUP_DELAY"
+	if [ -s "$OUT" ]; then
+		log "skip: $OUT appeared during the wait"
+		exit 0
+	fi
+fi
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+prompt_args=(recap-prompt --period "$PERIOD")
+[ -n "$NOTE" ] && prompt_args+=(--note "$NOTE")
+
+log "window ${WINDOW[*]} (period shape: $PERIOD)"
+for attempt in 1 2 3; do
+	# Feed the LLM a metrics-free digest (it writes the narrative); the exact
+	# Metrics section is appended deterministically below so the model can't fudge
+	# the figures.
+	if claude-status recap "${WINDOW[@]}" --metrics none --db "$DB" --transcripts "$TRANSCRIPTS" \
+		| claude -p "$(claude-status "${prompt_args[@]}")" >"$tmp" 2>>"$LOG" \
+		&& [ -s "$tmp" ]; then
+		metrics="$(claude-status recap "${WINDOW[@]}" --metrics only --db "$DB" --transcripts "$TRANSCRIPTS" 2>>"$LOG")"
+		{ printf '%s\n\n' "$TITLE"; cat "$tmp"; printf '\n%s\n' "$metrics"; } >"$OUT"
+		log "wrote $OUT (attempt $attempt)"
+		exit 0
+	fi
+	log "attempt $attempt failed (network not ready?); retrying in 30s"
+	sleep 30
+done
+
+log "FAILED after 3 attempts; left any existing $OUT untouched"
+exit 1

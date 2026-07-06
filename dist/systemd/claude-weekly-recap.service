@@ -1,0 +1,12 @@
+[Unit]
+Description=Build the weekly Claude recap document (~/weeklies/weekly-YYYYMMDD.md)
+# Network readiness after a resume is handled by the script's retry loop.
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1800
+# Longer post-wakeup delay than the daily job (300s): on Monday both timers fire
+# at 09:00, so staggering the weekly to ~10min keeps the two heavy LLM runs from
+# competing on a fresh, still-thrashing wakeup.
+Environment=RECAP_STARTUP_DELAY=600
+ExecStart=%h/.local/bin/claude-recap-job weekly

@@ -1,0 +1,12 @@
+[Unit]
+Description=Build the daily Claude recap document (~/dailies/daily-YYYYMMDD.md)
+# Network readiness after a resume is handled by the script's retry loop, not a
+# unit dependency — user-scope units can't meaningfully order on the system's
+# network-online.target.
+
+[Service]
+Type=oneshot
+# The script sleeps ~5min before a network-bound LLM call, then may retry; give
+# it ample headroom so systemd doesn't time out and kill it mid-run.
+TimeoutStartSec=1200
+ExecStart=%h/.local/bin/claude-recap-job daily

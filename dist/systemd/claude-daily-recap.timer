@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily Claude recap at 09:00, catching up after suspend/power-off
+
+[Timer]
+# Fire at 09:00. Persistent=true records the last run, so if 09:00 passed while
+# the laptop was suspended or off, the timer fires at the first power-on/resume
+# afterwards instead of silently skipping the day (which plain cron would do).
+# One trigger per calendar day; the service then adds the "+5min after wakeup"
+# delay so this doesn't run into the startup resource storm.
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
