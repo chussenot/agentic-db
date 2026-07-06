@@ -160,6 +160,31 @@ func (d *DB) RecentEvents(limit int, sessionID string) ([]Event, error) {
 	return out, rows.Err()
 }
 
+// EventsBetween returns every audit row with ts in [fromMS, toMS], oldest
+// first, across all sessions. The recap aggregator folds these into a windowed
+// digest; ascending order lets it reconstruct each session's state timeline in
+// one pass. Unlike RecentEvents there is no row cap — a recap window is bounded
+// by time, not count.
+func (d *DB) EventsBetween(fromMS, toMS int64) ([]Event, error) {
+	rows, err := d.sql.Query(`
+SELECT id, ts, session_id, event, message, matched, new_state, window_id, window_title
+FROM events WHERE ts >= ? AND ts <= ? ORDER BY ts ASC`, fromMS, toMS)
+	if err != nil {
+		return nil, fmt.Errorf("events between: %w", err)
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.ID, &e.TS, &e.SessionID, &e.Event, &e.Message,
+			&e.Matched, &e.NewState, &e.WindowID, &e.WindowTitle); err != nil {
+			return nil, fmt.Errorf("scan event: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // PruneEvents keeps only the newest keep rows, deleting older ones. It returns
 // the number deleted. The audit log is retained indefinitely by default — the
 // daemon no longer calls this; it remains a manual primitive for a one-off trim

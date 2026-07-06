@@ -14,6 +14,7 @@ import (
 	"github.com/mrzor/claude-status/internal/doctor"
 	"github.com/mrzor/claude-status/internal/hook"
 	"github.com/mrzor/claude-status/internal/install"
+	"github.com/mrzor/claude-status/internal/recap"
 	"github.com/mrzor/claude-status/internal/tile"
 	"github.com/mrzor/claude-status/internal/waybar"
 )
@@ -31,6 +32,8 @@ commands:
   gen-waybar   emit waybar format-icons + style.css fragments
   doctor       dump the DB and live niri windows (debugging)
   events       print the bounded audit log (--session, --limit)
+  recap        summarize a time window of Claude sessions (--period, --json)
+  recap-prompt emit the LLM instructions for turning a recap into a report
   tile-data    emit pwetty claude-tile JSON for one niri desktop (--output)
   tile-watch   stream tile JSON for one desktop on change (pwetty stream:true)
 `
@@ -60,6 +63,10 @@ func main() {
 		err = doctor.Run(args)
 	case "events":
 		err = doctor.RunEvents(args)
+	case "recap":
+		err = recap.RunRecap(args)
+	case "recap-prompt":
+		err = recap.RunPrompt(args)
 	case "tile-data":
 		err = tile.Run(args)
 	case "tile-watch":
