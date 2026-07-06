@@ -132,6 +132,11 @@ func TestTopicPrefersInWindowTitle(t *testing.T) {
 	if s.Ask != "the ask" || s.Project != "proj" || s.Branch != "main" {
 		t.Errorf("transcript enrichment wrong: %+v", s)
 	}
+	// The project rollup carries the session cwd(s) so git enrichment can find
+	// the repo later.
+	if len(d.Projects) != 1 || len(d.Projects[0].Dirs) != 1 || d.Projects[0].Dirs[0] != "/home/zor/proj" {
+		t.Errorf("Project.Dirs = %+v, want [/home/zor/proj]", d.Projects)
+	}
 }
 
 func TestTopNCapAndProjectRollup(t *testing.T) {

@@ -8,12 +8,34 @@ import (
 	"time"
 
 	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/git"
 	"github.com/mrzor/claude-status/internal/transcript"
 )
 
 // defaultTopN caps how many sessions are shown in full detail; the rest fold
 // into the "+N more" summary and the project roll-ups.
 const defaultTopN = 25
+
+// enrichProjects fills the git fields (remote, branch, window commit count) for
+// every project, marking HasRepo when the cwd resolves to a live git work tree.
+// The render then lists only the repos and drops the rest (a removed temp
+// worktree, a non-repo cwd like $HOME), which is why we enrich all rather than
+// capping: the cap is applied by "does it have a repo?", not by count.
+func enrichProjects(projects []Project, from, to time.Time) {
+	for i := range projects {
+		for _, dir := range projects[i].Dirs {
+			info, ok := git.Describe(dir, from, to)
+			if !ok {
+				continue // a since-removed temp worktree / non-repo cwd — try the next
+			}
+			projects[i].HasRepo = true
+			projects[i].Remote = info.Remote
+			projects[i].Branch = info.Branch
+			projects[i].Commits = info.Commits
+			break
+		}
+	}
+}
 
 // periodDur maps a --period keyword to a trailing window length.
 func periodDur(period string) (time.Duration, bool) {
@@ -80,6 +102,7 @@ func RunRecap(args []string) error {
 	}
 
 	d := Build(events, lookup, from, to, *top)
+	enrichProjects(d.Projects, from, to)
 	if *asJSON {
 		return JSON(os.Stdout, d)
 	}

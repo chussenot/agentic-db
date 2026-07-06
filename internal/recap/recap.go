@@ -15,6 +15,7 @@ package recap
 
 import (
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 
@@ -69,6 +70,7 @@ type Session struct {
 	ID        string
 	Topic     string
 	Project   string
+	Dir       string // working directory (used to locate the project's git repo)
 	Branch    string
 	Ask       string
 	Started   time.Time
@@ -85,9 +87,19 @@ type Streak struct {
 	Dur        time.Duration
 }
 
-// Project is a per-project roll-up over all in-window sessions.
+// Project is a per-project roll-up over all in-window sessions. The git fields
+// (Remote/Branch/Commits) are left zero by Build — it stays pure — and filled by
+// the recap command via internal/git for the projects it displays.
 type Project struct {
-	Name     string
+	Name string
+	// Dirs are the distinct session cwds seen for this project (first-seen order).
+	// Enrichment tries each until one resolves to a git repo, so a project worked
+	// from a since-removed temp worktree still resolves via its surviving checkout.
+	Dirs     []string
+	HasRepo  bool // some Dir resolved to a live git work tree (set during enrichment)
+	Remote   string
+	Branch   string
+	Commits  int
 	Active   time.Duration
 	Sessions int
 }
@@ -128,6 +140,7 @@ func Build(events []db.Event, lookup Lookup, from, to time.Time, topN int) Diges
 			}
 			s.Ask = m.Ask
 			s.Branch = m.Branch
+			s.Dir = m.Cwd
 			s.Project = projectName(m.Cwd)
 		}
 		if s.Project == "" {
@@ -147,6 +160,7 @@ func Build(events []db.Event, lookup Lookup, from, to time.Time, topN int) Diges
 	tot := Totals{Sessions: len(sessions), Active: unionDur(allBeats)}
 	projActive := map[string]time.Duration{}
 	projCount := map[string]int{}
+	projDirs := map[string][]string{}
 	var sumActive time.Duration
 	for i, s := range sessions {
 		tot.Turns += s.Turns
@@ -161,13 +175,16 @@ func Build(events []db.Event, lookup Lookup, from, to time.Time, topN int) Diges
 		}
 		projActive[s.Project] += s.Active
 		projCount[s.Project]++
+		if s.Dir != "" && !slices.Contains(projDirs[s.Project], s.Dir) {
+			projDirs[s.Project] = append(projDirs[s.Project], s.Dir)
+		}
 	}
 	if len(sessions) > 0 {
 		tot.AvgActive = sumActive / time.Duration(len(sessions))
 	}
 	projects := make([]Project, 0, len(projActive))
 	for name, act := range projActive {
-		projects = append(projects, Project{Name: name, Active: act, Sessions: projCount[name]})
+		projects = append(projects, Project{Name: name, Dirs: projDirs[name], Active: act, Sessions: projCount[name]})
 	}
 	sort.Slice(projects, func(i, j int) bool { return projects[i].Active > projects[j].Active })
 	for _, p := range projects {

@@ -43,9 +43,17 @@ claude-status recap --period day | claude -p "$(claude-status recap-prompt --per
 `recap` alone prints the digest (add `--json` for tooling); `recap-prompt` prints
 period-tuned instructions (day = terse standup, week = themes, quarter = narrative).
 
-The digest ends with a deterministic `## Metrics` section (total wall-clock time,
-per-session active min/avg/max, prompts sent, permission prompts). `--metrics`
-controls it:
+The digest ends with deterministic `## Metrics` (total wall-clock time,
+per-session active min/avg/max, prompts sent, permission prompts) and
+`## Project metrics` (per project: the origin remote as `gh/owner/repo` or
+`host/path`, and commits landed in the window on the current branch; the branch
+is noted when it isn't main/master). Every project that resolves to a git repo
+is listed. Git state is read best-effort via `internal/git`, trying each of a
+project's session cwds until one resolves — so work done from a since-removed
+temp worktree still resolves via its surviving checkout, and a project that
+resolves to no repo at all (a non-repo cwd like `$HOME`) is simply dropped. A
+repo with no origin shows `(no remote)`.
+`--metrics` controls the whole appended block:
 `full` (default, append it), `none` (omit — used to feed the LLM so it can't
 restate figures), or `only` (just the section — the recap job appends this
 verbatim after the LLM narrative).

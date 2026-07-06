@@ -61,13 +61,15 @@ func Markdown(w io.Writer, d Digest) {
 	}
 }
 
-// MetricsMarkdown renders the deterministic "## Metrics" section. It is kept
-// separate from Markdown so it can be appended to the daily doc verbatim (exact
-// figures the LLM never touches) or omitted from the digest fed to the LLM. All
-// values are over the recap window; "total" is union wall-clock (the heartbeat
-// model), and "average per topic" divides that by the session/topic count.
+// MetricsMarkdown renders the deterministic "## Metrics" and "## Project metrics"
+// sections. They are kept separate from Markdown so they can be appended to the
+// daily doc verbatim (exact figures the LLM never touches) or omitted from the
+// digest fed to the LLM. All values are over the recap window; "total" is union
+// wall-clock (the heartbeat model), and the per-session figures summarize the
+// individual session active times.
 func MetricsMarkdown(w io.Writer, d Digest) {
 	fmt.Fprintln(w, "## Metrics")
+	fmt.Fprintln(w)
 	n := d.Totals.Sessions
 	if n == 0 {
 		fmt.Fprintln(w, "- No activity in this window.")
@@ -79,6 +81,40 @@ func MetricsMarkdown(w io.Writer, d Digest) {
 		n, plural(n))
 	fmt.Fprintf(w, "- Prompts sent: %d\n", d.Totals.Prompts)
 	fmt.Fprintf(w, "- Permission prompts: %d\n", d.Totals.Questions)
+
+	projectMetricsMarkdown(w, d.Projects)
+}
+
+// projectMetricsMarkdown renders per-project git context (remote + window commit
+// count), one line per project that resolves to a git repo (projects sorted by
+// active desc). Projects whose cwd isn't a live work tree — a removed temp
+// worktree, a non-repo directory like $HOME — are dropped rather than shown as an
+// empty "(no remote) · 0" line. The branch is shown only when it isn't
+// main/master (i.e. the count came off a feature branch — worth flagging).
+func projectMetricsMarkdown(w io.Writer, projects []Project) {
+	var repos []Project
+	for _, p := range projects {
+		if p.HasRepo {
+			repos = append(repos, p)
+		}
+	}
+	if len(repos) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "\n## Project metrics")
+	fmt.Fprintln(w)
+	for _, p := range repos {
+		remote := p.Remote
+		if remote == "" {
+			remote = "(no remote)"
+		}
+		branch := ""
+		if p.Branch != "" && p.Branch != "main" && p.Branch != "master" {
+			branch = fmt.Sprintf(" (%s)", p.Branch)
+		}
+		fmt.Fprintf(w, "- %s — %s · %d commit%s%s\n",
+			p.Name, remote, p.Commits, plural(p.Commits), branch)
+	}
 }
 
 // JSON writes the Digest as indented JSON for programmatic consumers.
