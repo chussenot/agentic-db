@@ -64,11 +64,20 @@ weekly)
 	PERIOD=week
 	OUT_DIR="$HOME/weeklies"
 	OUT="$OUT_DIR/weekly-$(date +%Y%m%d).md"
-	TITLE="# Weekly recap — week of $(date '+%A %d %B %Y')"
 	if [ -n "${RECAP_SINCE:-}" ]; then
 		WINDOW=(--since "$RECAP_SINCE")
+		TITLE="# Weekly recap — since $RECAP_SINCE"
 	else
-		WINDOW=(--period week)   # trailing 7 days
+		# The most recent COMPLETE calendar week: Monday 00:00 through Sunday
+		# 23:59:59. Runs Monday (the department weekly), but stays correct if a
+		# Persistent catch-up fires later in the week — it always reports the last
+		# whole Mon–Sun, never a partial current week. recap's --until is inclusive
+		# through the given day (it adds a day internally), so --until <Sunday>
+		# ends the window at Sun 23:59:59.999.
+		sun="$(date -d 'last sunday' +%Y-%m-%d)"
+		mon="$(date -d "$sun -6 days" +%Y-%m-%d)"
+		WINDOW=(--since "$mon" --until "$sun")
+		TITLE="# Weekly recap — week of $(date -d "$mon" '+%A %d %B %Y')"
 	fi
 	;;
 *)

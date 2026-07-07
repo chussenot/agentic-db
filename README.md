@@ -66,7 +66,7 @@ verbatim after the LLM narrative).
 - `claude-daily-recap.timer` — daily at 09:00 → `~/dailies/daily-YYYYMMDD.md`
   (previous day, or Fri–Sun on a Monday).
 - `claude-weekly-recap.timer` — Mondays at 09:00 → `~/weeklies/weekly-YYYYMMDD.md`
-  (trailing 7 days).
+  (the previous complete calendar week, Mon 00:00 → Sun 23:59).
 
 Both are `Persistent=true`, so a run missed while the laptop was suspended/off
 fires at the next power-on (unlike cron). The job waits out the wakeup resource
