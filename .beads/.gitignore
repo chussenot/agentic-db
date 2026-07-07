@@ -59,6 +59,11 @@ dolt-pprof/
 # Backup data (auto-exported JSONL, local-only)
 backup/
 
+# Passive JSONL exports — not versioned (Dolt DB in embeddeddolt/ is source of truth)
+issues.jsonl
+interactions.jsonl
+events.jsonl
+
 # Per-project environment file (Dolt connection config, GH#2520)
 .env
 
