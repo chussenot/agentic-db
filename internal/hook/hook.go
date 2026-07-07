@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/git"
 	"github.com/mrzor/claude-status/internal/niri"
 	"github.com/mrzor/claude-status/internal/state"
 )
@@ -161,6 +162,21 @@ func run(r io.Reader, dbPath string, startPID int) error {
 		}
 		// If resolution fails (remote/tmux/ssh, or niri unavailable) we leave
 		// both NULL and continue — degrade gracefully.
+	}
+
+	// Repo resolution: gated exactly like window_id — resolve once (on SessionStart,
+	// or lazily whenever repo_id is still NULL, which covers a session that started
+	// outside a work tree and later cd'd into one), then never shell out to git
+	// again for this session. Best-effort: any failure leaves repo_id NULL and the
+	// recap falls back to its cwd heuristic. session_repos is the durable record
+	// (survives the SessionEnd that deletes this row); repo_id is just the cache.
+	if ev.HookEventName == "SessionStart" || !s.RepoID.Valid {
+		if remote, root, branch, ok := git.Resolve(ev.Cwd); ok {
+			if id, rerr := database.UpsertRepo(remote, root, now); rerr == nil {
+				s.RepoID = sql.NullInt64{Int64: id, Valid: true}
+				_ = database.LinkSessionRepo(ev.SessionID, id, nullString(branch), now)
+			}
+		}
 	}
 
 	// Status change. Notification is special: MapEvent always reports Prompt,

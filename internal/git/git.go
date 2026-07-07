@@ -7,11 +7,18 @@
 package git
 
 import (
+	"context"
 	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// runTimeout bounds any single git invocation. Describe runs off the recap path
+// (not latency-critical) and Resolve runs on the hook hot path (must never
+// block); a hung git — a network remote, a corrupt repo, an unresponsive
+// filesystem — degrades to an unavailable field rather than stalling either.
+const runTimeout = 500 * time.Millisecond
 
 // Info is the git context for one repository at recap time.
 type Info struct {
@@ -55,10 +62,46 @@ func Describe(dir string, since, until time.Time) (Info, bool) {
 	return i, true
 }
 
-// run executes `git -C dir <args...>` and returns its stdout. Errors (including a
-// non-zero exit) are returned so callers can treat that field as unavailable.
+// Resolve returns the identity of the repo containing dir — its git worktree
+// toplevel (root), normalized origin remote, and current branch — for capture on
+// the hook hot path. It is the cheap cousin of Describe: it OMITS the commit
+// count (a rev-list walk), which is window-dependent and belongs at recap time,
+// not on every session's first hook. ok is false when dir is empty, git is
+// unavailable, or dir is not inside a work tree; remote/branch degrade to "" on
+// their own (a repo with no origin or a detached HEAD still yields ok==true).
+func Resolve(dir string) (remote, root, branch string, ok bool) {
+	if dir == "" {
+		return "", "", "", false
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return "", "", "", false
+	}
+	out, err := run(dir, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", "", "", false // not a work tree (or git failed)
+	}
+	root = strings.TrimSpace(out)
+	if root == "" {
+		return "", "", "", false
+	}
+	if out, err := run(dir, "remote", "get-url", "origin"); err == nil {
+		remote = normalizeRemote(out)
+	}
+	if out, err := run(dir, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
+		if b := strings.TrimSpace(out); b != "HEAD" { // "HEAD" == detached
+			branch = b
+		}
+	}
+	return remote, root, branch, true
+}
+
+// run executes `git -C dir <args...>` and returns its stdout, under runTimeout.
+// Errors (including a non-zero exit or a timeout) are returned so callers can
+// treat that field as unavailable.
 func run(dir string, args ...string) (string, error) {
-	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).Output()
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...).Output()
 	return string(out), err
 }
 

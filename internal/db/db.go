@@ -61,6 +61,38 @@ CREATE TABLE IF NOT EXISTS events (
   window_title TEXT               -- niri window title; set ONLY on event='TitleChanged' rows
 );
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+
+-- repos is the normalized git repository catalogue. A session's repo is captured
+-- once at hook time (see session_repos) instead of re-derived from cwd heuristics
+-- at recap time. A repo IS its remote when it has one, else its root_path — the
+-- two partial unique indexes enforce that identity without NULLs colliding.
+-- root_path (the git worktree toplevel) is also the directory recap runs
+-- git rev-list in to count window commits, so it doubles as a live handle.
+CREATE TABLE IF NOT EXISTS repos (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  remote        TEXT,             -- normalized (e.g. "gh/owner/repo"); NULL for a local-only repo
+  root_path     TEXT,             -- git worktree toplevel; NULL if unknown
+  first_seen_ts INTEGER NOT NULL,
+  last_seen_ts  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_remote ON repos(remote) WHERE remote IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_root   ON repos(root_path)
+  WHERE remote IS NULL AND root_path IS NOT NULL;
+
+-- session_repos is the DURABLE session<->repo association. Unlike sessions (which
+-- are deleted on SessionEnd), these rows are never removed, so recap — which runs
+-- over the historical event log — can resolve any past session's repo. The
+-- composite primary key makes it N-M ready: a session that works several repos
+-- (e.g. via /add-dir) records one row per repo. branch is the branch observed for
+-- this session in this repo (NULL if detached/unknown).
+CREATE TABLE IF NOT EXISTS session_repos (
+  session_id    TEXT NOT NULL,
+  repo_id       INTEGER NOT NULL,
+  branch        TEXT,
+  first_seen_ts INTEGER NOT NULL,
+  PRIMARY KEY (session_id, repo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_session_repos_session ON session_repos(session_id);
 `
 
 // Session mirrors one row of the sessions table. NULLable columns use the
@@ -77,6 +109,11 @@ type Session struct {
 	// TerminalPID is the terminal (kitty) pid used for /proc liveness checks;
 	// NULL if unresolved.
 	TerminalPID sql.NullInt64
+	// RepoID is the repos.id resolved from cwd at hook time; NULL until the
+	// session's cwd first resolves to a git work tree (or if it never does). It
+	// caches the resolution and gates re-resolution; session_repos is the durable
+	// record.
+	RepoID sql.NullInt64
 	// State is one of state.Working / state.Prompt / state.Idle (stored as the
 	// backing string). NOT NULL.
 	State string
@@ -185,6 +222,28 @@ FROM events WHERE ts >= ? AND ts <= ? ORDER BY ts ASC`, fromMS, toMS)
 	return out, rows.Err()
 }
 
+// DistinctEventSessionIDs returns every session id that appears in the audit log,
+// oldest-first by earliest event. It is the enumeration backfill uses to find
+// historical sessions — the sessions table is long gone for ended sessions, but
+// the event log persists.
+func (d *DB) DistinctEventSessionIDs() ([]string, error) {
+	rows, err := d.sql.Query(`
+SELECT session_id FROM events GROUP BY session_id ORDER BY MIN(ts) ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("distinct session ids: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			return nil, fmt.Errorf("scan session id: %w", err)
+		}
+		out = append(out, sid)
+	}
+	return out, rows.Err()
+}
+
 // PruneEvents keeps only the newest keep rows, deleting older ones. It returns
 // the number deleted. The audit log is retained indefinitely by default — the
 // daemon no longer calls this; it remains a manual primitive for a one-off trim
@@ -270,6 +329,12 @@ func migrate(sqldb *sql.DB) error {
 		!strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("add events.window_title: %w", err)
 	}
+	// repo_id caches the resolved repo on the live row and gates re-resolution in
+	// the hook (mirrors window_id): the durable record lives in session_repos.
+	if _, err := sqldb.Exec(`ALTER TABLE sessions ADD COLUMN repo_id INTEGER`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("add sessions.repo_id: %w", err)
+	}
 	return nil
 }
 
@@ -288,20 +353,21 @@ func (d *DB) Upsert(s Session) error {
 	defer tx.Rollback()
 	_, err = tx.Exec(`
 INSERT INTO sessions
-  (session_id, cwd, window_id, terminal_pid, state, notify_kind,
+  (session_id, cwd, window_id, terminal_pid, repo_id, state, notify_kind,
    last_talk_ts, last_event_ts, last_seen_ts, created_ts)
-VALUES (?,?,?,?,?,?,?,?,?,?)
+VALUES (?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(session_id) DO UPDATE SET
   cwd           = excluded.cwd,
   window_id     = excluded.window_id,
   terminal_pid  = excluded.terminal_pid,
+  repo_id       = excluded.repo_id,
   state         = excluded.state,
   notify_kind   = excluded.notify_kind,
   last_talk_ts  = excluded.last_talk_ts,
   last_event_ts = excluded.last_event_ts,
   last_seen_ts  = excluded.last_seen_ts
 `,
-		s.SessionID, s.Cwd, s.WindowID, s.TerminalPID, s.State, s.NotifyKind,
+		s.SessionID, s.Cwd, s.WindowID, s.TerminalPID, s.RepoID, s.State, s.NotifyKind,
 		s.LastTalkTS, s.LastEventTS, s.LastSeenTS, s.CreatedTS)
 	if err != nil {
 		return fmt.Errorf("upsert: %w", err)
@@ -309,12 +375,12 @@ ON CONFLICT(session_id) DO UPDATE SET
 	return tx.Commit()
 }
 
-const selectCols = `session_id, cwd, window_id, terminal_pid, state, notify_kind,
+const selectCols = `session_id, cwd, window_id, terminal_pid, repo_id, state, notify_kind,
   last_talk_ts, last_event_ts, last_seen_ts, created_ts`
 
 func scanSession(row interface{ Scan(...any) error }) (Session, error) {
 	var s Session
-	err := row.Scan(&s.SessionID, &s.Cwd, &s.WindowID, &s.TerminalPID, &s.State,
+	err := row.Scan(&s.SessionID, &s.Cwd, &s.WindowID, &s.TerminalPID, &s.RepoID, &s.State,
 		&s.NotifyKind, &s.LastTalkTS, &s.LastEventTS, &s.LastSeenTS, &s.CreatedTS)
 	return s, err
 }
@@ -382,6 +448,119 @@ func (d *DB) ReapDead(predicate func(Session) bool) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// nullString maps "" to a NULL string so an unknown remote/root/branch stores as
+// NULL rather than the empty string (which the partial unique indexes treat as a
+// real value).
+func nullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
+}
+
+// RepoRef is a repos row joined with the per-session branch, as consumed by
+// recap. Remote is the normalized remote ("" for a local-only repo), Root the
+// git worktree toplevel, Branch the branch observed for the owning session.
+type RepoRef struct {
+	Remote string
+	Root   string
+	Branch string
+}
+
+// UpsertRepo records (or refreshes) the repo identified by remote/rootPath and
+// returns its id. Identity is the remote when non-empty, else the root_path — a
+// SELECT-then-INSERT under an IMMEDIATE tx (rather than ON CONFLICT) so the two
+// partial unique indexes don't need distinct conflict targets. A repeated repo
+// bumps last_seen_ts; a first sighting inserts. It is best-effort input: an empty
+// remote AND empty rootPath is meaningless and returns an error.
+func (d *DB) UpsertRepo(remote, rootPath string, ts int64) (int64, error) {
+	if remote == "" && rootPath == "" {
+		return 0, fmt.Errorf("upsert repo: empty remote and root_path")
+	}
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	rem := nullString(remote)
+	root := nullString(rootPath)
+
+	// Identity lookup: by remote when we have one, else by root_path among the
+	// local-only (remote IS NULL) rows.
+	var (
+		id  int64
+		sel *sql.Row
+	)
+	if remote != "" {
+		sel = tx.QueryRow(`SELECT id FROM repos WHERE remote = ?`, rem)
+	} else {
+		sel = tx.QueryRow(`SELECT id FROM repos WHERE remote IS NULL AND root_path = ?`, root)
+	}
+	switch err := sel.Scan(&id); err {
+	case nil:
+		// Refresh last_seen_ts, and fill root_path if we now know it and didn't.
+		if _, err := tx.Exec(`UPDATE repos SET last_seen_ts = ?,
+		    root_path = COALESCE(root_path, ?) WHERE id = ?`, ts, root, id); err != nil {
+			return 0, fmt.Errorf("touch repo: %w", err)
+		}
+	case sql.ErrNoRows:
+		res, err := tx.Exec(`INSERT INTO repos (remote, root_path, first_seen_ts, last_seen_ts)
+		    VALUES (?,?,?,?)`, rem, root, ts, ts)
+		if err != nil {
+			return 0, fmt.Errorf("insert repo: %w", err)
+		}
+		if id, err = res.LastInsertId(); err != nil {
+			return 0, fmt.Errorf("repo id: %w", err)
+		}
+	default:
+		return 0, fmt.Errorf("select repo: %w", err)
+	}
+	return id, tx.Commit()
+}
+
+// LinkSessionRepo records the durable association between a session and a repo
+// (one row per repo, N-M ready). It is idempotent on (session_id, repo_id) and
+// refreshes the branch. Unlike the sessions row, this survives SessionEnd so
+// recap can resolve historical sessions.
+func (d *DB) LinkSessionRepo(sessionID string, repoID int64, branch sql.NullString, ts int64) error {
+	_, err := d.sql.Exec(`
+INSERT INTO session_repos (session_id, repo_id, branch, first_seen_ts)
+VALUES (?,?,?,?)
+ON CONFLICT(session_id, repo_id) DO UPDATE SET branch = excluded.branch`,
+		sessionID, repoID, branch, ts)
+	if err != nil {
+		return fmt.Errorf("link session_repo: %w", err)
+	}
+	return nil
+}
+
+// LoadSessionRepos returns every session's repos, keyed by session_id, in a
+// single join. first_seen_ts orders the slice so the primary (earliest-seen)
+// repo of a session is element 0 — recap groups by that one for now.
+func (d *DB) LoadSessionRepos() (map[string][]RepoRef, error) {
+	rows, err := d.sql.Query(`
+SELECT sr.session_id, r.remote, r.root_path, sr.branch
+FROM session_repos sr JOIN repos r ON r.id = sr.repo_id
+ORDER BY sr.session_id, sr.first_seen_ts, sr.repo_id`)
+	if err != nil {
+		return nil, fmt.Errorf("load session_repos: %w", err)
+	}
+	defer rows.Close()
+	out := map[string][]RepoRef{}
+	for rows.Next() {
+		var sid string
+		var remote, root, branch sql.NullString
+		if err := rows.Scan(&sid, &remote, &root, &branch); err != nil {
+			return nil, fmt.Errorf("scan session_repo: %w", err)
+		}
+		out[sid] = append(out[sid], RepoRef{
+			Remote: remote.String, Root: root.String, Branch: branch.String,
+		})
+	}
+	return out, rows.Err()
 }
 
 // DefaultDBPath returns the canonical database path,

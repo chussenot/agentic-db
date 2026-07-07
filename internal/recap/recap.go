@@ -36,6 +36,14 @@ type Meta struct {
 // session has no transcript (still counted for effort, just without content).
 type Lookup func(sessionID string) (Meta, bool)
 
+// RepoLookup resolves a session id to its primary repo, captured at hook time and
+// stored normalized (internal/db). ok is false for a session with no stored repo
+// (an old/un-backfilled session, or a cwd that never resolved to a work tree), in
+// which case Build falls back to the transcript-cwd heuristic. Returning the zero
+// RepoLookup (nil) disables the DB path entirely — every session takes the
+// fallback, which is the pre-normalization behavior.
+type RepoLookup func(sessionID string) (db.RepoRef, bool)
+
 // Digest is the full windowed recap. Sessions holds the top-N by active time in
 // detail; sessions beyond that are summarized by MoreSessions / MoreProjects and
 // still fold into Totals and Projects.
@@ -107,9 +115,11 @@ type Project struct {
 type interval struct{ start, end int64 } // unix ms
 
 // Build aggregates events (any order; grouped internally) into a Digest for
-// [from, to]. lookup supplies transcript content; topN caps the detailed session
-// list. Effort stats are computed only from events already inside the window.
-func Build(events []db.Event, lookup Lookup, from, to time.Time, topN int) Digest {
+// [from, to]. lookup supplies transcript content; repoLookup supplies the stored
+// repo (nil disables it, falling back to the cwd heuristic for every session);
+// topN caps the detailed session list. Effort stats are computed only from events
+// already inside the window.
+func Build(events []db.Event, lookup Lookup, repoLookup RepoLookup, from, to time.Time, topN int) Digest {
 	fromMS, toMS := from.UnixMilli(), to.UnixMilli()
 
 	// Group events per session, preserving ascending ts.
@@ -142,6 +152,19 @@ func Build(events []db.Event, lookup Lookup, from, to time.Time, topN int) Diges
 			s.Branch = m.Branch
 			s.Dir = m.Cwd
 			s.Project = projectName(m.Cwd)
+		}
+		// Prefer the normalized repo stored at hook time: it groups sessions by the
+		// actual repository (so two cwds sharing a remote collapse into one project),
+		// where the transcript heuristic groups by cwd basename. Fall back to the
+		// heuristic above when no repo was captured.
+		if repoLookup != nil {
+			if r, ok := repoLookup(sid); ok {
+				s.Dir = r.Root // the git toplevel; recap runs git rev-list here
+				s.Project = repoDisplayName(r)
+				if r.Branch != "" {
+					s.Branch = r.Branch
+				}
+			}
 		}
 		if s.Project == "" {
 			s.Project = "(unknown)"
@@ -329,4 +352,17 @@ func projectName(cwd string) string {
 		return ""
 	}
 	return filepath.Base(cwd)
+}
+
+// repoDisplayName is the short label for a stored repo: the last segment of the
+// normalized remote (e.g. "gh/owner/repo" -> "repo"), else the basename of the
+// git toplevel for a local-only repo, else "(unknown)".
+func repoDisplayName(r db.RepoRef) string {
+	if r.Remote != "" {
+		return filepath.Base(r.Remote)
+	}
+	if r.Root != "" {
+		return filepath.Base(r.Root)
+	}
+	return ""
 }

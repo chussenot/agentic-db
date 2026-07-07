@@ -1,6 +1,7 @@
 package recap
 
 import (
+	"database/sql"
 	"flag"
 	"fmt"
 	"io"
@@ -101,7 +102,22 @@ func RunRecap(args []string) error {
 		return Meta{Title: info.Title, Ask: info.Ask, Cwd: info.Cwd, Branch: info.Branch}, true
 	}
 
-	d := Build(events, lookup, from, to, *top)
+	// Repo captured at hook time (normalized). The primary repo is element 0 (see
+	// LoadSessionRepos ordering). A missing entry makes Build fall back to the
+	// transcript-cwd heuristic for that session.
+	sessionRepos, err := database.LoadSessionRepos()
+	if err != nil {
+		return fmt.Errorf("load session repos: %w", err)
+	}
+	repoLookup := func(sid string) (db.RepoRef, bool) {
+		refs := sessionRepos[sid]
+		if len(refs) == 0 {
+			return db.RepoRef{}, false
+		}
+		return refs[0], true
+	}
+
+	d := Build(events, lookup, repoLookup, from, to, *top)
 	enrichProjects(d.Projects, from, to)
 	if *asJSON {
 		return JSON(os.Stdout, d)
@@ -116,6 +132,84 @@ func RunRecap(args []string) error {
 		MetricsMarkdown(os.Stdout, d)
 	}
 	return nil
+}
+
+// RunRepoBackfill implements `claude-status repo-backfill`. It walks every
+// session id in the event log, and for those without a stored repo yet, runs the
+// same heuristics recap used before normalization — transcript-glob for the cwd,
+// then git for the repo identity — and persists the result (repos + session_repos).
+// A session whose cwd no longer resolves to a work tree (a since-removed temp
+// worktree, a non-repo dir) is left unresolved: NULL where the heuristic falls
+// short is acceptable. It is idempotent: already-linked sessions are skipped, so
+// it is safe to re-run.
+func RunRepoBackfill(args []string) error {
+	fs := flag.NewFlagSet("repo-backfill", flag.ContinueOnError)
+	dbPath := fs.String("db", db.DefaultDBPath(), "path to the claude-status sqlite database")
+	tdir := fs.String("transcripts", transcript.DefaultDir(), "Claude Code transcripts root")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	database, err := db.Open(*dbPath)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer database.Close()
+
+	ids, err := database.DistinctEventSessionIDs()
+	if err != nil {
+		return fmt.Errorf("enumerate sessions: %w", err)
+	}
+	existing, err := database.LoadSessionRepos()
+	if err != nil {
+		return fmt.Errorf("load session repos: %w", err)
+	}
+
+	now := db.Now().UnixMilli()
+	var resolved, unresolved, skipped int
+	for _, sid := range ids {
+		if len(existing[sid]) > 0 {
+			skipped++
+			continue
+		}
+		info, ok := transcript.Meta(*tdir, sid)
+		if !ok || info.Cwd == "" {
+			unresolved++
+			continue
+		}
+		remote, root, branch, ok := git.Resolve(info.Cwd)
+		if !ok {
+			unresolved++
+			continue
+		}
+		id, err := database.UpsertRepo(remote, root, now)
+		if err != nil {
+			unresolved++
+			continue
+		}
+		// Prefer the transcript's recorded branch (the branch at that session's
+		// time); fall back to git's current branch for the checkout.
+		b := info.Branch
+		if b == "" {
+			b = branch
+		}
+		if err := database.LinkSessionRepo(sid, id, nullString(b), now); err != nil {
+			return fmt.Errorf("link %s: %w", sid, err)
+		}
+		resolved++
+	}
+
+	fmt.Fprintf(os.Stdout, "repo-backfill: %d resolved, %d unresolved, %d already-linked (of %d sessions)\n",
+		resolved, unresolved, skipped, len(ids))
+	return nil
+}
+
+// nullString maps "" to a NULL string for the backfill's branch field.
+func nullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
 }
 
 // RunPrompt implements `claude-status recap-prompt`: it prints the period-tuned
