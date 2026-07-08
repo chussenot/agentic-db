@@ -50,14 +50,23 @@ daily)
 	PERIOD=day
 	OUT_DIR="$HOME/dailies"
 	OUT="$OUT_DIR/daily-$(date +%Y%m%d).md"
-	TITLE="# Daily recap — $(date '+%A %d %B %Y')"
 	# Normally the previous day; on Monday reach back over the weekend to Friday.
+	# The title names the day(s) BEING recapped, not today (the day the job runs).
 	if [ -n "${RECAP_SINCE:-}" ]; then
 		WINDOW=(--since "$RECAP_SINCE")
+		TITLE="# Daily recap — since $RECAP_SINCE"
 	else
 		back=1
 		[ "$(date +%u)" = 1 ] && back=3   # Monday (ISO weekday 1): include Fri+Sat+Sun
 		WINDOW=(--since "$(date -d "$back days ago" +%Y-%m-%d)")
+		last="$(date -d 'yesterday' '+%A %d %B %Y')"
+		if [ "$back" = 1 ]; then
+			TITLE="# Daily recap — $last"
+		else
+			# A Monday run covers Fri–Sun: title the range.
+			first="$(date -d "$back days ago" '+%A %d %B')"
+			TITLE="# Daily recap — $first → $last"
+		fi
 	fi
 	;;
 weekly)
@@ -132,7 +141,10 @@ for attempt in 1 2 3; do
 		| claude -p "$(claude-status "${prompt_args[@]}")" >"$tmp" 2>>"$LOG" \
 		&& [ -s "$tmp" ]; then
 		metrics="$(claude-status recap "${WINDOW[@]}" --metrics only --db "$DB" --transcripts "$TRANSCRIPTS" 2>>"$LOG")"
-		{ printf '%s\n\n' "$TITLE"; cat "$tmp"; printf '\n%s\n' "$metrics"; } >"$OUT"
+		# Title names the recapped period; a small footer records when the doc was
+		# produced (distinct from the period — matters for a force/catch-up run).
+		footer="_Generated on $(date '+%A %d %B %Y, %H:%M')._"
+		{ printf '%s\n\n' "$TITLE"; cat "$tmp"; printf '\n%s\n' "$metrics"; printf '\n---\n\n%s\n' "$footer"; } >"$OUT"
 		log "wrote $OUT (attempt $attempt)"
 		exit 0
 	fi
