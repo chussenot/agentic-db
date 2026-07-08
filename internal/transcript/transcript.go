@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Info is what a transcript yields about one session. Any field may be empty
@@ -24,14 +25,25 @@ import (
 type Info struct {
 	SessionID string
 	Title     string // Claude's latest ai-title for the session (the topic)
-	Ask       string // the opening user prompt (truncated), i.e. the intent
+	Ask       string // the opening user prompt (full, untruncated), i.e. the intent
 	Cwd       string // working directory the session ran in
 	Branch    string // git branch at the session's start
+	// Turns is the session's main-thread conversational arc: every genuine user
+	// prompt interleaved with the assistant's turn-ending message that preceded
+	// the next prompt (the "recap before my prompt"), in chronological order.
+	// Text is never truncated — the consumer decides what to elide. Sidechain
+	// (subagent) messages are excluded; this is the top-level thread only.
+	Turns []Turn
 }
 
-// askMax bounds the stored opening prompt: enough to convey intent in a recap
-// without piping a wall of text (or much of the conversation) to the model.
-const askMax = 240
+// Turn is one message in the arc: a genuine user prompt (Role "user") or an
+// assistant turn-ending message (Role "assistant"). Text is the full message
+// text. At is the transcript line's timestamp (zero if unparseable).
+type Turn struct {
+	Role string
+	Text string
+	At   time.Time
+}
 
 // DefaultDir returns Claude Code's transcripts root. It honors CLAUDE_CONFIG_DIR
 // (as internal/clauded does for the sessions dir) so a relocated Claude config
@@ -74,61 +86,116 @@ func Meta(dir, sessionID string) (Info, bool) {
 	}
 	defer f.Close()
 
-	info := Info{SessionID: sessionID}
+	sc := scanner{info: &Info{SessionID: sessionID}}
 	r := bufio.NewReader(f)
 	for {
 		// Transcript lines can be far larger than bufio.Scanner's default token
 		// cap (big assistant turns), so read by delimiter with no size limit.
 		lineBytes, rerr := r.ReadBytes('\n')
 		if len(lineBytes) > 0 {
-			scanLine(lineBytes, &info)
+			sc.line(lineBytes)
 		}
 		if rerr != nil {
 			break // io.EOF or a read error: return what we have
 		}
 	}
-	return info, true
+	sc.done()
+	return *sc.info, true
 }
 
 // tLine is the tolerant decode of one transcript line — only the fields recap
 // needs. message.content is left raw because it is polymorphic (a plain string
 // for a typed prompt, or an array of blocks for tool results / rich content).
 type tLine struct {
-	Type      string `json:"type"`
-	AiTitle   string `json:"aiTitle"`
-	Cwd       string `json:"cwd"`
-	GitBranch string `json:"gitBranch"`
-	Message   *struct {
+	Type        string `json:"type"`
+	AiTitle     string `json:"aiTitle"`
+	Cwd         string `json:"cwd"`
+	GitBranch   string `json:"gitBranch"`
+	Timestamp   string `json:"timestamp"`
+	IsSidechain bool   `json:"isSidechain"`
+	Message     *struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	} `json:"message"`
 }
 
-func scanLine(b []byte, info *Info) {
+// scanner accumulates Info across a transcript's lines. It carries the pending
+// assistant summary — the last assistant text seen since the previous user
+// prompt — which is flushed into the arc just before the next user prompt (so
+// it reads as the "recap before my prompt") and, at EOF, as the session's final
+// outcome.
+type scanner struct {
+	info     *Info
+	pendText string    // last assistant text since the previous user turn
+	pendAt   time.Time // its timestamp
+}
+
+func (sc *scanner) line(b []byte) {
 	var l tLine
 	if err := json.Unmarshal(b, &l); err != nil {
 		return
 	}
 	if l.AiTitle != "" {
-		info.Title = l.AiTitle // last one wins
+		sc.info.Title = l.AiTitle // last one wins
 	}
-	if info.Cwd == "" && l.Cwd != "" {
-		info.Cwd = l.Cwd
+	if sc.info.Cwd == "" && l.Cwd != "" {
+		sc.info.Cwd = l.Cwd
 	}
-	if info.Branch == "" && l.GitBranch != "" {
-		info.Branch = l.GitBranch
+	if sc.info.Branch == "" && l.GitBranch != "" {
+		sc.info.Branch = l.GitBranch
 	}
-	if info.Ask == "" && l.Type == "user" && l.Message != nil {
-		if text := userText(l.Message.Content); isRealAsk(text) {
-			info.Ask = truncate(text, askMax)
+	// The arc is the top-level thread only — subagent (sidechain) messages are
+	// their own conversations, not what I typed to this session.
+	if l.IsSidechain || l.Message == nil {
+		return
+	}
+	switch l.Message.Role {
+	case "assistant":
+		if text := strings.TrimSpace(contentText(l.Message.Content)); text != "" {
+			sc.pendText = text // last assistant text before the next prompt wins
+			sc.pendAt = parseTS(l.Timestamp)
+		}
+	case "user":
+		text := contentText(l.Message.Content)
+		if !isRealAsk(text) {
+			return // a tool_result-only turn, a slash-command wrapper, or a preamble
+		}
+		if sc.pendText != "" {
+			sc.info.Turns = append(sc.info.Turns, Turn{Role: "assistant", Text: sc.pendText, At: sc.pendAt})
+			sc.pendText = ""
+		}
+		sc.info.Turns = append(sc.info.Turns, Turn{Role: "user", Text: text, At: parseTS(l.Timestamp)})
+		if sc.info.Ask == "" {
+			sc.info.Ask = text // the opening ask, full and untruncated
 		}
 	}
 }
 
-// userText extracts the text of a user message. content is either a JSON string
+// done flushes the trailing assistant summary — the last thing Claude said with
+// no user prompt after it, i.e. the session's final outcome.
+func (sc *scanner) done() {
+	if sc.pendText != "" {
+		sc.info.Turns = append(sc.info.Turns, Turn{Role: "assistant", Text: sc.pendText, At: sc.pendAt})
+	}
+}
+
+// parseTS parses a transcript RFC3339 timestamp, returning the zero time when it
+// is absent or malformed (never the caller's concern — At is best-effort).
+func parseTS(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// contentText extracts the text of a message. content is either a JSON string
 // (a typed prompt) or an array of blocks; for the array we join the text of any
-// "text" blocks and ignore tool_result / image / other blocks.
-func userText(content json.RawMessage) string {
+// "text" blocks and ignore thinking / tool_use / tool_result / image blocks.
+func contentText(content json.RawMessage) string {
 	if len(content) == 0 {
 		return ""
 	}
@@ -164,17 +231,12 @@ func isRealAsk(text string) bool {
 	case strings.HasPrefix(text, "<command-"),
 		strings.HasPrefix(text, "<local-command"),
 		strings.HasPrefix(text, "Caveat:"),
-		strings.HasPrefix(text, "<system-reminder"):
+		strings.HasPrefix(text, "<system-reminder"),
+		strings.HasPrefix(text, "<task-notification"):
+		// Harness-injected pseudo-prompts (slash-command wrappers, the caveat/
+		// system-reminder preamble, background task-completion notifications) —
+		// not something I typed, so they never enter the arc.
 		return false
 	}
 	return true
-}
-
-// truncate caps s at n runes, appending an ellipsis when it cuts.
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return strings.TrimSpace(string(r[:n])) + "…"
 }

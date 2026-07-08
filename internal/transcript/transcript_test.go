@@ -62,7 +62,9 @@ func TestMetaMissing(t *testing.T) {
 	}
 }
 
-func TestAskTruncation(t *testing.T) {
+// The opening ask is stored full — no truncation at the tooling level (the
+// consumer decides what to elide).
+func TestAskNotTruncated(t *testing.T) {
 	dir := t.TempDir()
 	id := "long"
 	long := strings.Repeat("x", 400)
@@ -70,10 +72,45 @@ func TestAskTruncation(t *testing.T) {
 		`{"type":"user","message":{"role":"user","content":"` + long + `"}}`,
 	})
 	info, _ := Meta(dir, id)
-	if len([]rune(info.Ask)) > askMax+1 { // +1 for the ellipsis rune
-		t.Errorf("Ask not truncated: %d runes", len([]rune(info.Ask)))
+	if info.Ask != long {
+		t.Errorf("Ask should be the full %d-rune prompt untruncated, got %d runes", len(long), len([]rune(info.Ask)))
 	}
-	if info.Ask[len(info.Ask)-len("…"):] != "…" {
-		t.Errorf("truncated Ask should end with ellipsis, got %q", info.Ask[len(info.Ask)-4:])
+}
+
+// The arc interleaves my prompts with the assistant's turn-ending message
+// before each next prompt: only the LAST assistant text of a run survives (the
+// turn-ending one), sidechain (subagent) messages are excluded, and the final
+// assistant message is flushed as the session outcome.
+func TestArc(t *testing.T) {
+	dir := t.TempDir()
+	id := "arc"
+	writeTranscript(t, dir, "p", id, []string{
+		`{"type":"user","timestamp":"2026-07-07T10:00:00Z","message":{"role":"user","content":"first ask"}}`,
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"thinking out loud"}]}}`,
+		`{"type":"assistant","timestamp":"2026-07-07T10:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"done the first thing"}]}}`,
+		`{"type":"user","isSidechain":true,"message":{"role":"user","content":"subagent prompt"}}`,
+		`{"type":"user","timestamp":"2026-07-07T10:05:00Z","message":{"role":"user","content":"second ask"}}`,
+		`{"type":"assistant","timestamp":"2026-07-07T10:06:00Z","message":{"role":"assistant","content":[{"type":"text","text":"final outcome"}]}}`,
+	})
+	info, ok := Meta(dir, id)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	want := []Turn{
+		{Role: "user", Text: "first ask"},
+		{Role: "assistant", Text: "done the first thing"}, // intermediate "thinking out loud" dropped
+		{Role: "user", Text: "second ask"},                // sidechain prompt excluded
+		{Role: "assistant", Text: "final outcome"},        // flushed at EOF
+	}
+	if len(info.Turns) != len(want) {
+		t.Fatalf("Turns = %d, want %d: %+v", len(info.Turns), len(want), info.Turns)
+	}
+	for i, w := range want {
+		if info.Turns[i].Role != w.Role || info.Turns[i].Text != w.Text {
+			t.Errorf("Turns[%d] = {%s %q}, want {%s %q}", i, info.Turns[i].Role, info.Turns[i].Text, w.Role, w.Text)
+		}
+	}
+	if info.Turns[2].At.IsZero() {
+		t.Error("expected the second ask's timestamp to be parsed")
 	}
 }

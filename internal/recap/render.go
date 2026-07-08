@@ -81,6 +81,8 @@ func MetricsMarkdown(w io.Writer, d Digest) {
 		n, plural(n))
 	fmt.Fprintf(w, "- Prompts sent: %d\n", d.Totals.Prompts)
 	fmt.Fprintf(w, "- Permission prompts: %d\n", d.Totals.Questions)
+	fmt.Fprintf(w, "- Work vs wait: %s working · %s waiting on me · %s on permission\n",
+		fmtDur(d.Totals.Working), fmtDur(d.Totals.WaitingUser), fmtDur(d.Totals.WaitingPermission))
 
 	projectMetricsMarkdown(w, d.Projects)
 }

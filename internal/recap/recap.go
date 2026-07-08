@@ -30,6 +30,18 @@ const heartbeatCap = 5 * time.Minute
 // Meta is the transcript-derived content for a session (see internal/transcript).
 type Meta struct {
 	Title, Ask, Cwd, Branch string
+	Arc                     []Turn // full conversational arc; untruncated
+}
+
+// Turn is one message in a session's arc: a genuine user prompt (Role "user")
+// or the assistant's turn-ending message that preceded the next prompt (Role
+// "assistant"). Text is untruncated. It mirrors transcript.Turn, kept local so
+// recap stays free of the transcript dependency (Build is pure over injected
+// data).
+type Turn struct {
+	Role string
+	Text string
+	At   time.Time
 }
 
 // Lookup resolves a session id to its transcript content. ok is false when the
@@ -71,6 +83,11 @@ type Totals struct {
 	Prompts   int // prompts I sent (UserPromptSubmit)
 	Questions int // permission prompts Claude raised (new_state=='prompt')
 	Projects  []string
+	// Window-wide work-vs-wait sums (see Session's fields). Summed per session,
+	// so unlike Active these do not merge overlaps across concurrent sessions.
+	Working           time.Duration
+	WaitingUser       time.Duration
+	WaitingPermission time.Duration
 }
 
 // Session is one session's contribution within the window.
@@ -87,6 +104,34 @@ type Session struct {
 	Turns     int
 	Prompts   int // prompts I sent (UserPromptSubmit)
 	Questions int // permission prompts Claude raised
+	// Arc is the full conversational arc (my prompts + Claude's turn-ending
+	// summaries), untruncated; empty when the transcript is unavailable.
+	Arc []Turn
+	// Work-vs-wait breakdown, derived from the event log's gaps (see summarize):
+	// Working = my prompt → Stop; WaitingUser = Stop → my next prompt; and
+	// WaitingPermission = a permission prompt → the next activity. Gaps into a
+	// SessionEnd are not attributed (the session ended, it wasn't waiting).
+	Working           time.Duration
+	WaitingUser       time.Duration
+	WaitingPermission time.Duration
+	// Timeline is the ordered span sequence the durations above sum from, with
+	// runs of the same kind coalesced — the intra-day picture of the session.
+	Timeline []Span
+}
+
+// SpanKind labels a stretch of a session's timeline.
+type SpanKind string
+
+const (
+	SpanWorking  SpanKind = "working"            // Claude taking a turn
+	SpanWaitUser SpanKind = "waiting_user"       // done, waiting on me to reply
+	SpanWaitPerm SpanKind = "waiting_permission" // blocked on a permission prompt
+)
+
+// Span is one contiguous stretch of a session's timeline of a single kind.
+type Span struct {
+	Kind       SpanKind
+	Start, End time.Time
 }
 
 // Streak is a contiguous span of cross-session activity within the window.
@@ -108,8 +153,17 @@ type Project struct {
 	Remote   string
 	Branch   string
 	Commits  int
+	Log      []Commit // the in-window commits behind Commits (newest first); "shipped X"
 	Active   time.Duration
 	Sessions int
+}
+
+// Commit mirrors git.Commit, kept local so recap's types don't leak the git
+// dependency into consumers of the digest. Subject is untruncated.
+type Commit struct {
+	Hash    string
+	Subject string
+	At      time.Time
 }
 
 type interval struct{ start, end int64 } // unix ms
@@ -149,6 +203,7 @@ func Build(events []db.Event, lookup Lookup, repoLookup RepoLookup, from, to tim
 				s.Topic = m.Title
 			}
 			s.Ask = m.Ask
+			s.Arc = m.Arc
 			s.Branch = m.Branch
 			s.Dir = m.Cwd
 			s.Project = projectName(m.Cwd)
@@ -189,6 +244,9 @@ func Build(events []db.Event, lookup Lookup, repoLookup RepoLookup, from, to tim
 		tot.Turns += s.Turns
 		tot.Prompts += s.Prompts
 		tot.Questions += s.Questions
+		tot.Working += s.Working
+		tot.WaitingUser += s.WaitingUser
+		tot.WaitingPermission += s.WaitingPermission
 		sumActive += s.Active
 		if i == 0 || s.Active < tot.MinActive {
 			tot.MinActive = s.Active
@@ -286,7 +344,70 @@ func summarize(evs []db.Event, sid string, toMS int64) (Session, []interval) {
 			}
 		}
 	}
+	buildTimeline(&s, evs, toMS)
 	return s, beats
+}
+
+// buildTimeline classifies the gap between each pair of consecutive events into
+// a work-vs-wait Span and coalesces same-kind runs, then sums the per-kind
+// totals onto s. The mode entered by event i governs the gap that follows it, so
+// UserPromptSubmit→...→Stop is "working", Stop→next prompt is "waiting_user",
+// and a permission prompt→next activity is "waiting_permission". A gap whose
+// end is a SessionEnd is left unattributed: the session ended, it wasn't
+// waiting. Sessions with no SessionEnd simply have no trailing event, so their
+// dangling final gap is likewise never invented.
+func buildTimeline(s *Session, evs []db.Event, toMS int64) {
+	mode := SpanWaitUser // before the first prompt we're waiting on the user to type
+	for i := range evs {
+		mode = nextMode(evs[i], mode)
+		if i+1 >= len(evs) || evs[i+1].Event == "SessionEnd" {
+			continue
+		}
+		start, end := evs[i].TS, evs[i+1].TS
+		if end > toMS {
+			end = toMS
+		}
+		if end <= start {
+			continue
+		}
+		if n := len(s.Timeline); n > 0 && s.Timeline[n-1].Kind == mode &&
+			s.Timeline[n-1].End.UnixMilli() == start {
+			s.Timeline[n-1].End = time.UnixMilli(end) // extend the current run
+		} else {
+			s.Timeline = append(s.Timeline, Span{Kind: mode, Start: time.UnixMilli(start), End: time.UnixMilli(end)})
+		}
+	}
+	for _, sp := range s.Timeline {
+		d := sp.End.Sub(sp.Start)
+		switch sp.Kind {
+		case SpanWorking:
+			s.Working += d
+		case SpanWaitUser:
+			s.WaitingUser += d
+		case SpanWaitPerm:
+			s.WaitingPermission += d
+		}
+	}
+}
+
+// nextMode is the timeline state machine: the span kind in effect after event e,
+// given the current kind. Neutral events (TitleChanged, SessionEnd, unknown)
+// keep the current kind; a non-permission Notification (e.g. the idle nudge)
+// likewise doesn't change what we're waiting on.
+func nextMode(e db.Event, cur SpanKind) SpanKind {
+	switch e.Event {
+	case "UserPromptSubmit", "PostToolUse", "SubagentStop":
+		return SpanWorking
+	case "Stop", "SessionStart":
+		return SpanWaitUser
+	case "Notification":
+		if e.NewState == "prompt" {
+			return SpanWaitPerm
+		}
+		return cur
+	default:
+		return cur
+	}
 }
 
 // unionDur returns the total duration covered by the union of intervals.

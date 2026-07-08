@@ -70,6 +70,17 @@ func TestDescribe(t *testing.T) {
 	if info.Commits != 2 {
 		t.Errorf("Commits = %d, want 2 (only the two in-window commits)", info.Commits)
 	}
+	// Log carries the actual in-window commits, newest first, with full subjects.
+	if len(info.Log) != 2 {
+		t.Fatalf("Log = %d commits, want 2: %+v", len(info.Log), info.Log)
+	}
+	if info.Log[0].Subject != "in window 2" || info.Log[1].Subject != "in window 1" {
+		t.Errorf("Log subjects = %q, %q; want newest-first 'in window 2', 'in window 1'",
+			info.Log[0].Subject, info.Log[1].Subject)
+	}
+	if info.Log[0].Hash == "" || info.Log[0].At.IsZero() {
+		t.Errorf("Log[0] should carry a hash and a parsed time: %+v", info.Log[0])
+	}
 
 	// A non-repo directory degrades to ok=false.
 	if _, ok := Describe(filepath.Join(dir, "does-not-exist"), since, until); ok {
@@ -152,5 +163,24 @@ func baseGitEnv() []string {
 		"GIT_COMMITTER_EMAIL=t@example.com",
 		"HOME=/tmp",
 		"PATH=" + os.Getenv("PATH"),
+	}
+}
+
+// TestParseLog checks the unit-separated decode skips blank and malformed lines
+// and keeps subjects verbatim.
+func TestParseLog(t *testing.T) {
+	out := "abc123\x1ffeat: do the thing\x1f2026-07-07T10:00:00Z\n" +
+		"\n" + // blank line — skipped
+		"def456\x1ffix: the bug\x1f2026-07-06T09:00:00Z\n" +
+		"garbage-without-separators\n" // < 3 fields — skipped
+	log := parseLog(out)
+	if len(log) != 2 {
+		t.Fatalf("commits = %d, want 2: %+v", len(log), log)
+	}
+	if log[0].Hash != "abc123" || log[0].Subject != "feat: do the thing" {
+		t.Errorf("commit[0] = %+v", log[0])
+	}
+	if log[0].At.IsZero() {
+		t.Error("expected a parsed commit time")
 	}
 }

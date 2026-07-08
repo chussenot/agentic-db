@@ -120,6 +120,46 @@ func TestBuildEffortAndWindowing(t *testing.T) {
 	}
 }
 
+// TestTimelineWorkWait exercises the work-vs-wait breakdown: a turn, then me
+// away 8m, then a permission wait, then a final Stop whose gap into SessionEnd
+// must NOT count as waiting (the session just ended).
+func TestTimelineWorkWait(t *testing.T) {
+	from := time.UnixMilli(0)
+	to := time.UnixMilli(1000 * min)
+	events := []db.Event{
+		ev(0, "A", "UserPromptSubmit", "working"),      // working [0,2]
+		ev(2*min, "A", "Stop", "idle"),                 // -> waiting on me [2,10]
+		ev(10*min, "A", "UserPromptSubmit", "working"), // I replied -> working [10,11]
+		ev(11*min, "A", "Notification", "prompt"),      // -> waiting permission [11,14]
+		ev(14*min, "A", "PostToolUse", "working"),      // approved -> working [14,15]
+		ev(15*min, "A", "Stop", "idle"),                // -> waiting on me...
+		ev(20*min, "A", "SessionEnd", "deleted"),       // ...but [15,20] into SessionEnd is unattributed
+	}
+	d := Build(events, noLookup, nil, from, to, 10)
+	s := d.Sessions[0]
+	if s.Working != 4*time.Minute { // [0,2] + [10,11] + [14,15]
+		t.Errorf("working = %s, want 4m", s.Working)
+	}
+	if s.WaitingUser != 8*time.Minute { // [2,10]; the [15,20] into SessionEnd excluded
+		t.Errorf("waitingUser = %s, want 8m", s.WaitingUser)
+	}
+	if s.WaitingPermission != 3*time.Minute { // [11,14]
+		t.Errorf("waitingPermission = %s, want 3m", s.WaitingPermission)
+	}
+	if d.Totals.Working != s.Working || d.Totals.WaitingUser != s.WaitingUser ||
+		d.Totals.WaitingPermission != s.WaitingPermission {
+		t.Errorf("totals must sum the single session: %+v", d.Totals)
+	}
+	// Five coalesced spans; the trailing gap into SessionEnd produced none.
+	if len(s.Timeline) != 5 {
+		t.Fatalf("timeline spans = %d, want 5: %+v", len(s.Timeline), s.Timeline)
+	}
+	if s.Timeline[0].Kind != SpanWorking || s.Timeline[1].Kind != SpanWaitUser ||
+		s.Timeline[3].Kind != SpanWaitPerm {
+		t.Errorf("unexpected timeline kinds: %+v", s.Timeline)
+	}
+}
+
 func TestFrozenWorkingIsBounded(t *testing.T) {
 	from := time.UnixMilli(0)
 	to := time.UnixMilli(10_000 * min)

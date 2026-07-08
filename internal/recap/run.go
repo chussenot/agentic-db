@@ -33,6 +33,10 @@ func enrichProjects(projects []Project, from, to time.Time) {
 			projects[i].Remote = info.Remote
 			projects[i].Branch = info.Branch
 			projects[i].Commits = info.Commits
+			projects[i].Log = make([]Commit, len(info.Log))
+			for j, c := range info.Log {
+				projects[i].Log[j] = Commit{Hash: c.Hash, Subject: c.Subject, At: c.At}
+			}
 			break
 		}
 	}
@@ -99,7 +103,11 @@ func RunRecap(args []string) error {
 		if !ok {
 			return Meta{}, false
 		}
-		return Meta{Title: info.Title, Ask: info.Ask, Cwd: info.Cwd, Branch: info.Branch}, true
+		arc := make([]Turn, len(info.Turns))
+		for i, t := range info.Turns {
+			arc[i] = Turn{Role: t.Role, Text: t.Text, At: t.At}
+		}
+		return Meta{Title: info.Title, Ask: info.Ask, Cwd: info.Cwd, Branch: info.Branch, Arc: arc}, true
 	}
 
 	// Repo captured at hook time (normalized). The primary repo is element 0 (see
