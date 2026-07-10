@@ -244,6 +244,44 @@ SELECT session_id FROM events GROUP BY session_id ORDER BY MIN(ts) ASC`)
 	return out, rows.Err()
 }
 
+// RecentSession is one session's activity span, derived purely from the audit
+// log: its id and the first/last event timestamps observed for it. It exists so
+// callers (the resume picker) can rank historical sessions by recency without
+// the sessions table, which is long gone for ended sessions.
+type RecentSession struct {
+	SessionID string
+	FirstTS   int64 // unix ms, earliest event
+	LastTS    int64 // unix ms, most recent event (the recency key)
+}
+
+// RecentSessions returns up to limit distinct sessions from the event log,
+// most-recently-active first (by MAX(ts)). A non-positive limit returns them
+// all. Like DistinctEventSessionIDs it reads the append-only log, so it sees
+// dead sessions whose sessions-table row was deleted on SessionEnd.
+func (d *DB) RecentSessions(limit int) ([]RecentSession, error) {
+	q := `SELECT session_id, MIN(ts), MAX(ts) FROM events
+GROUP BY session_id ORDER BY MAX(ts) DESC`
+	args := []any{}
+	if limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := d.sql.Query(q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("recent sessions: %w", err)
+	}
+	defer rows.Close()
+	var out []RecentSession
+	for rows.Next() {
+		var s RecentSession
+		if err := rows.Scan(&s.SessionID, &s.FirstTS, &s.LastTS); err != nil {
+			return nil, fmt.Errorf("scan recent session: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 // PruneEvents keeps only the newest keep rows, deleting older ones. It returns
 // the number deleted. The audit log is retained indefinitely by default — the
 // daemon no longer calls this; it remains a manual primitive for a one-off trim

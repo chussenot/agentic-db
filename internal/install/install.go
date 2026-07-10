@@ -39,6 +39,8 @@ func Run(args []string) error {
 	settingsPath := fs.String("settings", "", "path to settings.json (default ~/.claude/settings.json)")
 	bin := fs.String("bin", "claude-status", "command to register (the bin on PATH)")
 	dryRun := fs.Bool("dry-run", false, "print what would change, write nothing")
+	noShell := fs.Bool("no-shell", false, "do not add the claude-resume block to .zshrc")
+	zshrc := fs.String("zshrc", "", "path to .zshrc (default $ZDOTDIR/.zshrc or ~/.zshrc)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -87,9 +89,46 @@ func Run(args []string) error {
 		fmt.Fprintf(out, "ensured state dir %s\n", stateDir)
 	}
 
-	// 3 & 4. Print manual-edit guidance and reload reminders.
+	// 3. zsh resume integration: add the claude-resume block to .zshrc.
+	if *noShell {
+		fmt.Fprintf(out, "skipped .zshrc (--no-shell)\n")
+	} else if err := installShell(out, *zshrc, *bin, *dryRun); err != nil {
+		return err
+	}
+
+	// 4 & 5. Print manual-edit guidance and reload reminders.
 	printSetupGuidance(out)
 
+	return nil
+}
+
+// installShell adds (or upgrades) the claude-resume managed block in the user's
+// .zshrc. .zshrc is usually a git-tracked dotfile — unlike settings.json, which
+// is why the rest of the tool leaves dotfiles alone — but the user opted into
+// having it managed, so we edit it (with a .bak) and remind them to re-sync
+// chezmoi and reload their shell.
+func installShell(out io.Writer, zshrc, bin string, dryRun bool) error {
+	path := zshrc
+	if path == "" {
+		p, err := defaultZshrc()
+		if err != nil {
+			return err
+		}
+		path = p
+	}
+	if dryRun {
+		fmt.Fprintf(out, "[dry-run] would add the claude-resume block to %s\n", path)
+		return nil
+	}
+	status, realPath, err := ensureZshBlock(path, bin)
+	if err != nil {
+		return fmt.Errorf("updating %s: %w", path, err)
+	}
+	fmt.Fprintf(out, "zsh integration: %s in %s\n", status, path)
+	if status != "already present (unchanged)" {
+		fmt.Fprintf(out, "  backup written to %s.bak\n", path)
+		printChezmoiReminder(out, realPath)
+	}
 	return nil
 }
 
@@ -99,6 +138,8 @@ func RunUninstall(args []string) error {
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	settingsPath := fs.String("settings", "", "path to settings.json (default ~/.claude/settings.json)")
 	purge := fs.Bool("purge", false, "also remove the state dir + DB")
+	noShell := fs.Bool("no-shell", false, "leave the claude-resume block in .zshrc")
+	zshrc := fs.String("zshrc", "", "path to .zshrc (default $ZDOTDIR/.zshrc or ~/.zshrc)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -132,6 +173,13 @@ func RunUninstall(args []string) error {
 		fmt.Fprintf(out, "  (bd prime and any other hooks left untouched)\n")
 	}
 
+	// Remove the claude-resume block from .zshrc.
+	if *noShell {
+		fmt.Fprintf(out, "left the .zshrc block in place (--no-shell)\n")
+	} else if err := uninstallShell(out, *zshrc); err != nil {
+		return err
+	}
+
 	printUninstallGuidance(out)
 
 	if *purge {
@@ -142,6 +190,31 @@ func RunUninstall(args []string) error {
 		fmt.Fprintf(out, "purged state dir %s (DB and logs removed)\n", dir)
 	}
 
+	return nil
+}
+
+// uninstallShell removes the claude-resume managed block from the user's .zshrc.
+// A missing file or absent block is reported as a no-op.
+func uninstallShell(out io.Writer, zshrc string) error {
+	path := zshrc
+	if path == "" {
+		p, err := defaultZshrc()
+		if err != nil {
+			return err
+		}
+		path = p
+	}
+	removed, realPath, err := removeZshBlock(path)
+	if err != nil {
+		return fmt.Errorf("updating %s: %w", path, err)
+	}
+	if !removed {
+		fmt.Fprintf(out, "no claude-resume block found in %s\n", path)
+		return nil
+	}
+	fmt.Fprintf(out, "removed the claude-resume block from %s\n", path)
+	fmt.Fprintf(out, "  backup written to %s.bak\n", path)
+	printChezmoiReminder(out, realPath)
 	return nil
 }
 
@@ -442,7 +515,8 @@ func printMergeSummary(out io.Writer, command string, added, alreadyPresent []st
 
 func printSetupGuidance(out io.Writer) {
 	fmt.Fprint(out, `
-Next steps (manual edits — this tool does not touch your git-tracked dotfiles):
+Next steps (manual edits — apart from the .zshrc block above, this tool leaves
+your other git-tracked dotfiles alone):
 
   niri config.kdl:
     Add (or replace the old niri-topic-namer spawn) with:
@@ -463,7 +537,8 @@ Next steps (manual edits — this tool does not touch your git-tracked dotfiles)
 
 func printUninstallGuidance(out io.Writer) {
 	fmt.Fprint(out, `
-Revert your dotfiles manually (this tool does not touch git-tracked files):
+Revert the rest of your dotfiles manually (the .zshrc block was removed above;
+this tool does not touch your other git-tracked files):
 
   niri config.kdl:
     Remove the spawn-sh-at-startup "exec ~/.local/bin/claude-status daemon" line.

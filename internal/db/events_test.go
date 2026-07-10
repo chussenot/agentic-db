@@ -158,6 +158,57 @@ func TestTitleChangedRoundTripAndLatestTitles(t *testing.T) {
 	}
 }
 
+func TestRecentSessions(t *testing.T) {
+	d := openTempDB(t)
+
+	// Three sessions with interleaved events; recency is by MAX(ts).
+	//   s-old:  ts 100, 150      (last 150)
+	//   s-mid:  ts 200           (last 200)
+	//   s-new:  ts 120, 300      (last 300)
+	rows := []Event{
+		{TS: 100, SessionID: "s-old", Event: "SessionStart", NewState: "idle"},
+		{TS: 120, SessionID: "s-new", Event: "SessionStart", NewState: "idle"},
+		{TS: 150, SessionID: "s-old", Event: "Stop", NewState: "idle"},
+		{TS: 200, SessionID: "s-mid", Event: "Stop", NewState: "idle"},
+		{TS: 300, SessionID: "s-new", Event: "Stop", NewState: "idle"},
+	}
+	for _, e := range rows {
+		if err := d.InsertEvent(e); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	got, err := d.RecentSessions(0) // 0 = all
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOrder := []string{"s-new", "s-mid", "s-old"} // by MAX(ts) desc
+	if len(got) != 3 {
+		t.Fatalf("RecentSessions = %d, want 3", len(got))
+	}
+	for i, w := range wantOrder {
+		if got[i].SessionID != w {
+			t.Errorf("order[%d] = %q, want %q", i, got[i].SessionID, w)
+		}
+	}
+	// First/last spans.
+	if got[0].SessionID != "s-new" || got[0].FirstTS != 120 || got[0].LastTS != 300 {
+		t.Errorf("s-new span = %+v, want first=120 last=300", got[0])
+	}
+	if got[2].SessionID != "s-old" || got[2].FirstTS != 100 || got[2].LastTS != 150 {
+		t.Errorf("s-old span = %+v, want first=100 last=150", got[2])
+	}
+
+	// Limit honored (newest N).
+	two, err := d.RecentSessions(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(two) != 2 || two[0].SessionID != "s-new" || two[1].SessionID != "s-mid" {
+		t.Errorf("RecentSessions(2) = %+v, want [s-new s-mid]", two)
+	}
+}
+
 // TestMigrateAddsWindowTitleColumn proves Open() upgrades a database created
 // before the window_title column existed, rather than failing on the missing
 // column. It builds a legacy events table by hand, then opens it through Open().

@@ -18,14 +18,43 @@ niri window model and sets niri workspace **names**, which waybar renders as gly
 |---|---|
 | `hook` | Hot-path hook handler. Reads a Claude Code hook JSON event from stdin, derives session state, and upserts one row in the SQLite DB. Always exits 0. |
 | `daemon` | Long-lived reconciler. Watches the DB + niri event stream and sets/unsets workspace names. |
-| `install` | Idempotently merge our hooks into `~/.claude/settings.json` and print niri/waybar setup fragments. |
-| `uninstall` | Remove only our hook entries. `--purge` also drops the state dir + DB. |
+| `install` | Idempotently merge our hooks into `~/.claude/settings.json`, add the `claude-resume` block to `.zshrc`, and print niri/waybar setup fragments. `--no-shell` skips the `.zshrc` edit; `--zshrc <path>` overrides its location. |
+| `uninstall` | Remove only our hook entries and the `.zshrc` block. `--purge` also drops the state dir + DB; `--no-shell` leaves the `.zshrc` block. |
 | `gc` | Run the dead-session reap pass once and report reaped rows. |
 | `gen-waybar` | Emit paste-ready waybar `format-icons` JSON and `style.css` fragments. |
 | `doctor` | Dump the DB schema/rows and the live niri windows list (debugging). |
 | `events` | Print the audit log (one row per hook), newest first. `--session <id>`, `--limit N`. |
 | `recap` | Summarize a time window of Claude sessions (topics, effort, streaks, metrics). `--period day\|week\|quarter`, `--since`, `--json`, `--metrics full\|none\|only`. |
 | `recap-prompt` | Emit the LLM instructions that turn a recap into a written report. `--period`. |
+| `resume` | Backend for the `claude-resume` picker: `--list` (fzf rows), `--show <id>` (preview), `--init zsh` (shell integration). Bare prints setup help. |
+
+## Resume a dead session
+
+When a crash kills your sessions, `claude-resume` fuzzy-picks a recent one (across
+**all** projects, newest first) and resurrects it. `claude --resume` is scoped to
+the directory the session started in, and a subprocess can't change your shell's
+cwd — so the picker ships as a **zsh function** that `cd`s into the session's dir
+(in your shell, where the `cd` sticks) and then runs `claude --resume`. `fzf` does
+the picking; the binary only serves rows + a preview.
+
+`claude-status install` adds this to your `.zshrc` (a marker-delimited, idempotent
+block — reversible via `uninstall`, `.bak` kept; if the file is chezmoi-managed it
+prints a `chezmoi re-add` reminder). Then, in a new shell:
+
+```sh
+claude-resume          # fuzzy-pick + resurrect (cr is a guarded alias, if free)
+claude-resume --here   # only sessions from the current repo
+claude-resume --all    # include still-running sessions too
+```
+
+To wire it up by hand instead of via `install`, add to `~/.zshrc`:
+
+```sh
+eval "$(claude-status resume --init zsh)"
+```
+
+The preview pane shows each session's topic, repo/branch, cwd, and the tail of its
+conversation, so you can tell dead sessions apart before reviving one.
 
 ## Recap / reporting
 

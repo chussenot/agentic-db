@@ -15,6 +15,7 @@ import (
 	"github.com/mrzor/claude-status/internal/hook"
 	"github.com/mrzor/claude-status/internal/install"
 	"github.com/mrzor/claude-status/internal/recap"
+	"github.com/mrzor/claude-status/internal/resume"
 	"github.com/mrzor/claude-status/internal/tile"
 	"github.com/mrzor/claude-status/internal/waybar"
 )
@@ -34,6 +35,7 @@ commands:
   events       print the bounded audit log (--session, --limit)
   recap        summarize a time window of Claude sessions (--period, --json)
   recap-prompt emit the LLM instructions for turning a recap into a report
+  resume       pick a recent (dead) session to resurrect (--list/--show/--init zsh)
   repo-backfill backfill stored repos for historical sessions (one-off, idempotent)
   tile-data    emit pwetty claude-tile JSON for one niri desktop (--output)
   tile-watch   stream tile JSON for one desktop on change (pwetty stream:true)
@@ -68,6 +70,8 @@ func main() {
 		err = recap.RunRecap(args)
 	case "recap-prompt":
 		err = recap.RunPrompt(args)
+	case "resume":
+		err = resume.Run(args)
 	case "repo-backfill":
 		err = recap.RunRepoBackfill(args)
 	case "tile-data":
