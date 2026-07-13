@@ -6,8 +6,8 @@ description = "Build the static claude-status binary to ./claude-status"
 run = "CGO_ENABLED=0 go build -o claude-status ."
 
 [tasks.install]
-description = "Build, install to ~/.local/bin, and flip a running daemon to the new build"
-depends = ["build"]
+description = "Build, install the binary + recap timers, and flip a running daemon"
+depends = ["build", "install-units"]
 run = '''
 #!/usr/bin/env bash
 set -euo pipefail
@@ -44,4 +44,45 @@ if [ -n "$daemon_pid" ]; then
 else
   echo "no daemon running; binary updated (niri spawns it on next start)"
 fi
+'''
+
+[tasks.test]
+description = "Run the Go test suite"
+run = "go test ./..."
+
+[tasks.install-units]
+description = "Install + enable the recap-job wrapper and its systemd user timers"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+bindir="$HOME/.local/bin"
+unitdir="$HOME/.config/systemd/user"
+mkdir -p "$bindir" "$unitdir"
+
+# The recap-job wrapper the timers exec. rm the pre-split predecessor.
+install -Dm755 share/claude-recap-job "$bindir/claude-recap-job"
+rm -f "$bindir/claude-daily-recap"   # superseded by claude-recap-job
+
+for u in claude-daily-recap.service claude-daily-recap.timer \
+         claude-weekly-recap.service claude-weekly-recap.timer; do
+  install -Dm644 "share/systemd/$u" "$unitdir/$u"
+done
+systemctl --user daemon-reload
+systemctl --user enable claude-daily-recap.timer claude-weekly-recap.timer
+echo "installed recap-job wrapper + daily/weekly timers"
+'''
+
+[tasks.uninstall-units]
+description = "Disable and remove the recap systemd user timers"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+unitdir="$HOME/.config/systemd/user"
+systemctl --user disable --now claude-daily-recap.timer claude-weekly-recap.timer 2>/dev/null || true
+rm -f "$unitdir"/claude-daily-recap.service "$unitdir"/claude-daily-recap.timer \
+      "$unitdir"/claude-weekly-recap.service "$unitdir"/claude-weekly-recap.timer
+systemctl --user daemon-reload
+echo "removed recap timers"
 '''

@@ -89,8 +89,8 @@ verbatim after the LLM narrative).
 
 ### Scheduled reports
 
-`make install` also installs a single `claude-recap-job <daily|weekly>` wrapper
-(in `share/`) plus two systemd **user** timers:
+`mise run install` also installs a single `claude-recap-job <daily|weekly>`
+wrapper (in `share/`) plus two systemd **user** timers:
 
 - `claude-daily-recap.timer` — daily at 09:00 → `~/dailies/daily-YYYYMMDD.md`
   (from the last covered day through yesterday, so a multi-day gap is caught in
@@ -116,17 +116,22 @@ claude-recap-job weekly force "keep ci-base and datadog-ci separate"  # steered 
 
 ## Build & install
 
-Two [mise](https://mise.jdx.dev) tasks (see `mise.toml`):
+[mise](https://mise.jdx.dev) tasks (see `mise.toml`):
 
 ```sh
-mise run build     # -> ./claude-status (static, CGO_ENABLED=0)
-mise run install   # build, install to ~/.local/bin, and flip a running daemon
+mise run build           # -> ./claude-status (static, CGO_ENABLED=0)
+mise run test            # go test ./...
+mise run install         # build + deploy binary, recap-job, timers; flip the daemon
+mise run install-units   # (re)install just the recap-job wrapper + systemd timers
+mise run uninstall-units # disable and remove the recap timers
 ```
 
 `mise run install` is idempotent and safe to re-run: it builds, atomically
-replaces `~/.local/bin/claude-status`, and — **if a `claude-status daemon` is
-already running** — stops it and relaunches the new build detached (otherwise it
-just updates the binary and leaves startup to niri's `spawn-at-startup`).
+replaces `~/.local/bin/claude-status`, deploys the recap-job wrapper and
+re-enables the systemd timers (via `install-units`), and — **if a
+`claude-status daemon` is already running** — stops it and relaunches the new
+build detached (otherwise it just updates the binary and leaves startup to
+niri's `spawn-at-startup`).
 
 Plain `go build` works too; the only external dependency is
 [`modernc.org/sqlite`](https://pkg.go.dev/modernc.org/sqlite) (pure Go, no CGO),
@@ -138,7 +143,7 @@ CGO_ENABLED=0 go build -o claude-status .
 
 > First-time setup (hooks + niri/waybar config) is the binary's own
 > `claude-status install` subcommand — distinct from `mise run install`, which
-> only builds and deploys the binary.
+> builds and deploys the binary, recap-job, and timers.
 
 ## Layout
 
