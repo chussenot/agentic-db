@@ -90,10 +90,11 @@ verbatim after the LLM narrative).
 ### Scheduled reports
 
 `make install` also installs a single `claude-recap-job <daily|weekly>` wrapper
-(in `dist/`) plus two systemd **user** timers:
+(in `share/`) plus two systemd **user** timers:
 
 - `claude-daily-recap.timer` — daily at 09:00 → `~/dailies/daily-YYYYMMDD.md`
-  (previous day, or Fri–Sun on a Monday).
+  (from the last covered day through yesterday, so a multi-day gap is caught in
+  one run; falls back to the previous day, or Fri–Sun on a Monday).
 - `claude-weekly-recap.timer` — Mondays at 09:00 → `~/weeklies/weekly-YYYYMMDD.md`
   (the previous complete calendar week, Mon 00:00 → Sun 23:59).
 

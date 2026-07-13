@@ -23,16 +23,16 @@ test:
 # (re)enable the systemd user timers. daemon-reload picks up unit edits.
 install: build install-units
 	install -Dm755 claude-status $(BIN)
-	install -Dm755 dist/claude-recap-job $(JOB)
+	install -Dm755 share/claude-recap-job $(JOB)
 	rm -f $(PREFIX)/bin/claude-daily-recap   # superseded by claude-recap-job
 	@echo "installed $(BIN) and $(JOB)"
 	@echo "restart the daemon to run the new binary: make restart-daemon"
 
 install-units:
-	install -Dm644 dist/systemd/claude-daily-recap.service  $(UNITDIR)/claude-daily-recap.service
-	install -Dm644 dist/systemd/claude-daily-recap.timer    $(UNITDIR)/claude-daily-recap.timer
-	install -Dm644 dist/systemd/claude-weekly-recap.service $(UNITDIR)/claude-weekly-recap.service
-	install -Dm644 dist/systemd/claude-weekly-recap.timer   $(UNITDIR)/claude-weekly-recap.timer
+	install -Dm644 share/systemd/claude-daily-recap.service  $(UNITDIR)/claude-daily-recap.service
+	install -Dm644 share/systemd/claude-daily-recap.timer    $(UNITDIR)/claude-daily-recap.timer
+	install -Dm644 share/systemd/claude-weekly-recap.service $(UNITDIR)/claude-weekly-recap.service
+	install -Dm644 share/systemd/claude-weekly-recap.timer   $(UNITDIR)/claude-weekly-recap.timer
 	systemctl --user daemon-reload
 	systemctl --user enable claude-daily-recap.timer claude-weekly-recap.timer
 
