@@ -2,8 +2,13 @@
 # claude-recap-job <daily|weekly> [force] [note…] — produce a recap document.
 #
 # One script, two modes, driven by the systemd user timers:
-#   daily  -> ~/dailies/daily-YYYYMMDD.md   (DAY-1, or Fri–Sun on a Monday)
+#   daily  -> ~/dailies/daily-YYYYMMDD.md   (last covered day+1 .. yesterday)
 #   weekly -> ~/weeklies/weekly-YYYYMMDD.md (trailing 7 days; fires Mondays)
+#
+# The daily window starts the morning after the last day it covered (tracked in
+# a marker under $STATE_DIR) and runs through yesterday, so a multi-day gap
+# (holiday, PTO, laptop off) is swept up in ONE catch-up run instead of
+# orphaning the middle days — systemd Persistent only fires ONCE on power-on.
 #
 # It deliberately does NOT run the moment its timer fires: a fresh wakeup is
 # thrashing on startup work, so we wait STARTUP_DELAY before the (heavy, network-
@@ -50,21 +55,38 @@ daily)
 	PERIOD=day
 	OUT_DIR="$HOME/dailies"
 	OUT="$OUT_DIR/daily-$(date +%Y%m%d).md"
-	# Normally the previous day; on Monday reach back over the weekend to Friday.
 	# The title names the day(s) BEING recapped, not today (the day the job runs).
+	MARKER="$STATE_DIR/recap-daily-covered-through"
 	if [ -n "${RECAP_SINCE:-}" ]; then
+		# Explicit manual backfill: honour it verbatim and do NOT perturb the
+		# cadence marker (COVER_THROUGH stays unset, so no marker write happens).
 		WINDOW=(--since "$RECAP_SINCE")
 		TITLE="# Daily recap — since $RECAP_SINCE"
 	else
-		back=1
-		[ "$(date +%u)" = 1 ] && back=3   # Monday (ISO weekday 1): include Fri+Sat+Sun
-		WINDOW=(--since "$(date -d "$back days ago" +%Y-%m-%d)")
-		last="$(date -d 'yesterday' '+%A %d %B %Y')"
-		if [ "$back" = 1 ]; then
+		through="$(date -d 'yesterday' +%Y-%m-%d)"
+		if [ -s "$MARKER" ] && last_cov="$(cat "$MARKER")" \
+			&& date -d "$last_cov" >/dev/null 2>&1; then
+			# Resume the morning after the last covered day.
+			since="$(date -d "$last_cov +1 day" +%Y-%m-%d)"
+		else
+			# No marker yet (fresh install / lost state): fall back to the classic
+			# heuristic — yesterday, or reach back over the weekend on a Monday.
+			back=1
+			[ "$(date +%u)" = 1 ] && back=3   # Monday (ISO weekday 1): include Fri+Sat+Sun
+			since="$(date -d "$back days ago" +%Y-%m-%d)"
+		fi
+		# Cap the lookback so a long absence can't build a monster window.
+		earliest="$(date -d "${RECAP_MAX_LOOKBACK:-14} days ago" +%Y-%m-%d)"
+		[[ "$since" < "$earliest" ]] && since="$earliest"
+		# Never start after the day we cover through (defensive: same-day re-trigger).
+		[[ "$since" > "$through" ]] && since="$through"
+		WINDOW=(--since "$since" --until "$through")
+		COVER_THROUGH="$through"   # written to MARKER on a successful run
+		last="$(date -d "$through" '+%A %d %B %Y')"
+		if [ "$since" = "$through" ]; then
 			TITLE="# Daily recap — $last"
 		else
-			# A Monday run covers Fri–Sun: title the range.
-			first="$(date -d "$back days ago" '+%A %d %B')"
+			first="$(date -d "$since" '+%A %d %B')"
 			TITLE="# Daily recap — $first → $last"
 		fi
 	fi
@@ -97,6 +119,11 @@ esac
 
 mkdir -p "$STATE_DIR" "$OUT_DIR"
 log() { printf '%s [%s] %s\n' "$(date -Iseconds)" "$MODE" "$*" >>"$LOG"; }
+
+# Advance the daily coverage marker so the next run resumes the morning after.
+# COVER_THROUGH is set only on the default (non-RECAP_SINCE) daily path; weekly
+# and explicit-backfill runs leave it unset, making this a no-op.
+record_covered() { [ -n "${COVER_THROUGH:-}" ] && printf '%s\n' "$COVER_THROUGH" >"$MARKER"; }
 
 # Single-instance lock, PER MODE (daily and weekly may run at once, but never two
 # of the same). Without it, two triggers — a timer catch-up and a resume
@@ -146,6 +173,7 @@ for attempt in 1 2 3; do
 		footer="_Generated on $(date '+%A %d %B %Y, %H:%M')._"
 		{ printf '%s\n\n' "$TITLE"; cat "$tmp"; printf '\n%s\n' "$metrics"; printf '\n---\n\n%s\n' "$footer"; } >"$OUT"
 		log "wrote $OUT (attempt $attempt)"
+		record_covered
 		exit 0
 	fi
 	log "attempt $attempt failed (network not ready?); retrying in 30s"
