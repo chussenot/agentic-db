@@ -1,16 +1,26 @@
-# claude-status
+# agentic-db
 
-A multi-call Go binary that powers a per-workspace "Claude activity" indicator in
-[waybar](https://github.com/Alexays/Waybar) under the [niri](https://github.com/YaLTeR/niri)
-Wayland compositor.
+A multi-call Go binary (`claude-status`) that powers a per-workspace "Claude
+activity" indicator in [waybar](https://github.com/Alexays/Waybar) under the
+[niri](https://github.com/YaLTeR/niri) Wayland compositor.
+
+> The repository is **agentic-db**; the binary it builds is still `claude-status`
+> (as are the Go module and the on-disk DB), so every command below is unchanged.
 
 Claude Code hooks invoke `claude-status hook`, which writes per-session state to a
 SQLite database. A long-lived `claude-status daemon` reads that database plus the
-niri window model and sets niri workspace **names**, which waybar renders as glyphs:
+niri window model and drives two renderers:
 
-- **Working** — blinking orange `●`
-- **Prompt/waiting** — blinking yellow `?` (Claude needs you)
-- **Idle** — a two-cell shade bar that fades over 60 minutes as the session goes stale
+- **Workspace-name glyphs.** The daemon sets niri workspace **names**, which
+  waybar renders directly as glyphs:
+  - **Working** — blinking orange `●`
+  - **Prompt/waiting** — blinking yellow `?` (Claude needs you)
+  - **Idle** — a two-cell shade bar that fades over 60 minutes as the session goes stale
+- **The pwetty `claude` tile.** On each tick the daemon also precomputes a
+  per-desktop payload and writes it to a tile cache. `claude-status tile-data`
+  (and `tile-watch`) then serve that cache as the JSON a pwetty-hosted waybar
+  tile expects — a cheap file read on the hot path, no `niri msg` spawn per
+  render. Contract: `~/Perso/pwetty-box-rs/tiles/claude/schema.json`.
 
 ## Subcommands
 
@@ -27,6 +37,9 @@ niri window model and sets niri workspace **names**, which waybar renders as gly
 | `recap` | Summarize a time window of Claude sessions (topics, effort, streaks, metrics). `--period day\|week\|quarter`, `--since`, `--json`, `--metrics full\|none\|only`. |
 | `recap-prompt` | Emit the LLM instructions that turn a recap into a written report. `--period`. |
 | `resume` | Backend for the `claude-resume` picker: `--list` (fzf rows), `--show <id>` (preview), `--init zsh` (shell integration). Bare prints setup help. |
+| `repo-backfill` | One-off, idempotent pass that backfills stored git repos for historical sessions (so old rows resolve in recap project metrics). |
+| `tile-data` | Emit the pwetty `claude`-tile JSON for one niri desktop, keyed by its per-output workspace index. Reads the daemon's precomputed tile cache (falls back to a live build when no daemon is up); always prints valid JSON. `--output` overrides the niri connector. |
+| `tile-watch` | Like `tile-data` but streams the payload for one desktop on every change (for a pwetty `stream: true` module) instead of printing once. |
 
 ## Resume a dead session
 
@@ -153,8 +166,14 @@ internal/state       shared name grammar, decay table, event->state mapping, ren
 internal/db          SQLite layer (schema, Session, Open/Upsert/LoadLive/...)
 internal/niri        niri IPC: ListWindows + event-stream client + window/workspace model
 internal/hook        hook subcommand (state derivation, /proc->window resolution, audit row)
-internal/daemon      daemon subcommand (reconciler: aggregate, slots, decay, GC)
+internal/clauded     reads Claude Code's first-party per-session status files (busy/idle/waiting)
+internal/daemon      daemon subcommand (reconciler: aggregate, slots, decay, GC, tile cache)
+internal/tile        tile-data/tile-watch subcommands: pwetty tile payload model + cache
 internal/waybar      gen-waybar subcommand (format-icons + style.css generator)
 internal/install     install/uninstall subcommands (settings.json hook merge)
 internal/doctor      doctor + gc + events subcommands
+internal/recap       recap/recap-prompt/repo-backfill subcommands (digest + LLM instructions)
+internal/transcript  reads session transcripts (ai-title, opening prompt, cwd)
+internal/git         best-effort git CLI wrapper for recap project metrics
+internal/resume      resume subcommand (claude-resume rows/preview + zsh integration)
 ```
