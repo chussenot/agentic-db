@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/niri"
 	"github.com/mrzor/claude-status/internal/state"
 )
 
@@ -423,9 +424,71 @@ func TestParentPIDMissingProc(t *testing.T) {
 }
 
 func TestResolveWindowDegradesWhenNoMatch(t *testing.T) {
-	// startPID=1: even if niri is present, pid 1 (systemd) is not a window.
-	if _, _, ok := resolveWindow(1); ok {
-		t.Error("resolveWindow(1) should not match a niri window")
+	// startPID=1: even if niri is present, pid 1 (systemd) is not a window, and
+	// an empty cwd disables the client-cwd fallback.
+	if _, _, ok := resolveWindow(1, ""); ok {
+		t.Error("resolveWindow(1, \"\") should not match a niri window")
+	}
+}
+
+func TestClientPIDsFindsSelf(t *testing.T) {
+	// The test binary's own comm+cwd must locate it in a /proc scan.
+	comm, err := os.ReadFile("/proc/self/comm")
+	if err != nil {
+		t.Skip("no /proc on this platform")
+	}
+	cwd, err := os.Readlink("/proc/self/cwd")
+	if err != nil {
+		t.Fatalf("readlink /proc/self/cwd: %v", err)
+	}
+	pids := clientPIDs(strings.TrimSpace(string(comm)), cwd)
+	for _, p := range pids {
+		if p == os.Getpid() {
+			return
+		}
+	}
+	t.Errorf("clientPIDs(%q, %q) = %v, missing self %d",
+		strings.TrimSpace(string(comm)), cwd, pids, os.Getpid())
+}
+
+func TestClientPIDsEmptyCwdIsNoOp(t *testing.T) {
+	if pids := clientPIDs(clientComm, ""); pids != nil {
+		t.Errorf("clientPIDs with empty cwd = %v, want nil", pids)
+	}
+}
+
+func TestResolveClientWindowUnambiguous(t *testing.T) {
+	// Our parent stands in for a terminal window; our own pid is the client.
+	ppid := os.Getppid()
+	byPID := map[int]niri.Window{ppid: {ID: 7, PID: ppid}}
+	winID, termPID, ok := resolveClientWindow([]int{os.Getpid()}, byPID)
+	if !ok || winID != 7 || termPID != ppid {
+		t.Errorf("resolveClientWindow = (%d, %d, %v), want (7, %d, true)",
+			winID, termPID, ok, ppid)
+	}
+}
+
+func TestResolveClientWindowAmbiguousStaysUnbound(t *testing.T) {
+	// Two candidates whose ancestries reach two DIFFERENT windows: a wrong
+	// binding is worse than NULL, so resolution must refuse.
+	self, ppid := os.Getpid(), os.Getppid()
+	byPID := map[int]niri.Window{
+		self: {ID: 1, PID: self},
+		ppid: {ID: 2, PID: ppid},
+	}
+	if _, _, ok := resolveClientWindow([]int{self, ppid}, byPID); ok {
+		t.Error("ambiguous same-cwd clients must stay unbound")
+	}
+}
+
+func TestResolveClientWindowSkipsNonWindowCandidates(t *testing.T) {
+	// A candidate whose ancestry reaches no window (pid 1: the daemon, or a
+	// tmux-wrapped client) is skipped, not treated as ambiguity.
+	ppid := os.Getppid()
+	byPID := map[int]niri.Window{ppid: {ID: 7, PID: ppid}}
+	winID, _, ok := resolveClientWindow([]int{1, os.Getpid()}, byPID)
+	if !ok || winID != 7 {
+		t.Errorf("resolveClientWindow = (%d, _, %v), want (7, _, true)", winID, ok)
 	}
 }
 

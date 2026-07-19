@@ -156,7 +156,7 @@ func run(r io.Reader, dbPath string, startPID int) error {
 	// Window resolution: only on SessionStart, or lazily when an existing row
 	// never got a window_id (covers DB wipes / daemon restarts mid-session).
 	if ev.HookEventName == "SessionStart" || !s.WindowID.Valid {
-		if winID, termPID, ok := resolveWindow(startPID); ok {
+		if winID, termPID, ok := resolveWindow(startPID, ev.Cwd); ok {
 			s.WindowID = sql.NullInt64{Int64: int64(winID), Valid: true}
 			s.TerminalPID = sql.NullInt64{Int64: int64(termPID), Valid: true}
 		}
@@ -249,16 +249,28 @@ func nullString(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: true}
 }
 
-// resolveWindow walks the /proc PPid chain upward from startPID, collecting
-// ancestor pids, then matches them (nearest ancestor first) against the niri
-// window list. The first ancestor pid that is a window's PID yields that
-// window's id (window_id) and pid (terminal_pid). ok is false when no ancestor
-// maps to a niri window (remote/tmux/ssh) or niri is unavailable.
-func resolveWindow(startPID int) (windowID, terminalPID int, ok bool) {
-	ancestors := ancestorPIDs(startPID)
-	if len(ancestors) == 0 {
-		return 0, 0, false
-	}
+// clientComm is the /proc comm of a terminal-side Claude Code client process.
+// Daemon-spawned session workers re-exec a versioned binary, so their comm is
+// the version string (e.g. "2.1.215") — the comm filter alone separates the
+// in-terminal client from daemon-side processes.
+const clientComm = "claude"
+
+// resolveWindow maps this hook invocation to a niri window, trying two
+// strategies in order:
+//
+//  1. Ancestry: walk the /proc PPid chain upward from startPID and match each
+//     ancestor (nearest first) against the niri window pids. This works when
+//     the Claude process is a descendant of the terminal (pre-daemon Claude).
+//  2. Client cwd: daemonized Claude (observed v2.1.215) reparents session
+//     processes under the per-user `claude daemon` (itself under systemd), so
+//     strategy 1 dead-ends at pid 1. The terminal-side client is still a
+//     descendant of its terminal, so find `claude` client processes whose cwd
+//     equals the session's cwd and walk THEIR ancestry instead. Binds only on
+//     an unambiguous match — see resolveClientWindow.
+//
+// ok is false when neither strategy finds a window (remote/tmux/ssh, detached
+// background session, ambiguity) or niri is unavailable.
+func resolveWindow(startPID int, cwd string) (windowID, terminalPID int, ok bool) {
 	windows, err := niri.ListWindows()
 	if err != nil || len(windows) == 0 {
 		return 0, 0, false
@@ -267,12 +279,73 @@ func resolveWindow(startPID int) (windowID, terminalPID int, ok bool) {
 	for _, w := range windows {
 		byPID[w.PID] = w
 	}
-	for _, pid := range ancestors {
+	for _, pid := range ancestorPIDs(startPID) {
 		if w, found := byPID[pid]; found {
 			return w.ID, w.PID, true
 		}
 	}
-	return 0, 0, false
+	return resolveClientWindow(clientPIDs(clientComm, cwd), byPID)
+}
+
+// resolveClientWindow maps candidate client pids to niri windows via their
+// /proc ancestry. It binds only when every candidate that reaches a window
+// reaches the SAME window: two claude clients in the same cwd but different
+// windows are ambiguous, and a wrong binding is worse than a NULL one (the
+// pre-fallback status quo). Candidates whose ancestry reaches no window (the
+// daemon itself, a client inside tmux) are skipped, not ambiguity.
+// ponytail: same-cwd clients in different windows stay NULL; disambiguate by
+// process start time vs session created_ts if that ever bites.
+func resolveClientWindow(pids []int, byPID map[int]niri.Window) (windowID, terminalPID int, ok bool) {
+	var match niri.Window
+	var found bool
+	for _, pid := range pids {
+		for _, anc := range ancestorPIDs(pid) {
+			w, isWin := byPID[anc]
+			if !isWin {
+				continue
+			}
+			if found && w.ID != match.ID {
+				return 0, 0, false
+			}
+			match, found = w, true
+			break
+		}
+	}
+	if !found {
+		return 0, 0, false
+	}
+	return match.ID, match.PID, true
+}
+
+// clientPIDs scans /proc for processes whose comm equals comm and whose cwd
+// symlink equals cwd. Unreadable entries are skipped (processes may exit
+// mid-scan). The scan reads two small files per pid and only runs while a
+// session has no window_id, so it stays well inside the hook's latency budget.
+func clientPIDs(comm, cwd string) []int {
+	if cwd == "" {
+		return nil
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var out []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		c, err := os.ReadFile("/proc/" + e.Name() + "/comm")
+		if err != nil || strings.TrimSpace(string(c)) != comm {
+			continue
+		}
+		link, err := os.Readlink("/proc/" + e.Name() + "/cwd")
+		if err != nil || link != cwd {
+			continue
+		}
+		out = append(out, pid)
+	}
+	return out
 }
 
 // ancestorPIDs returns startPID followed by its /proc PPid ancestors, nearest
