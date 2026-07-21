@@ -1,8 +1,13 @@
 package tile
 
 import (
+	"bytes"
 	"database/sql"
+	"image"
+	"image/png"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -134,6 +139,37 @@ func TestCleanAppLabel(t *testing.T) {
 		if got := cleanAppLabel(in); got != want {
 			t.Errorf("cleanAppLabel(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestWrapPNGAsSVG(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	src := filepath.Join(t.TempDir(), "app.png")
+	img := image.NewRGBA(image.Rect(0, 0, 2, 3))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := wrapPNGAsSVG("com.example.App", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svg, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(svg)
+	if !strings.Contains(s, `width="2" height="3"`) || !strings.Contains(s, "data:image/png;base64,") {
+		t.Errorf("shim missing dims or payload: %s", s)
+	}
+	// Second call reuses the cached shim (same path, no error).
+	again, err := wrapPNGAsSVG("com.example.App", src)
+	if err != nil || again != out {
+		t.Errorf("cached shim not reused: %q %v", again, err)
 	}
 }
 

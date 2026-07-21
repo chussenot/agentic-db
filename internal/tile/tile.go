@@ -18,9 +18,12 @@
 package tile
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"image/png"
 	"io"
 	"os"
 	"path/filepath"
@@ -205,24 +208,40 @@ func PayloadFor(ws niri.Workspace, winsOnWs []niri.Window, sessionsOnWs []db.Ses
 // processes; within the daemon only the actor goroutine touches it).
 var iconMemo sync.Map
 
-// appIconDirs are the scalable (SVG) app-icon directories searched, in
-// preference order. pwetty's <icon src> is SVG-only (resvg), so only .svg is
-// considered — a sized PNG can't render.
-func appIconDirs() []string {
-	var dirs []string
+// iconThemeBases are the hicolor icon-theme roots searched for app icons, in
+// preference order — including the flatpak export trees (e.g. Slack only
+// ships its SVG under /var/lib/flatpak/exports).
+func iconThemeBases() []string {
+	var bases []string
 	if home, err := os.UserHomeDir(); err == nil {
-		dirs = append(dirs, filepath.Join(home, ".local/share/icons/hicolor/scalable/apps"))
+		bases = append(bases,
+			filepath.Join(home, ".local/share/icons/hicolor"),
+			filepath.Join(home, ".local/share/flatpak/exports/share/icons/hicolor"),
+		)
 	}
-	return append(dirs,
-		"/usr/share/icons/hicolor/scalable/apps",
-		"/usr/share/icons/Papirus/scalable/apps",
-		"/usr/local/share/icons/hicolor/scalable/apps",
+	return append(bases,
+		"/usr/share/icons/hicolor",
+		"/var/lib/flatpak/exports/share/icons/hicolor",
+		"/usr/local/share/icons/hicolor",
 	)
 }
 
+// appIconDirs are the scalable (SVG) app-icon directories searched, in
+// preference order. pwetty's <icon src> is SVG-only (resvg), so a raw PNG
+// can't render — sized PNGs are handled by findAppPNG + wrapPNGAsSVG instead.
+func appIconDirs() []string {
+	var dirs []string
+	for _, b := range iconThemeBases() {
+		dirs = append(dirs, filepath.Join(b, "scalable/apps"))
+	}
+	return append(dirs, "/usr/share/icons/Papirus/scalable/apps")
+}
+
 // resolveAppIcon maps a niri app_id to the tile's app_icon: an absolute .svg
-// path (drawn as the big hero icon) when a matching freedesktop icon exists,
-// else the bundled generic "app" glyph. Memoized.
+// path (drawn as the big hero icon) when a matching freedesktop icon exists —
+// a real SVG, or a sized PNG wrapped into a cached SVG shim (pwetty's resvg
+// renders embedded raster images) — else the bundled generic "app" glyph.
+// Memoized.
 func resolveAppIcon(appID string) string {
 	if appID == "" {
 		return "app"
@@ -231,6 +250,13 @@ func resolveAppIcon(appID string) string {
 		return v.(string)
 	}
 	res := findAppSVG(appID)
+	if res == "" {
+		if p := findAppPNG(appID); p != "" {
+			if svg, err := wrapPNGAsSVG(appID, p); err == nil {
+				res = svg
+			}
+		}
+	}
 	if res == "" {
 		res = "app"
 	}
@@ -248,6 +274,88 @@ func findAppSVG(appID string) string {
 		}
 	}
 	return ""
+}
+
+// pngIconSizes are the sized hicolor dirs tried for the PNG fallback, biggest
+// first (the tile hero icon rasterizes well under 512px).
+var pngIconSizes = []string{"512x512", "256x256", "192x192", "128x128", "96x96", "64x64", "48x48"}
+
+// findAppPNG finds the largest sized hicolor PNG for an app_id (e.g. Chrome
+// ships only PNGs), falling back to /usr/share/pixmaps.
+func findAppPNG(appID string) string {
+	for _, base := range iconThemeBases() {
+		for _, size := range pngIconSizes {
+			for _, c := range iconCandidates(appID) {
+				p := filepath.Join(base, size, "apps", c+".png")
+				if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+					return p
+				}
+			}
+		}
+	}
+	for _, c := range iconCandidates(appID) {
+		p := filepath.Join("/usr/share/pixmaps", c+".png")
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// wrapPNGAsSVG embeds a PNG as a base64 <image> in a minimal SVG under
+// ~/.cache/claude-status/icons/, so pwetty's SVG-only <icon src> (resvg, built
+// with raster-images) can draw apps that ship no vector icon. The shim is
+// written once and reused across runs.
+func wrapPNGAsSVG(appID, pngPath string) (string, error) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(cacheDir, "claude-status", "icons")
+	name := strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '-' || r == '_' {
+			return r
+		}
+		return '_'
+	}, appID)
+	out := filepath.Join(dir, name+".svg")
+	if fi, err := os.Stat(out); err == nil && !fi.IsDir() {
+		return out, nil
+	}
+	raw, err := os.ReadFile(pngPath)
+	if err != nil {
+		return "", err
+	}
+	cfg, err := png.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	svg := fmt.Sprintf(
+		`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="%d" height="%d"><image width="%d" height="%d" xlink:href="data:image/png;base64,%s"/></svg>`,
+		cfg.Width, cfg.Height, cfg.Width, cfg.Height, base64.StdEncoding.EncodeToString(raw))
+	// Atomic write (unique tmp + rename): the daemon and a cacheless CLI run
+	// can resolve the same app concurrently.
+	tmp, err := os.CreateTemp(dir, name+".*.tmp")
+	if err != nil {
+		return "", err
+	}
+	if _, err := tmp.WriteString(svg); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := os.Rename(tmp.Name(), out); err != nil {
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	return out, nil
 }
 
 // iconCandidates are the icon basenames to try for an app_id, e.g.
