@@ -495,7 +495,9 @@ const watchPoll = 75 * time.Millisecond
 // this desktop's cached payload changes. One long-lived process per tile (no
 // per-refresh process spawn, no niri/DB access), so pwetty pushes updates within
 // ~150ms instead of waiting on a 1s poll. Always returns nil after blocking
-// forever; on any read error it emits the empty placeholder.
+// forever; a read error emits the empty placeholder only before the first
+// successful emit (daemon not yet started) — afterwards it keeps the last
+// published state (see nextWatchLine).
 func RunWatch(args []string) error {
 	dbPath := db.DefaultDBPath()
 	output := defaultOutput
@@ -513,20 +515,12 @@ func RunWatch(args []string) error {
 
 	var last string
 	emit := func() {
-		p := emptyPayload(idx, false)
-		if tiles, rerr := ReadCache(path); rerr == nil {
-			if cached, ok := tiles[key]; ok {
-				p = cached
-			}
-		}
-		b, merr := json.Marshal(p)
-		if merr != nil {
-			return
-		}
-		if s := string(b); s != last {
-			last = s
+		tiles, rerr := ReadCache(path)
+		line, publish := nextWatchLine(tiles, rerr, key, idx, last)
+		last = line
+		if publish {
 			// One Write of the full line so pwetty's line reader sees it whole.
-			_, _ = os.Stdout.Write(append(b, '\n'))
+			_, _ = os.Stdout.Write(append([]byte(line), '\n'))
 		}
 	}
 
@@ -535,6 +529,33 @@ func RunWatch(args []string) error {
 		time.Sleep(watchPoll)
 		emit()
 	}
+}
+
+// nextWatchLine decides what one tile-watch poll should print. tiles/rerr are
+// the ReadCache result, last is the previously published line (or "" before
+// any). It returns the new value for last and whether to publish it. On a read
+// error after a previous emit it keeps last and skips: a transient cache
+// failure (torn write, deleted file) must not demote live published state to
+// the idle placeholder — the placeholder is only correct before the daemon has
+// ever written the cache.
+func nextWatchLine(tiles map[string]Payload, rerr error, key string, idx int, last string) (string, bool) {
+	if rerr != nil && last != "" {
+		return last, false // keep-last: never fabricate idleness over live state
+	}
+	p := emptyPayload(idx, false)
+	if rerr == nil {
+		if cached, ok := tiles[key]; ok {
+			p = cached
+		}
+	}
+	b, merr := json.Marshal(p)
+	if merr != nil {
+		return last, false
+	}
+	if s := string(b); s != last {
+		return s, true
+	}
+	return last, false
 }
 
 // BuildLive gathers state directly from niri + the DB for one desktop. It is the

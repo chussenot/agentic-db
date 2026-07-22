@@ -3,6 +3,8 @@ package tile
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"image"
 	"image/png"
 	"os"
@@ -231,6 +233,37 @@ func TestPayloadForDeterministicWindowPick(t *testing.T) {
 	}
 	if a.App != "Firefox" { // lowest id (9) wins, label cleaned
 		t.Errorf("expected lowest-id window (Firefox), got %q", a.App)
+	}
+}
+
+func TestNextWatchLine(t *testing.T) {
+	key := Key("HDMI-A-1", 3)
+	live := map[string]Payload{key: {Shortcut: 3, Sessions: []SessionTile{{State: "prompt", Folder: "repo"}}}}
+	liveLine, _ := json.Marshal(live[key])
+	placeholder, _ := json.Marshal(emptyPayload(3, false))
+	readErr := errors.New("torn read")
+
+	cases := []struct {
+		name        string
+		tiles       map[string]Payload
+		rerr        error
+		last        string
+		wantLine    string
+		wantPublish bool
+	}{
+		{"first successful read publishes", live, nil, "", string(liveLine), true},
+		{"read error before any state publishes placeholder", nil, readErr, "", string(placeholder), true},
+		{"read error after good state keeps last, no publish", nil, readErr, string(liveLine), string(liveLine), false},
+		{"unchanged payload deduped", live, nil, string(liveLine), string(liveLine), false},
+		{"missing key after good state publishes placeholder", map[string]Payload{}, nil, string(liveLine), string(placeholder), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			line, publish := nextWatchLine(tc.tiles, tc.rerr, key, 3, tc.last)
+			if line != tc.wantLine || publish != tc.wantPublish {
+				t.Fatalf("nextWatchLine = (%q, %v), want (%q, %v)", line, publish, tc.wantLine, tc.wantPublish)
+			}
+		})
 	}
 }
 
