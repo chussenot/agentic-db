@@ -196,7 +196,7 @@ func TestPayloadForEmptyDesktop(t *testing.T) {
 	if len(p.Sessions) != 1 || !p.Active {
 		t.Fatalf("empty desktop placeholder wrong: %+v", p)
 	}
-	if s := p.Sessions[0]; s.State != "idle" || s.IdleLevel == 0 || s.Folder != "" {
+	if s := p.Sessions[0]; s.State != "empty" || s.Folder != "" {
 		t.Fatalf("empty placeholder session wrong: %+v", s)
 	}
 }

@@ -86,15 +86,16 @@ func CachePath(dbPath string) string {
 	return filepath.Join(filepath.Dir(dbPath), "tiles.json")
 }
 
-// emptyPayload is the placeholder for an absent/empty desktop: the shortcut on a
-// fully-faded idle bar, expressed as a single dimmed idle session so it satisfies
-// the data-driven `sessions` contract. (Polishing this to the bundled `empty`
-// tile is beaded.)
+// emptyPayload is the placeholder for an absent/empty desktop: the shortcut
+// over a dim hollow "empty" ring (pwetty's `draw_status` state="empty"), as a
+// single session so it satisfies the data-driven `sessions` contract. Distinct
+// from a real `idle` session — a desktop with nothing open never shows the
+// idle decay bar.
 func emptyPayload(idx int, active bool) Payload {
 	return Payload{
 		Shortcut: idx,
 		Active:   active,
-		Sessions: []SessionTile{{State: string(state.Idle), IdleLevel: state.DecayLevels - 1}},
+		Sessions: []SessionTile{{State: "empty"}},
 	}
 }
 
