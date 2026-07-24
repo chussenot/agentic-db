@@ -284,3 +284,66 @@ func TestCacheRoundTrip(t *testing.T) {
 		t.Errorf("round-trip mismatch: %+v", got)
 	}
 }
+
+func TestParseDesktopEntry(t *testing.T) {
+	data := []byte("[Desktop Entry]\nName=Proton Mail\nIcon=/snap/proton-mail/current/meta/gui/icon.svg\nExec=proton-mail\n\n[Desktop Action new-window]\nName=New Window\nIcon=wrong\n")
+	name, icon := parseDesktopEntry(data)
+	if name != "Proton Mail" || icon != "/snap/proton-mail/current/meta/gui/icon.svg" {
+		t.Errorf("parseDesktopEntry = (%q, %q), want (Proton Mail, .../icon.svg)", name, icon)
+	}
+}
+
+// TestFindSnapIcon covers the Proton Mail case: niri hands us the app_id
+// "Proton Mail" (a display name, not a reverse-DNS id), and the icon it
+// resolves to lives under a snap's own meta/gui/ tree, outside every
+// iconThemeBases() dir.
+func TestFindSnapIcon(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() { snapDesktopDir = "/var/lib/snapd/desktop/applications" })
+	snapDesktopDir = dir
+
+	iconDir := filepath.Join(dir, "meta-gui")
+	if err := os.MkdirAll(iconDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	iconPath := filepath.Join(iconDir, "icon.svg")
+	if err := os.WriteFile(iconPath, []byte("<svg/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	desktop := "[Desktop Entry]\nName=Proton Mail\nIcon=" + iconPath + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "proton-mail_proton-mail.desktop"), []byte(desktop), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := findSnapIcon("Proton Mail"); got != iconPath {
+		t.Errorf("findSnapIcon(%q) = %q, want %q", "Proton Mail", got, iconPath)
+	}
+	if got := findSnapIcon("proton mail"); got != iconPath {
+		t.Errorf("findSnapIcon case-insensitive match failed: got %q", got)
+	}
+	if got := findSnapIcon("Some Other App"); got != "" {
+		t.Errorf("findSnapIcon(%q) = %q, want empty", "Some Other App", got)
+	}
+}
+
+// TestResolveAppIconSnapFallback exercises resolveAppIcon end to end: no
+// hicolor/Papirus match, but a snap desktop entry resolves it.
+func TestResolveAppIconSnapFallback(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // keep iconThemeBases() empty of real system icons
+	dir := t.TempDir()
+	t.Cleanup(func() { snapDesktopDir = "/var/lib/snapd/desktop/applications" })
+	snapDesktopDir = dir
+
+	iconPath := filepath.Join(dir, "icon.svg")
+	if err := os.WriteFile(iconPath, []byte("<svg/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	desktop := "[Desktop Entry]\nName=Some Snap App\nIcon=" + iconPath + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "app.desktop"), []byte(desktop), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resolveAppIcon("Some Snap App"); got != iconPath {
+		t.Errorf("resolveAppIcon = %q, want %q", got, iconPath)
+	}
+}

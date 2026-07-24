@@ -259,10 +259,82 @@ func resolveAppIcon(appID string) string {
 		}
 	}
 	if res == "" {
+		if p := findSnapIcon(appID); p != "" {
+			if strings.HasSuffix(strings.ToLower(p), ".svg") {
+				res = p
+			} else if svg, err := wrapPNGAsSVG(appID, p); err == nil {
+				res = svg
+			}
+		}
+	}
+	if res == "" {
 		res = "app"
 	}
 	iconMemo.Store(appID, res)
 	return res
+}
+
+// snapDesktopDir is where snapd publishes desktop entries for installed snap
+// apps. A var (not const) so tests can point it at a fixture directory.
+var snapDesktopDir = "/var/lib/snapd/desktop/applications"
+
+// findSnapIcon falls back to snapd's desktop-entry cache for windows whose
+// app_id is a free-form display name (e.g. niri reports Proton Mail's app_id
+// as the literal "Proton Mail", not a reverse-DNS id) rather than an
+// icon-theme name, and whose Icon= is an absolute path outside any hicolor
+// theme dir (snap installs each app's icon under its own
+// /snap/<name>/current/meta/gui/ tree) — both misses findAppSVG/findAppPNG
+// can't handle. Matches by the desktop entry's Name= against appID
+// (case-insensitive), since that's what snap-packaged Electron/Qt apps often
+// hand niri as the app_id.
+func findSnapIcon(appID string) string {
+	entries, err := os.ReadDir(snapDesktopDir)
+	if err != nil {
+		return ""
+	}
+	want := strings.ToLower(appID)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".desktop") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(snapDesktopDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		name, icon := parseDesktopEntry(data)
+		if icon == "" || strings.ToLower(name) != want {
+			continue
+		}
+		if filepath.IsAbs(icon) {
+			if fi, err := os.Stat(icon); err == nil && !fi.IsDir() {
+				return icon
+			}
+		}
+	}
+	return ""
+}
+
+// parseDesktopEntry extracts the Name and Icon keys from the [Desktop Entry]
+// section of a .desktop file, ignoring any other section (e.g. [Desktop
+// Action ...]) that might redefine them.
+func parseDesktopEntry(data []byte) (name, icon string) {
+	inSection := false
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			inSection = line == "[Desktop Entry]"
+			continue
+		}
+		if !inSection {
+			continue
+		}
+		if v, ok := strings.CutPrefix(line, "Name="); ok && name == "" {
+			name = v
+		} else if v, ok := strings.CutPrefix(line, "Icon="); ok && icon == "" {
+			icon = v
+		}
+	}
+	return name, icon
 }
 
 func findAppSVG(appID string) string {
