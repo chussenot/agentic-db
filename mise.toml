@@ -1,5 +1,6 @@
 [tools]
 go = "1.26.4"
+"go:github.com/steveyegge/beads/cmd/bd" = "1"
 
 [tasks.build]
 description = "Build the static claude-status binary to ./claude-status"
