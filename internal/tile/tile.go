@@ -18,6 +18,9 @@
 package tile
 
 import (
+	"bufio"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -211,12 +214,20 @@ var iconMemo sync.Map
 func appIconDirs() []string {
 	var dirs []string
 	if home, err := os.UserHomeDir(); err == nil {
-		dirs = append(dirs, filepath.Join(home, ".local/share/icons/hicolor/scalable/apps"))
+		dirs = append(dirs,
+			filepath.Join(home, ".local/share/icons/hicolor/scalable/apps"),
+			// Per-user flatpak exports (basename == reverse-DNS app_id, which niri
+			// reports verbatim, e.g. com.slack.Slack.svg).
+			filepath.Join(home, ".local/share/flatpak/exports/share/icons/hicolor/scalable/apps"),
+		)
 	}
 	return append(dirs,
 		"/usr/share/icons/hicolor/scalable/apps",
 		"/usr/share/icons/Papirus/scalable/apps",
 		"/usr/local/share/icons/hicolor/scalable/apps",
+		// System-wide flatpak exports — where slack/vesktop et al. actually ship
+		// their scalable icon.
+		"/var/lib/flatpak/exports/share/icons/hicolor/scalable/apps",
 	)
 }
 
@@ -230,12 +241,141 @@ func resolveAppIcon(appID string) string {
 	if v, ok := iconMemo.Load(appID); ok {
 		return v.(string)
 	}
-	res := findAppSVG(appID)
+	res := findIcon(appID)
 	if res == "" {
 		res = "app"
 	}
 	iconMemo.Store(appID, res)
 	return res
+}
+
+// findIcon resolves an app_id to an absolute .svg path — a native scalable icon
+// or a generated PNG wrapper — or "". It tries, in order: the app_id itself,
+// then the Icon= of a matching freedesktop .desktop entry (which bridges a WM-
+// class app_id like "vesktop" to its differently-named icon "dev.vencord.Vesktop").
+// For all keys it prefers a native SVG before falling back to wrapping the best
+// PNG (e.g. firefox, which ships PNG-only + a monochrome symbolic SVG), so
+// pwetty's SVG-only renderer (resvg, which draws embedded raster) shows the real
+// logo instead of the generic "app" bubble.
+func findIcon(appID string) string {
+	keys := []string{appID}
+	if icon := desktopEntryIcon(appID); icon != "" && icon != appID {
+		keys = append(keys, icon)
+	}
+	for _, k := range keys {
+		if p := iconFromName(k); p != "" {
+			return p
+		}
+	}
+	for _, k := range keys {
+		if p := wrappedPNGIcon(k); p != "" {
+			return p
+		}
+	}
+	return ""
+}
+
+// iconFromName resolves an Icon= value (or app_id) to a native .svg: an absolute
+// path is honored directly (SVG only — pwetty can't draw a raw PNG path),
+// otherwise it is looked up as a freedesktop icon name.
+func iconFromName(name string) string {
+	if filepath.IsAbs(name) {
+		if strings.HasSuffix(name, ".svg") {
+			if fi, err := os.Stat(name); err == nil && !fi.IsDir() {
+				return name
+			}
+		}
+		return ""
+	}
+	return findAppSVG(name)
+}
+
+// appDirs are the freedesktop application-entry directories searched for a
+// matching .desktop file, in precedence order (user, flatpak exports, system).
+func appDirs() []string {
+	var dirs []string
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".local/share/applications"))
+	}
+	return append(dirs,
+		"/var/lib/flatpak/exports/share/applications",
+		"/usr/local/share/applications",
+		"/usr/share/applications",
+	)
+}
+
+// desktopEntryIcon returns the Icon= of the .desktop entry that matches appID —
+// first by filename (<appID>.desktop), then by a StartupWMClass= equal to appID
+// (case-insensitive). This bridges a Wayland/X11 app_id to a differently named
+// icon (e.g. app_id "vesktop" -> Icon "dev.vencord.Vesktop"). "" if none.
+func desktopEntryIcon(appID string) string {
+	for _, dir := range appDirs() {
+		if icon, _ := parseDesktop(filepath.Join(dir, appID+".desktop")); icon != "" {
+			return icon
+		}
+	}
+	for _, dir := range appDirs() {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".desktop") {
+				continue
+			}
+			icon, wm := parseDesktop(filepath.Join(dir, e.Name()))
+			if icon != "" && wm != "" && strings.EqualFold(wm, appID) {
+				return icon
+			}
+		}
+	}
+	return ""
+}
+
+// parseDesktop reads a .desktop file's Icon= and StartupWMClass= from its
+// [Desktop Entry] group (later groups like [Desktop Action …] are ignored).
+// Missing file/keys -> empty strings.
+func parseDesktop(path string) (icon, wmClass string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", ""
+	}
+	defer f.Close()
+	inEntry := false
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "[") {
+			if inEntry {
+				break // left [Desktop Entry] for the next group
+			}
+			inEntry = line == "[Desktop Entry]"
+			continue
+		}
+		if !inEntry {
+			continue
+		}
+		if v, ok := cutKey(line, "Icon"); ok && icon == "" {
+			icon = v
+		} else if v, ok := cutKey(line, "StartupWMClass"); ok && wmClass == "" {
+			wmClass = v
+		}
+	}
+	_ = sc.Err() // best-effort parse; a truncated read just yields fewer keys
+	return icon, wmClass
+}
+
+// cutKey returns the value of a `Key=value` line for exactly key (so "Icon"
+// doesn't match "IconName="), trimmed. ok is false when the line isn't that key.
+func cutKey(line, key string) (string, bool) {
+	if !strings.HasPrefix(line, key) {
+		return "", false
+	}
+	rest := strings.TrimSpace(line[len(key):])
+	if !strings.HasPrefix(rest, "=") {
+		return "", false
+	}
+	return strings.TrimSpace(rest[1:]), true
 }
 
 func findAppSVG(appID string) string {
@@ -248,6 +388,193 @@ func findAppSVG(appID string) string {
 		}
 	}
 	return ""
+}
+
+// appIconThemeRoots are the hicolor theme roots holding sized (PNG) app icons —
+// the same coverage as appIconDirs (user, system, flatpak exports) minus the
+// scalable/apps leaf, since PNGs live under per-size subdirs (16x16 … 512x512).
+func appIconThemeRoots() []string {
+	var roots []string
+	if home, err := os.UserHomeDir(); err == nil {
+		roots = append(roots,
+			filepath.Join(home, ".local/share/icons/hicolor"),
+			filepath.Join(home, ".local/share/flatpak/exports/share/icons/hicolor"),
+		)
+	}
+	return append(roots,
+		"/usr/share/icons/hicolor",
+		"/usr/local/share/icons/hicolor",
+		"/var/lib/flatpak/exports/share/icons/hicolor",
+	)
+}
+
+// sizeDirPixels parses a hicolor size subdir name ("128x128" -> 128). Non-sized
+// dirs ("scalable", "symbolic") -> 0 so they never win the largest-PNG pick.
+func sizeDirPixels(name string) int {
+	i := strings.IndexByte(name, 'x')
+	if i <= 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(name[:i])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// findAppPNG returns the highest-resolution PNG app icon for appID across the
+// theme roots (larger is preferred so the wrapped hero icon stays crisp), or ""
+// if none. Falls back to unsized /usr/share/pixmaps last.
+func findAppPNG(appID string) string {
+	best, bestPx := "", 0
+	cands := iconCandidates(appID)
+	for _, root := range appIconThemeRoots() {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			px := sizeDirPixels(e.Name())
+			if px <= bestPx {
+				continue
+			}
+			for _, c := range cands {
+				p := filepath.Join(root, e.Name(), "apps", c+".png")
+				if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+					best, bestPx = p, px
+					break
+				}
+			}
+		}
+	}
+	if best == "" {
+		for _, c := range cands {
+			p := filepath.Join("/usr/share/pixmaps", c+".png")
+			if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+				return p
+			}
+		}
+	}
+	return best
+}
+
+// wrappedPNGIcon renders the best PNG icon for name (an icon name or an absolute
+// .png path from a desktop entry's Icon=) into a cached wrapper SVG — a single
+// <image> with the PNG embedded as a base64 data URI — and returns its path, or
+// "" if no PNG exists or the wrap fails. The wrapper is cached under the user
+// cache dir and regenerated only when missing or older than its source PNG.
+func wrappedPNGIcon(name string) string {
+	png := ""
+	if filepath.IsAbs(name) && strings.HasSuffix(name, ".png") {
+		if fi, err := os.Stat(name); err == nil && !fi.IsDir() {
+			png = name
+		}
+	} else {
+		png = findAppPNG(name)
+	}
+	if png == "" {
+		return ""
+	}
+	dir, err := iconCacheDir()
+	if err != nil {
+		return ""
+	}
+	out := filepath.Join(dir, sanitizeIconName(name)+".svg")
+	if wrapperFresh(out, png) {
+		return out
+	}
+	svg, err := buildPNGWrapperSVG(png)
+	if err != nil {
+		return ""
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return ""
+	}
+	tmp := out + ".tmp"
+	if err := os.WriteFile(tmp, svg, 0o644); err != nil {
+		return ""
+	}
+	if err := os.Rename(tmp, out); err != nil {
+		return ""
+	}
+	return out
+}
+
+// iconCacheDir is where generated PNG-wrapper SVGs live.
+func iconCacheDir() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "claude-status", "app-icons"), nil
+}
+
+// wrapperFresh reports whether the cached wrapper is present and no older than
+// its source PNG (so an app upgrade that ships a new icon regenerates it).
+func wrapperFresh(wrapper, src string) bool {
+	wi, err := os.Stat(wrapper)
+	if err != nil {
+		return false
+	}
+	si, err := os.Stat(src)
+	if err != nil {
+		return false
+	}
+	return !wi.ModTime().Before(si.ModTime())
+}
+
+// sanitizeIconName maps an app_id to a filesystem-safe cache basename (reverse-
+// DNS ids are already close; this just neutralizes any stray separators).
+func sanitizeIconName(appID string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '-', r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, appID)
+}
+
+// buildPNGWrapperSVG embeds a PNG file as a base64 data URI inside a minimal SVG
+// sized to the PNG's own pixel dimensions. Both href and xlink:href are omitted
+// in favor of xlink:href, which every resvg version accepts.
+func buildPNGWrapperSVG(pngPath string) ([]byte, error) {
+	data, err := os.ReadFile(pngPath)
+	if err != nil {
+		return nil, err
+	}
+	w, h, err := pngDimensions(data)
+	if err != nil {
+		return nil, err
+	}
+	enc := base64.StdEncoding.EncodeToString(data)
+	svg := fmt.Sprintf(
+		`<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" `+
+			`width="%d" height="%d" viewBox="0 0 %d %d">`+
+			`<image width="%d" height="%d" xlink:href="data:image/png;base64,%s"/></svg>`,
+		w, h, w, h, w, h, enc)
+	return []byte(svg), nil
+}
+
+// pngDimensions extracts (width, height) from a PNG's IHDR chunk: an 8-byte
+// signature, then a 4-byte length + "IHDR", then big-endian 4-byte width and
+// height. Enough of the header to size the wrapper's viewBox.
+func pngDimensions(data []byte) (int, int, error) {
+	const sig = "\x89PNG\r\n\x1a\n"
+	if len(data) < 24 || string(data[:8]) != sig || string(data[12:16]) != "IHDR" {
+		return 0, 0, fmt.Errorf("not a PNG")
+	}
+	w := int(binary.BigEndian.Uint32(data[16:20]))
+	h := int(binary.BigEndian.Uint32(data[20:24]))
+	if w <= 0 || h <= 0 {
+		return 0, 0, fmt.Errorf("bad PNG dimensions: %dx%d", w, h)
+	}
+	return w, h, nil
 }
 
 // iconCandidates are the icon basenames to try for an app_id, e.g.
