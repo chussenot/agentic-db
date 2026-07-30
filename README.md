@@ -21,6 +21,11 @@ niri window model and drives two renderers:
   (and `tile-watch`) then serve that cache as the JSON a pwetty-hosted waybar
   tile expects — a cheap file read on the hot path, no `niri msg` spawn per
   render. Contract: `~/Perso/pwetty-box-rs/tiles/claude/schema.json`.
+  A payload is the desktop's shortcut plus an `items` array of 1–2 rows, each
+  row either a Claude session or an ordinary window — so a desktop holding a
+  session *and* a browser shows both. The row count picks the tile's layout
+  (1 → rich single, 2 → stacked dual); choosing **which** two rows a busier
+  desktop shows is ours (prompt first, sessions over plain windows).
 
 ## Subcommands
 

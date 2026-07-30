@@ -4,7 +4,9 @@
 //
 // It emits, on stdout, the JSON data object the bundled pwetty `claude` tile
 // expects (contract: ~/Perso/pwetty-box-rs/tiles/claude/schema.json) for ONE
-// niri desktop, identified by its per-output workspace index.
+// niri desktop, identified by its per-output workspace index: a shortcut plus an
+// `items` array of 1-2 rows, each row either a Claude session or an ordinary
+// window. We only build the rows; their count picks the layout.
 //
 // HOT PATH: a waybar `cffi/pwetty#i` module reruns this every interval, once per
 // tile. To keep that cheap (a regression once hammered niri with `niri msg` IPC
@@ -44,38 +46,53 @@ import (
 const defaultOutput = "HDMI-A-1"
 
 // Payload is the pwetty `claude` tile data object for ONE niri desktop. The tile
-// is data-driven (contract: ~/Perso/pwetty-box-rs/tiles/claude/schema.json): a
-// Claude desktop carries `sessions` (1 -> single layout, 2 -> stacked dual), an
-// ordinary window carries is_claude=false + app/app_icon/title. Fields use
-// omitempty so an absent value falls back to the tile's schema default.
+// is data-driven (contract: ~/Perso/pwetty-box-rs/tiles/claude/schema.json): we
+// send the desktop's window(s) as `items` — 1 row -> rich single layout, 2 rows
+// -> stacked dual layout with a shared shortcut gutter — and the row count picks
+// the layout, never us. Fields use omitempty so an absent value falls back to the
+// tile's schema default.
+//
+// The legacy feeds this replaced (a bare `sessions` array; the flat
+// is_claude/app/app_icon/title window fields) still validate upstream, but they
+// couldn't express a MIXED desktop, so a plain window sitting next to a Claude
+// session was simply dropped from the tile.
 type Payload struct {
-	Shortcut int           `json:"shortcut"`
-	Active   bool          `json:"active,omitempty"`
-	Sessions []SessionTile `json:"sessions,omitempty"`
-	IsClaude *bool         `json:"is_claude,omitempty"`
-	App      string        `json:"app,omitempty"`
-	AppIcon  string        `json:"app_icon,omitempty"`
-	Title    string        `json:"title,omitempty"` // is_claude=false (window) only
+	Shortcut int    `json:"shortcut"`
+	Active   bool   `json:"active,omitempty"`
+	Items    []Item `json:"items,omitempty"`
 }
 
-// SessionTile is one Claude session within a desktop's `sessions` array. State is
-// required (drives the indicator); the rest fall back to schema defaults when
-// omitted. Two sessions sharing one niri window (e.g. two kitty tabs) share that
-// window's Title — niri exposes no per-tab title.
-type SessionTile struct {
-	State     string `json:"state"`
-	Folder    string `json:"folder,omitempty"`
-	Title     string `json:"title,omitempty"`
-	Unpushed  int    `json:"unpushed,omitempty"`
-	IdleLevel int    `json:"idle_level,omitempty"`
-	IdleAgo   string `json:"idle_ago,omitempty"`
+// Item is one row of a desktop's `items`: either a Claude SESSION row (Kind
+// session, State required — it drives the indicator and the tile-wide prompt
+// pulse) or an APP row for an ordinary window (Kind app, App + AppIcon required).
+// Kind is inferrable upstream from State vs App, but we send it explicitly: it
+// must agree with the body, and stating it keeps the daemon's tiles.json legible.
+// Two sessions sharing one niri window (e.g. two kitty tabs) share that window's
+// Title — niri exposes no per-tab title.
+type Item struct {
+	Kind      string `json:"kind"`
+	State     string `json:"state,omitempty"`      // session rows
+	Folder    string `json:"folder,omitempty"`     // session rows
+	Unpushed  int    `json:"unpushed,omitempty"`   // session rows
+	IdleLevel int    `json:"idle_level,omitempty"` // session rows, state=idle
+	IdleAgo   string `json:"idle_ago,omitempty"`   // session rows, state=idle
+	App       string `json:"app,omitempty"`        // app rows
+	AppIcon   string `json:"app_icon,omitempty"`   // app rows
+	Title     string `json:"title,omitempty"`      // both
 }
 
-// maxSessionsPerTile caps the sessions array at the contract's maxItems (2). When
-// a desktop has more, statePriority ordering keeps the most salient two (a prompt
-// is never dropped) so the tile's "any session prompt -> whole tile pulses" alert
-// still fires.
-const maxSessionsPerTile = 2
+// The two row kinds, as the contract's `kind` discriminator spells them.
+const (
+	KindSession = "session"
+	KindApp     = "app"
+)
+
+// maxItemsPerTile caps the items array at the contract's maxItems (2). When a
+// desktop has more windows, rowPriority ordering keeps the most salient two (a
+// prompt is never dropped) so the tile's "any row prompt -> whole tile pulses"
+// alert still fires. Picking the two is the producer's job — the tile won't
+// decide for us.
+const maxItemsPerTile = 2
 
 // Key is the tile-cache key for a desktop: "<output>:<idx>". Indexes repeat
 // across outputs, so the output qualifies them.
@@ -87,22 +104,28 @@ func CachePath(dbPath string) string {
 }
 
 // emptyPayload is the placeholder for an absent/empty desktop: the shortcut on a
-// fully-faded idle bar, expressed as a single dimmed idle session so it satisfies
-// the data-driven `sessions` contract. (Polishing this to the bundled `empty`
-// tile is beaded.)
+// fully-faded idle bar, expressed as a single dimmed idle session row — a
+// windowless desktop is really a different preset (the bundled `empty` tile), NOT
+// a 0-row items array, which the contract forbids. Selecting that preset per
+// desktop is claude-status-db-wsh.
 func emptyPayload(idx int, active bool) Payload {
 	return Payload{
 		Shortcut: idx,
 		Active:   active,
-		Sessions: []SessionTile{{State: string(state.Idle), IdleLevel: state.DecayLevels - 1}},
+		Items:    []Item{{Kind: KindSession, State: string(state.Idle), IdleLevel: state.DecayLevels - 1}},
 	}
 }
 
-// statePriority orders sessions for the dual layout and the maxSessionsPerTile
+// rowPriority orders a desktop's rows for the dual layout and the maxItemsPerTile
 // cap: prompt first (never dropped — it drives the tile pulse), then working,
-// shell, idle. Unknown states sort last.
-func statePriority(s string) int {
-	switch state.Status(s) {
+// shell, idle, an unknown session state, and finally app rows. Sessions outrank
+// ordinary windows: on a mixed desktop the Claude row is the one that must
+// survive the cap.
+func rowPriority(it Item) int {
+	if it.Kind == KindApp {
+		return 5
+	}
+	switch state.Status(it.State) {
 	case state.Prompt:
 		return 0
 	case state.Working:
@@ -116,18 +139,28 @@ func statePriority(s string) int {
 	}
 }
 
-// sessionTile builds one SessionTile from a DB session and its window title.
-func sessionTile(s db.Session, title string, now time.Time) SessionTile {
-	st := SessionTile{State: s.State, Title: title}
+// sessionItem builds one session row from a DB session and its window title.
+func sessionItem(s db.Session, title string, now time.Time) Item {
+	it := Item{Kind: KindSession, State: s.State, Title: title}
 	if s.Cwd.Valid {
-		st.Folder = filepath.Base(s.Cwd.String)
+		it.Folder = filepath.Base(s.Cwd.String)
 	}
 	if state.Status(s.State) == state.Idle && s.LastTalkTS.Valid {
 		elapsed := now.Sub(time.UnixMilli(s.LastTalkTS.Int64))
-		st.IdleLevel = state.DecayLevel(elapsed)
-		st.IdleAgo = fmtAgo(elapsed)
+		it.IdleLevel = state.DecayLevel(elapsed)
+		it.IdleAgo = fmtAgo(elapsed)
 	}
-	return st
+	return it
+}
+
+// appItem builds one app row from an ordinary niri window.
+func appItem(w niri.Window) Item {
+	return Item{
+		Kind:    KindApp,
+		App:     cleanAppLabel(w.AppID),
+		AppIcon: resolveAppIcon(w.AppID),
+		Title:   w.Title,
+	}
 }
 
 // PayloadFor computes the tile payload for one workspace from already-gathered
@@ -135,72 +168,82 @@ func sessionTile(s db.Session, title string, now time.Time) SessionTile {
 // cached window id, and the clock. PURE (no IPC/DB) so both the daemon and the
 // CLI fallback share it and it is unit-testable.
 //
-// An empty desktop -> emptyPayload. A desktop with one or more tracked sessions
-// -> the Claude layout: every session on the desktop as a `sessions[]` entry
-// (capped at maxSessionsPerTile, prompt-priority ordered). Co-resident sessions
-// that share one niri window (two kitty tabs) BOTH appear — they are grouped by
-// workspace, not window, so neither is masked. A desktop with windows but no
-// tracked session -> the app layout (leftmost window's app + icon). Note: the
-// daemon passes its first-party overlaid sessions, so each State is the effective
-// state, not raw hooks.
+// An empty desktop -> emptyPayload. Otherwise every window on the desktop becomes
+// a row: a session row per tracked session, an app row per window that hosts
+// none — so a MIXED desktop (a session plus an ordinary window) shows both, which
+// the old `sessions`-only feed could not express. Rows are prompt-first ordered
+// and capped at maxItemsPerTile. Co-resident sessions that share one niri window
+// (two kitty tabs) BOTH appear — they are grouped by workspace, not window, so
+// neither is masked. Note: the daemon passes its first-party overlaid sessions, so
+// each State is the effective state, not raw hooks.
 func PayloadFor(ws niri.Workspace, winsOnWs []niri.Window, sessionsOnWs []db.Session, now time.Time) Payload {
-	p := Payload{Shortcut: ws.Idx, Active: ws.IsFocused}
-
-	if len(sessionsOnWs) > 0 {
-		// Title comes from the session's niri window (sessions carry no title of
-		// their own); co-window sessions share it.
-		titleOf := make(map[int]string, len(winsOnWs))
-		for _, w := range winsOnWs {
-			titleOf[w.ID] = w.Title
-		}
-		// Deterministic, prompt-first order so the cap keeps the salient sessions
-		// and the layout doesn't flip between cache rebuilds. Tie-break on window
-		// then session id (both stable).
-		ss := append([]db.Session(nil), sessionsOnWs...)
-		sort.Slice(ss, func(i, j int) bool {
-			pi, pj := statePriority(ss[i].State), statePriority(ss[j].State)
-			if pi != pj {
-				return pi < pj
-			}
-			wi, wj := ss[i].WindowID.Int64, ss[j].WindowID.Int64
-			if wi != wj {
-				return wi < wj
-			}
-			return ss[i].SessionID < ss[j].SessionID
-		})
-		if len(ss) > maxSessionsPerTile {
-			ss = ss[:maxSessionsPerTile]
-		}
-		for _, s := range ss {
-			title := ""
-			if s.WindowID.Valid {
-				title = titleOf[int(s.WindowID.Int64)]
-			}
-			p.Sessions = append(p.Sessions, sessionTile(s, title, now))
-		}
-		return p
-	}
-
-	if len(winsOnWs) == 0 {
+	rows := desktopRows(winsOnWs, sessionsOnWs, now)
+	if len(rows) == 0 {
 		return emptyPayload(ws.Idx, ws.IsFocused)
 	}
+	return Payload{Shortcut: ws.Idx, Active: ws.IsFocused, Items: rows}
+}
 
-	// No tracked session on this desktop: the app layout for the leftmost window.
-	// Stable order: the daemon groups windows from a map (randomized iteration),
-	// so without this the chosen window flips on every cache rebuild — a desktop
-	// with 2+ windows visibly blinks between them.
-	w0 := winsOnWs[0]
-	for _, w := range winsOnWs[1:] {
-		if w.ID < w0.ID {
-			w0 = w
-		}
+// row is an Item plus the stable identity used to break ordering ties: the niri
+// window it came from, and the session id for session rows (an app row leaves it
+// empty). Keeping them beside the Item avoids re-deriving them while sorting.
+type row struct {
+	item      Item
+	winID     int64
+	sessionID string
+}
+
+// desktopRows turns a desktop's windows and sessions into the tile's rows, in the
+// order the cap should keep, capped at maxItemsPerTile. Ordering is fully
+// deterministic — the daemon groups windows and sessions out of maps (randomized
+// iteration), so without the tie-breaks the chosen/ordered rows would flip on
+// every cache rebuild and the tile would visibly blink between them.
+func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, now time.Time) []Item {
+	// Title comes from the session's niri window (sessions carry no title of their
+	// own); co-window sessions share it.
+	titleOf := make(map[int]string, len(winsOnWs))
+	for _, w := range winsOnWs {
+		titleOf[w.ID] = w.Title
 	}
-	isClaude := false
-	p.IsClaude = &isClaude
-	p.App = cleanAppLabel(w0.AppID)
-	p.AppIcon = resolveAppIcon(w0.AppID)
-	p.Title = w0.Title
-	return p
+	hosted := make(map[int]bool, len(sessionsOnWs))
+	rows := make([]row, 0, len(sessionsOnWs)+len(winsOnWs))
+	for _, s := range sessionsOnWs {
+		var wid int64
+		title := ""
+		if s.WindowID.Valid {
+			wid = s.WindowID.Int64
+			title = titleOf[int(wid)]
+			hosted[int(wid)] = true
+		}
+		rows = append(rows, row{item: sessionItem(s, title, now), winID: wid, sessionID: s.SessionID})
+	}
+	// Windows with no tracked session are ordinary apps. A window hosting one is
+	// already represented by its session row(s) — an app row for it would be a
+	// duplicate of the same window.
+	for _, w := range winsOnWs {
+		if hosted[w.ID] {
+			continue
+		}
+		rows = append(rows, row{item: appItem(w), winID: int64(w.ID)})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		pi, pj := rowPriority(rows[i].item), rowPriority(rows[j].item)
+		if pi != pj {
+			return pi < pj
+		}
+		if rows[i].winID != rows[j].winID {
+			return rows[i].winID < rows[j].winID // leftmost/oldest window first
+		}
+		return rows[i].sessionID < rows[j].sessionID
+	})
+	if len(rows) > maxItemsPerTile {
+		rows = rows[:maxItemsPerTile]
+	}
+	items := make([]Item, 0, len(rows))
+	for _, r := range rows {
+		items = append(items, r.item)
+	}
+	return items
 }
 
 // iconMemo caches app_id -> resolved app_icon so repeated cache rebuilds don't
@@ -689,10 +732,14 @@ func Run(args []string) error {
 	var p Payload
 	if tiles, rerr := ReadCache(CachePath(dbPath)); rerr == nil {
 		// Cache hit path: a single file read, no niri/DB. Missing key (a desktop
-		// the daemon didn't see) -> empty placeholder.
-		var ok bool
-		if p, ok = tiles[Key(output, idx)]; !ok {
-			p = emptyPayload(idx, false)
+		// the daemon didn't see) -> empty placeholder. A rowless payload means the
+		// same, or a cache still in the pre-items shape written by an older daemon
+		// mid-upgrade — either way the placeholder beats emitting an items-less
+		// object, which the contract rejects.
+		if cached, ok := tiles[Key(output, idx)]; ok && len(cached.Items) > 0 {
+			p = cached
+		} else {
+			p = emptyPayload(idx, cached.Active)
 		}
 	} else {
 		// No cache (daemon not running): degrade to a live query.
@@ -734,7 +781,8 @@ func RunWatch(args []string) error {
 	emit := func() {
 		p := emptyPayload(idx, false)
 		if tiles, rerr := ReadCache(path); rerr == nil {
-			if cached, ok := tiles[key]; ok {
+			// Same rowless guard as Run: never stream an items-less object.
+			if cached, ok := tiles[key]; ok && len(cached.Items) > 0 {
 				p = cached
 			}
 		}
@@ -804,15 +852,30 @@ func BuildLive(dbPath, output string, idx int) Payload {
 	return PayloadFor(*ws, onWs, sessOnWs, db.Now())
 }
 
-// fmtAgo renders an elapsed duration as the tile's "time since active" string:
-// "<60m" as minutes ("12m"), otherwise hours ("2h").
+// fmtAgo renders an elapsed duration as the tile's idle_ago: minutes under an
+// hour ("12m"), hours under a day ("2h"), then days ("3d"), clamped at "99d".
+//
+// The shape is load-bearing — it dodges two filed renderer bugs that the producer
+// can avoid entirely:
+//   - It MUST be <integer><suffix>. Anything else ("1.5h", "1h30m", "2 hours") is
+//     silently parsed as a couple of minutes and the label renders bright, i.e.
+//     "just idled" — the exact opposite of the truth (pwetty-box-rs-00i).
+//   - It must stay ~3 characters or it overruns its slot and paints over the
+//     folder name; "120m" already collides. Hence the rollover to hours then days
+//     rather than ever-growing minutes (pwetty-box-rs-9l7).
 func fmtAgo(d time.Duration) string {
 	if d < 0 {
 		d = 0
 	}
-	m := int(d.Minutes())
-	if m < 60 {
+	switch m := int(d.Minutes()); {
+	case m < 60:
 		return fmt.Sprintf("%dm", m)
+	case m < 24*60:
+		return fmt.Sprintf("%dh", m/60)
+	default:
+		if days := m / (24 * 60); days <= 99 {
+			return fmt.Sprintf("%dd", days)
+		}
+		return "99d"
 	}
-	return fmt.Sprintf("%dh", m/60)
 }

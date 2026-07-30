@@ -3,6 +3,7 @@ package tile
 import (
 	"database/sql"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -36,22 +37,22 @@ func TestPayloadForClaudeDesktop(t *testing.T) {
 	sessions := []db.Session{claudeSession(24, "/home/x/claude-status-db", "working", 0)}
 
 	p := PayloadFor(w, wins, sessions, now)
-	if p.Shortcut != 5 || !p.Active || len(p.Sessions) != 1 {
+	if p.Shortcut != 5 || !p.Active || len(p.Items) != 1 {
 		t.Fatalf("claude payload wrong: %+v", p)
 	}
-	s := p.Sessions[0]
-	if s.State != "working" || s.Folder != "claude-status-db" || s.Title != "Diagnose bug" {
-		t.Fatalf("claude session wrong: %+v", s)
+	s := p.Items[0]
+	if s.Kind != KindSession || s.State != "working" || s.Folder != "claude-status-db" || s.Title != "Diagnose bug" {
+		t.Fatalf("session row wrong: %+v", s)
 	}
-	if p.IsClaude != nil {
-		t.Errorf("claude desktop should leave is_claude default (nil), got %v", *p.IsClaude)
+	if s.App != "" || s.AppIcon != "" {
+		t.Errorf("session row must not carry app fields: %+v", s)
 	}
 }
 
 func TestPayloadForDualSharedWindow(t *testing.T) {
 	// Two sessions in two kitty tabs of ONE niri window (window 7). Both must
-	// surface as a 2-entry sessions[]; neither is masked. This is the desktop-3/5
-	// multi-session case grouped by workspace, not window.
+	// surface as 2 rows; neither is masked. This is the desktop-3/5 multi-session
+	// case grouped by workspace, not window.
 	now := time.UnixMilli(1_000_000)
 	w := ws(3, "HDMI-A-1", 30, true)
 	wins := []niri.Window{win(7, 30, "kitty", "ci-base")}
@@ -60,16 +61,70 @@ func TestPayloadForDualSharedWindow(t *testing.T) {
 		claudeSession(7, "/a/ci-base-prompt", "prompt", 0),
 	}
 	p := PayloadFor(w, wins, sessions, now)
-	if len(p.Sessions) != 2 {
-		t.Fatalf("want 2 sessions, got %d: %+v", len(p.Sessions), p)
+	if len(p.Items) != 2 {
+		t.Fatalf("want 2 rows, got %d: %+v", len(p.Items), p)
 	}
-	// prompt sorts first (statePriority), so it's never dropped and drives the pulse.
-	if p.Sessions[0].State != "prompt" || p.Sessions[1].State != "idle" {
-		t.Fatalf("dual order wrong (want prompt,idle): %+v", p.Sessions)
+	// prompt sorts first (rowPriority), so it's never dropped and drives the pulse.
+	if p.Items[0].State != "prompt" || p.Items[1].State != "idle" {
+		t.Fatalf("dual order wrong (want prompt,idle): %+v", p.Items)
 	}
-	// Both share window 7's title.
-	if p.Sessions[0].Title != "ci-base" || p.Sessions[1].Title != "ci-base" {
-		t.Errorf("co-window sessions should share the window title: %+v", p.Sessions)
+	// Both share window 7's title, and the window yields no extra app row.
+	if p.Items[0].Title != "ci-base" || p.Items[1].Title != "ci-base" {
+		t.Errorf("co-window sessions should share the window title: %+v", p.Items)
+	}
+}
+
+func TestPayloadForMixedSessionAndApp(t *testing.T) {
+	// One Claude session (window 7) plus an ordinary window (9) on the same
+	// desktop: BOTH surface, session row first. The old sessions[]-only feed
+	// dropped the plain window entirely.
+	now := time.UnixMilli(1_000_000)
+	w := ws(6, "HDMI-A-1", 60, false)
+	wins := []niri.Window{win(9, 60, "firefox", "JSON Schema anyOf — Mozilla Firefox"), win(7, 60, "kitty", "unify rows")}
+	sessions := []db.Session{claudeSession(7, "/a/pwetty-box-rs", "working", 0)}
+
+	p := PayloadFor(w, wins, sessions, now)
+	if len(p.Items) != 2 {
+		t.Fatalf("want 2 rows (session + app), got %d: %+v", len(p.Items), p)
+	}
+	if s := p.Items[0]; s.Kind != KindSession || s.Folder != "pwetty-box-rs" || s.Title != "unify rows" {
+		t.Fatalf("row 0 should be the session: %+v", s)
+	}
+	a := p.Items[1]
+	if a.Kind != KindApp || a.App != "Firefox" || a.Title != "JSON Schema anyOf — Mozilla Firefox" {
+		t.Fatalf("row 1 should be the Firefox app row: %+v", a)
+	}
+	if a.AppIcon == "" { // an svg path or the bundled "app" fallback, never empty
+		t.Errorf("app row needs an app_icon: %+v", a)
+	}
+	if a.State != "" || a.Folder != "" {
+		t.Errorf("app row must not carry session fields: %+v", a)
+	}
+}
+
+func TestPayloadForMixedSessionWinsTheCap(t *testing.T) {
+	// A session and TWO ordinary windows: we must pick the 2 rows, and the Claude
+	// session is the one that cannot be dropped.
+	now := time.UnixMilli(1_000_000)
+	w := ws(6, "HDMI-A-1", 60, false)
+	wins := []niri.Window{
+		win(3, 60, "firefox", "FF"),
+		win(4, 60, "org.keepassxc.KeePassXC", "Passbase"),
+		win(20, 60, "kitty", "idle work"),
+	}
+	sessions := []db.Session{claudeSession(20, "/a/repo", "idle", now.Add(-5*time.Minute).UnixMilli())}
+
+	p := PayloadFor(w, wins, sessions, now)
+	if len(p.Items) != 2 {
+		t.Fatalf("want cap of 2, got %d: %+v", len(p.Items), p)
+	}
+	// Idle session still outranks any app row; lowest-id app takes the other slot
+	// (claude-status-db-mu8 will make that the ACTIVE window instead).
+	if p.Items[0].Kind != KindSession || p.Items[0].Folder != "repo" {
+		t.Fatalf("session row must survive the cap: %+v", p.Items)
+	}
+	if p.Items[1].Kind != KindApp || p.Items[1].App != "Firefox" {
+		t.Fatalf("second row should be the lowest-id app window: %+v", p.Items)
 	}
 }
 
@@ -83,11 +138,11 @@ func TestPayloadForCapsAtTwo(t *testing.T) {
 		claudeSession(7, "/a/three", "prompt", 0),
 	}
 	p := PayloadFor(w, wins, sessions, now)
-	if len(p.Sessions) != 2 {
-		t.Fatalf("want cap of 2, got %d", len(p.Sessions))
+	if len(p.Items) != 2 {
+		t.Fatalf("want cap of 2, got %d", len(p.Items))
 	}
-	if p.Sessions[0].State != "prompt" {
-		t.Errorf("prompt must survive the cap (kept first): %+v", p.Sessions)
+	if p.Items[0].State != "prompt" {
+		t.Errorf("prompt must survive the cap (kept first): %+v", p.Items)
 	}
 }
 
@@ -99,11 +154,46 @@ func TestPayloadForIdleDecay(t *testing.T) {
 	sessions := []db.Session{claudeSession(7, "/a/ci-base", "idle", talk)}
 
 	p := PayloadFor(w, wins, sessions, now)
-	if len(p.Sessions) != 1 {
-		t.Fatalf("want 1 session: %+v", p)
+	if len(p.Items) != 1 {
+		t.Fatalf("want 1 row: %+v", p)
 	}
-	if s := p.Sessions[0]; s.State != "idle" || s.IdleAgo != "12m" || s.IdleLevel == 0 {
+	if s := p.Items[0]; s.State != "idle" || s.IdleAgo != "12m" || s.IdleLevel == 0 {
 		t.Fatalf("idle decay wrong: %+v", s)
+	}
+}
+
+// TestFmtAgoShapeDodgesRendererBugs pins the two renderer bugs the producer sides
+// around: idle_ago must be <integer><suffix> (pwetty-box-rs-00i — anything else
+// parses as a couple of minutes and renders as "just idled") and must stay ~3
+// chars or it paints over the folder name (pwetty-box-rs-9l7 — "120m" collides).
+func TestFmtAgoShapeDodgesRendererBugs(t *testing.T) {
+	cases := map[time.Duration]string{
+		-time.Minute:         "0m", // clock skew clamps, never a negative label
+		30 * time.Second:     "0m",
+		12 * time.Minute:     "12m",
+		59 * time.Minute:     "59m",
+		60 * time.Minute:     "1h", // NOT "60m"
+		120 * time.Minute:    "2h", // the pwetty-box-rs-9l7 collision case
+		23 * time.Hour:       "23h",
+		24 * time.Hour:       "1d", // NOT "24h"
+		3 * 24 * time.Hour:   "3d",
+		500 * 24 * time.Hour: "99d", // clamped: 4 chars would overrun the slot
+	}
+	for d, want := range cases {
+		got := fmtAgo(d)
+		if got != want {
+			t.Errorf("fmtAgo(%v) = %q, want %q", d, got, want)
+		}
+		if len(got) > 3 {
+			t.Errorf("fmtAgo(%v) = %q is longer than the 3-char slot", d, got)
+		}
+		suffix := got[len(got)-1]
+		if suffix != 'm' && suffix != 'h' && suffix != 'd' {
+			t.Errorf("fmtAgo(%v) = %q lacks an m/h/d suffix", d, got)
+		}
+		if _, err := strconv.Atoi(got[:len(got)-1]); err != nil {
+			t.Errorf("fmtAgo(%v) = %q is not <integer><suffix>", d, got)
+		}
 	}
 }
 
@@ -112,14 +202,21 @@ func TestPayloadForAppDesktop(t *testing.T) {
 	w := ws(1, "HDMI-A-1", 2, false)
 	wins := []niri.Window{win(15, 2, "org.keepassxc.KeePassXC", "Passbase")}
 	p := PayloadFor(w, wins, nil, now) // no tracked session
-	if p.IsClaude == nil || *p.IsClaude != false {
-		t.Fatalf("app desktop must set is_claude=false: %+v", p)
+	if len(p.Items) != 1 {
+		t.Fatalf("want 1 app row: %+v", p)
 	}
-	if p.App != "KeePassXC" { // reverse-DNS app_id cleaned to its last component
-		t.Errorf("app label = %q, want KeePassXC", p.App)
+	a := p.Items[0]
+	if a.Kind != KindApp {
+		t.Fatalf("windowless-of-sessions desktop must yield an app row: %+v", a)
 	}
-	if p.AppIcon == "" { // resolved to an svg path or the bundled "app" fallback
-		t.Errorf("app_icon should never be empty: %+v", p)
+	if a.App != "KeePassXC" { // reverse-DNS app_id cleaned to its last component
+		t.Errorf("app label = %q, want KeePassXC", a.App)
+	}
+	if a.AppIcon == "" { // resolved to an svg path or the bundled "app" fallback
+		t.Errorf("app_icon should never be empty: %+v", a)
+	}
+	if a.Title != "Passbase" {
+		t.Errorf("app row title = %q, want Passbase", a.Title)
 	}
 }
 
@@ -155,11 +252,14 @@ func TestIconCandidatesCoversReverseDNS(t *testing.T) {
 func TestPayloadForEmptyDesktop(t *testing.T) {
 	now := time.UnixMilli(1_000_000)
 	p := PayloadFor(ws(8, "HDMI-A-1", 80, true), nil, nil, now)
-	if len(p.Sessions) != 1 || !p.Active {
+	// A windowless desktop is a dimmed 1-row placeholder, never a 0-row items[]
+	// (the contract's minItems is 1); the real fix is the `empty` preset
+	// (claude-status-db-wsh).
+	if len(p.Items) != 1 || !p.Active {
 		t.Fatalf("empty desktop placeholder wrong: %+v", p)
 	}
-	if s := p.Sessions[0]; s.State != "idle" || s.IdleLevel == 0 || s.Folder != "" {
-		t.Fatalf("empty placeholder session wrong: %+v", s)
+	if s := p.Items[0]; s.Kind != KindSession || s.State != "idle" || s.IdleLevel == 0 || s.Folder != "" {
+		t.Fatalf("empty placeholder row wrong: %+v", s)
 	}
 }
 
@@ -176,8 +276,8 @@ func TestBuildAllKeysByOutputAndIdx(t *testing.T) {
 	if _, ok := all[Key("HDMI-A-1", 5)]; !ok {
 		t.Fatalf("missing HDMI-A-1:5 key; got %v", all)
 	}
-	if got := all[Key("HDMI-A-1", 5)]; len(got.Sessions) != 1 || got.Sessions[0].Folder != "repo" {
-		t.Errorf("HDMI-A-1:5 should be the claude tile: %+v", got)
+	if got := all[Key("HDMI-A-1", 5)]; len(got.Items) != 1 || got.Items[0].Folder != "repo" {
+		t.Errorf("HDMI-A-1:5 should be a single session row: %+v", got)
 	}
 	if _, ok := all[Key("eDP-1", 1)]; !ok {
 		t.Error("eDP-1:1 (empty) should still be present")
@@ -190,18 +290,26 @@ func TestPayloadForDeterministicWindowPick(t *testing.T) {
 	// Same two windows, opposite input orders (mimics randomized map iteration).
 	a := PayloadFor(w, []niri.Window{win(15, 2, "keepassxc", "KeePassXC"), win(9, 2, "firefox", "FF")}, nil, now)
 	b := PayloadFor(w, []niri.Window{win(9, 2, "firefox", "FF"), win(15, 2, "keepassxc", "KeePassXC")}, nil, now)
-	if a.App != b.App || a.Title != b.Title {
-		t.Fatalf("window pick not deterministic: %q/%q vs %q/%q", a.App, a.Title, b.App, b.Title)
+	if len(a.Items) != 2 || len(b.Items) != 2 {
+		t.Fatalf("two windows -> two app rows: %+v / %+v", a, b)
 	}
-	if a.App != "Firefox" { // lowest id (9) wins, label cleaned
-		t.Errorf("expected lowest-id window (Firefox), got %q", a.App)
+	for i := range a.Items {
+		if a.Items[i].App != b.Items[i].App || a.Items[i].Title != b.Items[i].Title {
+			t.Fatalf("row order not deterministic: %+v vs %+v", a.Items, b.Items)
+		}
+	}
+	if a.Items[0].App != "Firefox" { // lowest id (9) first, label cleaned
+		t.Errorf("expected lowest-id window (Firefox) first, got %q", a.Items[0].App)
 	}
 }
 
 func TestCacheRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tiles.json")
 	in := map[string]Payload{
-		Key("HDMI-A-1", 5): {Shortcut: 5, Sessions: []SessionTile{{State: "working", Folder: "repo"}}},
+		Key("HDMI-A-1", 5): {Shortcut: 5, Items: []Item{
+			{Kind: KindSession, State: "working", Folder: "repo"},
+			{Kind: KindApp, App: "Firefox", AppIcon: "app", Title: "FF"},
+		}},
 	}
 	if err := WriteCache(path, in); err != nil {
 		t.Fatalf("WriteCache: %v", err)
@@ -211,7 +319,13 @@ func TestCacheRoundTrip(t *testing.T) {
 		t.Fatalf("ReadCache: %v", err)
 	}
 	got := out[Key("HDMI-A-1", 5)]
-	if got.Shortcut != 5 || len(got.Sessions) != 1 || got.Sessions[0].State != "working" || got.Sessions[0].Folder != "repo" {
-		t.Errorf("round-trip mismatch: %+v", got)
+	if got.Shortcut != 5 || len(got.Items) != 2 {
+		t.Fatalf("round-trip mismatch: %+v", got)
+	}
+	if got.Items[0].Kind != KindSession || got.Items[0].State != "working" || got.Items[0].Folder != "repo" {
+		t.Errorf("session row lost in round-trip: %+v", got.Items[0])
+	}
+	if got.Items[1].Kind != KindApp || got.Items[1].App != "Firefox" || got.Items[1].AppIcon != "app" {
+		t.Errorf("app row lost in round-trip: %+v", got.Items[1])
 	}
 }
