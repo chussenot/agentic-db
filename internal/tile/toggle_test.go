@@ -12,6 +12,30 @@ func rows(winIDs ...int64) []Item {
 	return items
 }
 
+func TestCrossesOutput(t *testing.T) {
+	tests := []struct {
+		name          string
+		output        string
+		focusedOutput string
+		want          bool
+	}{
+		{"same output -> stay put", "HDMI-A-1", "HDMI-A-1", false},
+		{"laptop bar clicked while the desktop monitor has focus", "eDP-1", "HDMI-A-1", true},
+		{"desktop bar clicked while the laptop has focus", "HDMI-A-1", "eDP-1", true},
+		// niri unreachable: we don't know where we are, so don't gamble on a switch.
+		{"unknown focused output", "eDP-1", "", false},
+		{"unknown requested output", "", "HDMI-A-1", false},
+		{"both unknown", "", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := crossesOutput(tc.output, tc.focusedOutput); got != tc.want {
+				t.Errorf("crossesOutput(%q, %q) = %v, want %v", tc.output, tc.focusedOutput, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNextWindow(t *testing.T) {
 	tests := []struct {
 		name    string

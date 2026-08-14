@@ -45,10 +45,13 @@ func RunToggle(args []string) error {
 		idx = 0
 	}
 
-	// Not on this desktop yet -> the click is an ordinary jump. This is the common
-	// path and costs one niri call, same as before.
-	if !isFocusedDesktop(output, idx) {
-		return niri.FocusWorkspaceByIndex(idx)
+	// One workspace snapshot answers both questions a click raises: is this a jump
+	// or a flip, and — for a jump — which monitor we have to cross to get there.
+	focusedOutput, onTarget := desktopFocus(output, idx)
+
+	// Not on this desktop yet -> the click is an ordinary jump. The common path.
+	if !onTarget {
+		return jump(output, focusedOutput, idx)
 	}
 
 	// Already here: flip to the tile's other row. A cheap file read of the cache
@@ -56,36 +59,64 @@ func RunToggle(args []string) error {
 	// click must stay snappy.
 	tiles, err := ReadCache(CachePath(dbPath))
 	if err != nil {
-		return niri.FocusWorkspaceByIndex(idx)
+		return jump(output, focusedOutput, idx)
 	}
 	focused, err := niri.FocusedWindowID()
 	if err != nil {
-		return niri.FocusWorkspaceByIndex(idx)
+		return jump(output, focusedOutput, idx)
 	}
 	target, ok := nextWindow(tiles[Key(output, idx)].Items, int64(focused))
 	if !ok {
 		// Nothing to flip to (one focusable row, or none). Re-focusing the desktop
 		// we are already on is a no-op, which is the right answer.
-		return niri.FocusWorkspaceByIndex(idx)
+		return jump(output, focusedOutput, idx)
 	}
 	return niri.FocusWindow(int(target))
 }
 
-// isFocusedDesktop reports whether desktop idx on this output is the focused one.
-// Matching on (output, idx) rather than idx alone keeps the answer right when both
-// bars are up, since indexes repeat across outputs. A niri error answers "no",
-// which routes the click to the plain jump.
-func isFocusedDesktop(output string, idx int) bool {
+// desktopFocus returns the output that currently holds focus, and whether the
+// focused desktop is the one this tile stands for. Exactly one workspace is
+// focused, so "are we on the target" is just "is the focused one the target" —
+// which also answers correctly for a desktop that doesn't exist yet. A niri error
+// yields ("", false): treat the click as a jump, and don't try to cross outputs
+// when we don't know where we are.
+func desktopFocus(output string, idx int) (focusedOutput string, onTarget bool) {
 	all, err := niri.ListWorkspaces()
 	if err != nil {
-		return false
+		return "", false
 	}
 	for _, w := range all {
-		if w.Output == output && w.Idx == idx {
-			return w.IsFocused
+		if w.IsFocused {
+			focusedOutput = w.Output
+			onTarget = w.Output == output && w.Idx == idx
 		}
 	}
-	return false
+	return focusedOutput, onTarget
+}
+
+// jump is the plain desktop move a first click performs.
+//
+// niri resolves a bare workspace index against the FOCUSED output, and indexes
+// repeat across outputs, so `focus-workspace 3` from the eDP-1 bar while HDMI-A-1
+// holds focus would land on HDMI-A-1's desktop 3 — the wrong screen. Cross to the
+// requested output first when it isn't the focused one.
+//
+// A failed crossing is not fatal: niri already exits 0 and no-ops for a disabled
+// or absent output, and if some other niri ever errors instead, falling through to
+// the bare index is exactly what this did before crossing existed. Swallowing the
+// click would be worse than landing on the wrong output.
+func jump(output, focusedOutput string, idx int) error {
+	if crossesOutput(output, focusedOutput) {
+		_ = niri.FocusMonitor(output)
+	}
+	return niri.FocusWorkspaceByIndex(idx)
+}
+
+// crossesOutput reports whether reaching output means leaving the focused one.
+// An unknown focused output (niri unreachable) is never crossed from: without
+// knowing where we are, a monitor switch is as likely to be wrong as right.
+func crossesOutput(output, focusedOutput string) bool {
+	return output != "" && focusedOutput != "" && output != focusedOutput
 }
 
 // nextWindow picks the window a click should focus, given the tile's rows and the

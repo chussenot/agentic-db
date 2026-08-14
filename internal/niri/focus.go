@@ -38,11 +38,18 @@ func FocusWindow(id int) error {
 }
 
 // FocusWorkspaceByIndex runs `niri msg action focus-workspace <idx>`, the plain
-// desktop jump a tile click has always performed. Note niri resolves a bare index
-// against the FOCUSED output, so on a multi-output setup this can land on a
-// different output's desktop <idx> than the bar that was clicked; the reference
-// form takes an index or a name, never a workspace id, so there is no id-precise
-// alternative for the unnamed desktops.
+// desktop jump a tile click has always performed. niri resolves a bare index
+// against the FOCUSED output, and the reference form takes an index or a name but
+// never a workspace id, so there is no id-precise alternative for the unnamed
+// desktops — cross with FocusMonitor first to aim at another output's desktop.
 func FocusWorkspaceByIndex(idx int) error {
 	return runAction("focus-workspace", itoa(idx))
+}
+
+// FocusMonitor runs `niri msg action focus-monitor <output>`, moving focus to
+// another monitor. It is the missing half of aiming at a specific output's
+// desktop, since a bare workspace index only ever resolves on the focused output.
+// niri exits 0 and no-ops when the output is disabled or absent.
+func FocusMonitor(output string) error {
+	return runAction("focus-monitor", output)
 }
