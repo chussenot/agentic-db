@@ -72,6 +72,10 @@ func TestPayloadForDualSharedWindow(t *testing.T) {
 	if p.Items[0].Title != "ci-base" || p.Items[1].Title != "ci-base" {
 		t.Errorf("co-window sessions should share the window title: %+v", p.Items)
 	}
+	// …and its id, which is why tile-toggle sees ONE candidate here, not two.
+	if p.Items[0].WinID != 7 || p.Items[1].WinID != 7 {
+		t.Errorf("co-window sessions should share the window id: %+v", p.Items)
+	}
 }
 
 func TestPayloadForMixedSessionAndApp(t *testing.T) {
@@ -93,6 +97,10 @@ func TestPayloadForMixedSessionAndApp(t *testing.T) {
 	a := p.Items[1]
 	if a.Kind != KindApp || a.App != "Firefox" || a.Title != "JSON Schema anyOf — Mozilla Firefox" {
 		t.Fatalf("row 1 should be the Firefox app row: %+v", a)
+	}
+	// Both kinds carry the niri window a click should focus.
+	if p.Items[0].WinID != 7 || a.WinID != 9 {
+		t.Errorf("rows should carry their window ids (want 7, 9): %+v", p.Items)
 	}
 	if a.AppIcon == "" { // an svg path or the bundled "app" fallback, never empty
 		t.Errorf("app row needs an app_icon: %+v", a)
@@ -300,6 +308,22 @@ func TestPayloadForDeterministicWindowPick(t *testing.T) {
 	}
 	if a.Items[0].App != "Firefox" { // lowest id (9) first, label cleaned
 		t.Errorf("expected lowest-id window (Firefox) first, got %q", a.Items[0].App)
+	}
+}
+
+func TestPayloadForWindowlessSessionHasNoWinID(t *testing.T) {
+	// A session we never pinned to a niri window can't be focused, so its row must
+	// leave WinID at 0 — that's what makes `win_id,omitempty` mean "not focusable"
+	// rather than "window 0", and what keeps tile-toggle from focusing nothing.
+	now := time.UnixMilli(1_000_000)
+	s := claudeSession(0, "/a/detached", "working", 0)
+	s.WindowID = sql.NullInt64{} // never learned
+	p := PayloadFor(ws(4, "HDMI-A-1", 40, false), nil, []db.Session{s}, now)
+	if len(p.Items) != 1 {
+		t.Fatalf("want the lone session row, got %+v", p.Items)
+	}
+	if p.Items[0].WinID != 0 {
+		t.Errorf("windowless session must not claim a window: %+v", p.Items[0])
 	}
 }
 

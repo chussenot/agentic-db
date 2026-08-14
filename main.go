@@ -39,6 +39,7 @@ commands:
   repo-backfill backfill stored repos for historical sessions (one-off, idempotent)
   tile-data    emit pwetty claude-tile JSON for one niri desktop (--output)
   tile-watch   stream tile JSON for one desktop on change (pwetty stream:true)
+  tile-toggle  a tile click: jump to the desktop, or flip between its rows (--output)
 `
 
 func main() {
@@ -78,6 +79,8 @@ func main() {
 		err = tile.Run(args)
 	case "tile-watch":
 		err = tile.RunWatch(args)
+	case "tile-toggle":
+		err = tile.RunToggle(args)
 	default:
 		fmt.Fprintf(os.Stderr, "claude-status: unknown command %q\n\n", os.Args[1])
 		fmt.Fprint(os.Stderr, usage)

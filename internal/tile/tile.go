@@ -68,7 +68,7 @@ type Payload struct {
 // Kind is inferrable upstream from State vs App, but we send it explicitly: it
 // must agree with the body, and stating it keeps the daemon's tiles.json legible.
 // Two sessions sharing one niri window (e.g. two kitty tabs) share that window's
-// Title — niri exposes no per-tab title.
+// Title — niri exposes no per-tab title, and they share WinID for the same reason.
 type Item struct {
 	Kind      string `json:"kind"`
 	State     string `json:"state,omitempty"`      // session rows
@@ -79,6 +79,13 @@ type Item struct {
 	App       string `json:"app,omitempty"`        // app rows
 	AppIcon   string `json:"app_icon,omitempty"`   // app rows
 	Title     string `json:"title,omitempty"`      // both
+	// WinID is the niri window this row stands for — what `tile-toggle` focuses
+	// when the tile is clicked. The tile itself ignores it (pwetty's schema is
+	// additionalProperties, so an unknown key is inert), but shipping it in the
+	// same payload is what keeps a click and the painted rows from ever
+	// disagreeing. Omitted (0) when the row has no window to focus: a session
+	// whose WindowID we never learned.
+	WinID int64 `json:"win_id,omitempty"` // both
 }
 
 // The two row kinds, as the contract's `kind` discriminator spells them.
@@ -239,9 +246,13 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, now time.Tim
 	if len(rows) > maxItemsPerTile {
 		rows = rows[:maxItemsPerTile]
 	}
+	// The winID the sort just used as a tie-break is also what a click on this row
+	// should focus, so publish it rather than making tile-toggle re-derive it.
 	items := make([]Item, 0, len(rows))
 	for _, r := range rows {
-		items = append(items, r.item)
+		it := r.item
+		it.WinID = r.winID
+		items = append(items, it)
 	}
 	return items
 }
