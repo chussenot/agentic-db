@@ -14,9 +14,11 @@ import (
 	"flag"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
 	"github.com/mrzor/claude-status/internal/git"
 	"github.com/mrzor/claude-status/internal/niri"
@@ -44,6 +46,89 @@ var notifyPatterns = []string{
 // chain can never spin (the real tree is zsh -> claude -> zsh -> kitty ->
 // systemd, ~4 hops).
 const maxProcHops = 20
+
+// fleetNotifySep splits a FLEET notification — one a session receives ABOUT one of
+// its background agents — from an ordinary one. The full form is
+// "<agent-name> needs your input: <ask>", e.g.
+// "project-manager-3 needs your input: approve Bash: ls docs/…".
+//
+// These need their own path because they defeat the ordinary prompt filter twice
+// over: the ask usually contains "approve"/"confirm", so the pattern match fires,
+// and yet the RECEIVING session is not the blocked one — its agent is. Flipping the
+// receiver to Prompt would strand a session at "?" for work it cannot do anything
+// about from its own turn, while the agent that is actually waiting stays unmarked.
+const fleetNotifySep = " needs your input: "
+
+// Environment variables a Claude Code process exports to the children it spawns —
+// which includes hook processes, since a hook is a child of the session that fires
+// it. Verified on live children of both background and interactive sessions
+// (Claude Code 2.1.231).
+//
+// CLAUDE_PID is the pid of the Claude process that spawned THIS hook. Note it means
+// something different one level up: in a background session's own environment the
+// same variable names its SPAWNER (see package fleet). Read here, it is always
+// "my own Claude".
+//
+// CLAUDE_JOB_DIR is exported only by background sessions, so its presence is the
+// background marker and its basename is the job id. CLAUDE_CODE_SESSION_KIND and
+// CLAUDE_CODE_SESSION_NAME are NOT inherited by children — they exist only on the
+// background process itself — so the hook cannot read them and does not try; the
+// daemon picks the name up from the first-party status file instead.
+const (
+	envClaudePID = "CLAUDE_PID"
+	envJobDir    = "CLAUDE_JOB_DIR"
+)
+
+// lookupEnv is the environment seam, so tests can drive identity without setting
+// process-wide variables.
+var lookupEnv = os.Getenv
+
+// listWindows is the niri seam. It exists so a test can COUNT the calls: this
+// lookup spawns `niri msg -j windows`, and the hook is the hot path, so "how often
+// do we shell out" is a behaviour worth asserting rather than assuming.
+var listWindows = niri.ListWindows
+
+// selfIdentity is what the hook can learn about its own session for free, from its
+// own environment, with no file reads and no niri IPC.
+type selfIdentity struct {
+	// Kind is "bg", "interactive", or "" when the environment said nothing (an
+	// older Claude Code, or an unexpected spawn path).
+	Kind string
+	// JobID is set for background sessions only.
+	JobID string
+	// ClaudePID is this session's Claude process pid — NOT the terminal pid the
+	// window walk resolves. It is the liveness anchor for a session that has no
+	// window at all.
+	ClaudePID int
+	// ProcStart is ClaudePID's start time, so a recycled pid cannot later make a
+	// dead session look alive.
+	ProcStart string
+}
+
+// isBackground reports whether the environment identified this as a background
+// agent.
+func (i selfIdentity) isBackground() bool { return i.Kind == "bg" }
+
+// readSelfIdentity derives the session's identity from the hook's environment.
+func readSelfIdentity() selfIdentity {
+	var id selfIdentity
+	if dir := strings.TrimRight(lookupEnv(envJobDir), "/"); dir != "" {
+		id.JobID = filepath.Base(dir)
+		id.Kind = "bg"
+	}
+	if v := lookupEnv(envClaudePID); v != "" {
+		if pid, err := strconv.Atoi(v); err == nil && pid > 0 {
+			id.ClaudePID = pid
+			if start, ok := clauded.ProcStartOf(pid); ok {
+				id.ProcStart = start
+			}
+			if id.Kind == "" {
+				id.Kind = "interactive"
+			}
+		}
+	}
+	return id
+}
 
 // hookEvent is the tolerant decode of the hook JSON delivered on stdin. Unknown
 // fields are ignored so future Claude Code additions don't break the hook.
@@ -153,9 +238,38 @@ func run(r io.Reader, dbPath string, startPID int) error {
 		s.LastTalkTS = sql.NullInt64{Int64: now, Valid: true}
 	}
 
+	// Identity from our own environment: free, and the only way a windowless
+	// session can be told apart from an ssh/tmux one. Resolve-once, like the
+	// window and the repo, so the /proc read for ProcStart happens at most once
+	// per session. Upsert merges these with COALESCE, so nothing is lost if the
+	// daemon got there first.
+	self := readSelfIdentity()
+	if ev.HookEventName == "SessionStart" || !s.Kind.Valid || !s.ClaudePID.Valid {
+		if self.Kind != "" {
+			s.Kind = nullString(self.Kind)
+		}
+		if self.JobID != "" {
+			s.JobID = nullString(self.JobID)
+		}
+		if self.ClaudePID > 0 {
+			s.ClaudePID = sql.NullInt64{Int64: int64(self.ClaudePID), Valid: true}
+		}
+		if self.ProcStart != "" {
+			s.ClaudeProcStart = nullString(self.ProcStart)
+		}
+	}
+
 	// Window resolution: only on SessionStart, or lazily when an existing row
 	// never got a window_id (covers DB wipes / daemon restarts mid-session).
-	if ev.HookEventName == "SessionStart" || !s.WindowID.Valid {
+	//
+	// A background agent is skipped outright. It has no terminal, so the walk can
+	// only ever end at the background supervisor — and because the lazy branch
+	// retries whenever window_id is NULL, which for an agent is FOREVER, the walk
+	// was re-running on every single hook. resolveWindow spawns `niri msg -j
+	// windows`, so a seven-agent colony streaming PostToolUse was generating a
+	// continuous stream of pointless niri IPC. Skipping it is both correct and the
+	// cheapest performance fix in this file.
+	if !self.isBackground() && (ev.HookEventName == "SessionStart" || !s.WindowID.Valid) {
 		if winID, termPID, ok := resolveWindow(startPID); ok {
 			s.WindowID = sql.NullInt64{Int64: int64(winID), Valid: true}
 			s.TerminalPID = sql.NullInt64{Int64: int64(termPID), Valid: true}
@@ -183,13 +297,22 @@ func run(r io.Reader, dbPath string, startPID int) error {
 	// but only permission/idle messages actually qualify (see notifyPatterns).
 	prevState := s.State
 	if ev.HookEventName == "Notification" {
-		// A Notification means "Claude wants the user" but covers two cases: a
-		// permission/approval request (a genuine prompt) and the post-Stop idle
-		// nudge. Distinguish them by BOTH the message (permission patterns) AND the
-		// current state: a real permission request only happens mid-work, so a
-		// matching message while the session is idle is the nudge and must NOT
-		// strand it at a non-decaying "?". See notifyPatterns.
-		matched := isPromptNotification(ev.Message) && prevState != string(state.Idle)
+		// A Notification means "Claude wants the user" but covers three cases: a
+		// permission/approval request (a genuine prompt), the post-Stop idle
+		// nudge, and a FLEET notification about one of this session's background
+		// agents. Distinguish the first two by BOTH the message (permission
+		// patterns) AND the current state: a real permission request only happens
+		// mid-work, so a matching message while the session is idle is the nudge
+		// and must NOT strand it at a non-decaying "?". See notifyPatterns.
+		//
+		// The fleet case is excluded from `matched` entirely: the ask it carries
+		// would match the patterns, but the session receiving it is the WATCHER,
+		// not the blocked party. It is attributed to the agent instead, below.
+		agentName, ask, isFleet := parseFleetNotification(ev.Message)
+		if isFleet {
+			attributeFleetNotification(database, ev.SessionID, agentName, ask, now)
+		}
+		matched := !isFleet && isPromptNotification(ev.Message) && prevState != string(state.Idle)
 		if matched {
 			s.NotifyKind = nullString("prompt")
 		}
@@ -219,6 +342,62 @@ func run(r io.Reader, dbPath string, startPID int) error {
 	_ = database.InsertEvent(evt)
 
 	return database.Upsert(s)
+}
+
+// parseFleetNotification splits "<agent-name> needs your input: <ask>". ok is
+// false for any other message, including one where either half is empty.
+func parseFleetNotification(message string) (name, ask string, ok bool) {
+	name, ask, ok = strings.Cut(message, fleetNotifySep)
+	if !ok {
+		return "", "", false
+	}
+	name, ask = strings.TrimSpace(name), strings.TrimSpace(ask)
+	if name == "" || ask == "" {
+		return "", "", false
+	}
+	// The name is a session name, not prose: a message that merely happens to
+	// contain the separator mid-sentence is not a fleet notification.
+	if strings.ContainsAny(name, " \t") {
+		return "", "", false
+	}
+	return name, ask, true
+}
+
+// attributeFleetNotification records a fleet notification against the AGENT it is
+// about, rather than against the session that received it.
+//
+// Two things are written, both best-effort (an attribution failure must never fail
+// the hook):
+//
+//   - the agent's console edge, i.e. "this session was told you need input". That
+//     is the desktop a human would go to in order to answer, and it is genuinely
+//     not the same session that spawned the fleet: on the machine this was built
+//     for, a fleet spawned from one desktop was being watched from another, whose
+//     tile cheerfully reported 19h idle.
+//   - an audit row keyed to the AGENT, so `events --session <agent>` finally shows
+//     which agent asked and what for. Before this, the ask was recorded only
+//     against the watcher with matched=false, and the agent's own log said nothing.
+//
+// The agent's own state is deliberately left alone: its first-party status file and
+// its job's `needs` already describe what it wants, and those are durable, whereas
+// a notification is a one-shot event that a later PostToolUse would clobber.
+func attributeFleetNotification(database *db.DB, receiverID, agentName, ask string, now int64) {
+	agent, found, err := database.GetByName(agentName)
+	if err != nil || !found || agent.SessionID == receiverID {
+		return
+	}
+	_, _ = database.SetIdentity(agent.SessionID, db.Identity{
+		ConsoleSessionID: &receiverID,
+		ConsoleTS:        &now,
+	})
+	_ = database.InsertEvent(db.Event{
+		TS:        now,
+		SessionID: agent.SessionID,
+		Event:     "FleetNotification",
+		Message:   nullString(truncate(ask, 300)),
+		Matched:   sql.NullBool{Bool: true, Valid: true},
+		NewState:  "unchanged",
+	})
 }
 
 // truncate caps a string at n bytes (Notification messages can be long; the
@@ -259,7 +438,7 @@ func resolveWindow(startPID int) (windowID, terminalPID int, ok bool) {
 	if len(ancestors) == 0 {
 		return 0, 0, false
 	}
-	windows, err := niri.ListWindows()
+	windows, err := listWindows()
 	if err != nil || len(windows) == 0 {
 		return 0, 0, false
 	}

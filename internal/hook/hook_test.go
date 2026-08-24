@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/niri"
 	"github.com/mrzor/claude-status/internal/state"
 )
 
@@ -478,3 +479,275 @@ func TestLogErrorNilIsNoop(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// stubEnv installs a fake environment for the hook's identity read.
+func stubEnv(t *testing.T, vars map[string]string) {
+	t.Helper()
+	prev := lookupEnv
+	lookupEnv = func(key string) string { return vars[key] }
+	t.Cleanup(func() { lookupEnv = prev })
+}
+
+func TestBackgroundIdentityFromEnv(t *testing.T) {
+	fixedClock(t, time.UnixMilli(1786714000000))
+	path := tempDBPath(t)
+	// A background agent's hook: CLAUDE_JOB_DIR is present, CLAUDE_PID names its
+	// own Claude process. Using our own pid means ProcStart is really readable.
+	stubEnv(t, map[string]string{
+		"CLAUDE_JOB_DIR": "/home/e/.claude/jobs/44644cdb",
+		"CLAUDE_PID":     strconv.Itoa(os.Getpid()),
+	})
+	drive(t, path, `{"session_id":"bg-1","hook_event_name":"SessionStart","cwd":"/repo"}`)
+
+	s, found := getRow(t, path, "bg-1")
+	if !found {
+		t.Fatal("row not created")
+	}
+	if s.Kind.String != "bg" {
+		t.Errorf("kind = %+v, want bg", s.Kind)
+	}
+	if s.JobID.String != "44644cdb" {
+		t.Errorf("job_id = %+v, want 44644cdb", s.JobID)
+	}
+	if s.ClaudePID.Int64 != int64(os.Getpid()) {
+		t.Errorf("claude_pid = %+v, want our own pid", s.ClaudePID)
+	}
+	if !s.ClaudeProcStart.Valid || s.ClaudeProcStart.String == "" {
+		t.Errorf("claude_proc_start = %+v, want the pid's start time", s.ClaudeProcStart)
+	}
+	if !s.IsBackground() {
+		t.Error("IsBackground() = false for a row built from a bg environment")
+	}
+}
+
+func TestInteractiveIdentityFromEnv(t *testing.T) {
+	fixedClock(t, time.UnixMilli(1786714000000))
+	path := tempDBPath(t)
+	// No CLAUDE_JOB_DIR: an interactive session's hook sees only CLAUDE_PID.
+	stubEnv(t, map[string]string{"CLAUDE_PID": strconv.Itoa(os.Getpid())})
+	drive(t, path, `{"session_id":"int-1","hook_event_name":"SessionStart","cwd":"/repo"}`)
+
+	s, _ := getRow(t, path, "int-1")
+	if s.Kind.String != "interactive" {
+		t.Errorf("kind = %+v, want interactive", s.Kind)
+	}
+	if s.JobID.Valid {
+		t.Errorf("job_id = %+v, want NULL for an interactive session", s.JobID)
+	}
+	if s.IsBackground() {
+		t.Error("an interactive row must not read as background")
+	}
+}
+
+// An environment that says nothing (older Claude Code, unexpected spawn path)
+// must behave exactly as before: identity NULL, everything else unchanged.
+func TestNoEnvIdentityLeavesColumnsNull(t *testing.T) {
+	fixedClock(t, time.UnixMilli(1786714000000))
+	path := tempDBPath(t)
+	stubEnv(t, map[string]string{})
+	drive(t, path, `{"session_id":"s","hook_event_name":"SessionStart","cwd":"/repo"}`)
+
+	s, found := getRow(t, path, "s")
+	if !found {
+		t.Fatal("row not created")
+	}
+	if s.Kind.Valid || s.JobID.Valid || s.ClaudePID.Valid || s.ClaudeProcStart.Valid {
+		t.Errorf("identity should be NULL with an empty environment: %+v", s)
+	}
+	if s.State != string(state.Idle) {
+		t.Errorf("state = %q, want idle (unchanged behaviour)", s.State)
+	}
+}
+
+// A background agent has no terminal, so the window walk can only ever find the
+// supervisor — and the lazy retry would re-run it on EVERY hook forever, each time
+// spawning `niri msg`. It must be skipped outright.
+func TestBackgroundSkipsWindowResolution(t *testing.T) {
+	fixedClock(t, time.UnixMilli(1786714000000))
+	path := tempDBPath(t)
+	stubEnv(t, map[string]string{"CLAUDE_JOB_DIR": "/home/e/.claude/jobs/j"})
+
+	calls := 0
+	prev := listWindows
+	listWindows = func() ([]niri.Window, error) {
+		calls++
+		return nil, nil
+	}
+	t.Cleanup(func() { listWindows = prev })
+
+	for _, ev := range []string{"SessionStart", "PostToolUse", "PostToolUse", "Stop"} {
+		drive(t, path, `{"session_id":"bg-1","hook_event_name":"`+ev+`","cwd":"/repo"}`)
+	}
+	if calls != 0 {
+		t.Errorf("niri was queried %d times for a background agent; want 0", calls)
+	}
+	s, _ := getRow(t, path, "bg-1")
+	if s.WindowID.Valid {
+		t.Errorf("window_id = %+v, want NULL", s.WindowID)
+	}
+}
+
+// An interactive session still resolves its window (and still retries lazily).
+func TestInteractiveStillResolvesWindow(t *testing.T) {
+	fixedClock(t, time.UnixMilli(1786714000000))
+	path := tempDBPath(t)
+	stubEnv(t, map[string]string{"CLAUDE_PID": strconv.Itoa(os.Getpid())})
+
+	calls := 0
+	prev := listWindows
+	listWindows = func() ([]niri.Window, error) {
+		calls++
+		return nil, nil
+	}
+	t.Cleanup(func() { listWindows = prev })
+
+	drive(t, path, `{"session_id":"int-1","hook_event_name":"SessionStart","cwd":"/repo"}`)
+	if calls == 0 {
+		t.Error("an interactive session should still attempt window resolution")
+	}
+}
+
+func TestParseFleetNotification(t *testing.T) {
+	cases := []struct {
+		msg      string
+		wantName string
+		wantAsk  string
+		wantOK   bool
+	}{
+		{
+			msg:      "project-manager-3 needs your input: approve Bash: ls docs/ | head -40",
+			wantName: "project-manager-3",
+			wantAsk:  "approve Bash: ls docs/ | head -40",
+			wantOK:   true,
+		},
+		{
+			msg:      "project-manager-helpdesk needs your input: answer: The recruiter question",
+			wantName: "project-manager-helpdesk",
+			wantAsk:  "answer: The recruiter question",
+			wantOK:   true,
+		},
+		// An ordinary permission prompt for the session itself.
+		{msg: "Claude needs your permission to use Bash", wantOK: false},
+		{msg: "waiting for your input", wantOK: false},
+		// Prose that happens to contain the separator is not a fleet notification:
+		// the name half must look like a session name.
+		{msg: "the agent over there needs your input: something", wantOK: false},
+		{msg: " needs your input: nothing", wantOK: false},
+		{msg: "someone needs your input: ", wantOK: false},
+	}
+	for _, c := range cases {
+		name, ask, ok := parseFleetNotification(c.msg)
+		if ok != c.wantOK {
+			t.Errorf("parseFleetNotification(%q) ok = %v, want %v", c.msg, ok, c.wantOK)
+			continue
+		}
+		if ok && (name != c.wantName || ask != c.wantAsk) {
+			t.Errorf("parseFleetNotification(%q) = (%q, %q), want (%q, %q)",
+				c.msg, name, ask, c.wantName, c.wantAsk)
+		}
+	}
+}
+
+func TestFleetNotificationAttributedToChildNotReceiver(t *testing.T) {
+	ts := fixedClock(t, time.UnixMilli(1786714000000))
+	path := tempDBPath(t)
+
+	// The agent exists and is known by name (as the daemon or its own hook would
+	// have recorded).
+	stubEnv(t, map[string]string{"CLAUDE_JOB_DIR": "/home/e/.claude/jobs/44644cdb"})
+	drive(t, path, `{"session_id":"agent-1","hook_event_name":"SessionStart","cwd":"/repo/wt"}`)
+	database, err := db.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	name := "project-manager-3"
+	if _, err := database.SetIdentity("agent-1", db.Identity{SessionName: &name}); err != nil {
+		t.Fatalf("SetIdentity: %v", err)
+	}
+	database.Close()
+
+	// The watcher is mid-turn, so the ordinary prompt filter WOULD have fired on
+	// this message ("approve") if the fleet path did not intercept it.
+	stubEnv(t, map[string]string{"CLAUDE_PID": strconv.Itoa(os.Getpid())})
+	drive(t, path, `{"session_id":"watcher","hook_event_name":"UserPromptSubmit","cwd":"/repo"}`)
+	drive(t, path, `{"session_id":"watcher","hook_event_name":"Notification",
+		"message":"project-manager-3 needs your input: approve Bash: rm -rf nothing","cwd":"/repo"}`)
+
+	// The watcher must NOT be flipped to prompt: it is not the blocked party.
+	w, _ := getRow(t, path, "watcher")
+	if w.State != string(state.Working) {
+		t.Errorf("watcher state = %q, want working (a fleet notification is not its own prompt)", w.State)
+	}
+	if w.NotifyKind.Valid {
+		t.Errorf("watcher notify_kind = %+v, want NULL", w.NotifyKind)
+	}
+
+	// The agent gets the console edge, pointing at the watcher.
+	a, _ := getRow(t, path, "agent-1")
+	if a.ConsoleSessionID.String != "watcher" {
+		t.Errorf("agent console = %+v, want watcher", a.ConsoleSessionID)
+	}
+	if a.ConsoleTS.Int64 != ts {
+		t.Errorf("agent console_ts = %+v, want %d", a.ConsoleTS, ts)
+	}
+	// The agent's own state is left alone: its status file and its job's `needs`
+	// are the durable signals, a notification is one-shot.
+	if a.State != string(state.Idle) {
+		t.Errorf("agent state = %q, want idle (untouched)", a.State)
+	}
+
+	// And the ask is now in the AGENT's audit log, not only the watcher's.
+	var fleetRows int
+	for _, e := range recentEvents(t, path) {
+		if e.Event == "FleetNotification" {
+			fleetRows++
+			if e.SessionID != "agent-1" {
+				t.Errorf("FleetNotification recorded against %q, want agent-1", e.SessionID)
+			}
+			if e.Message.String != "approve Bash: rm -rf nothing" {
+				t.Errorf("FleetNotification message = %q", e.Message.String)
+			}
+		}
+	}
+	if fleetRows != 1 {
+		t.Errorf("got %d FleetNotification rows, want 1", fleetRows)
+	}
+}
+
+// An unresolvable agent name must be harmless: no stamp, no event, no error.
+func TestFleetNotificationWithUnknownAgentIsHarmless(t *testing.T) {
+	fixedClock(t, time.UnixMilli(1786714000000))
+	path := tempDBPath(t)
+	stubEnv(t, map[string]string{})
+	drive(t, path, `{"session_id":"watcher","hook_event_name":"UserPromptSubmit","cwd":"/repo"}`)
+	drive(t, path, `{"session_id":"watcher","hook_event_name":"Notification",
+		"message":"who-is-this needs your input: approve something","cwd":"/repo"}`)
+
+	w, _ := getRow(t, path, "watcher")
+	if w.State != string(state.Working) {
+		t.Errorf("watcher state = %q, want working", w.State)
+	}
+	for _, e := range recentEvents(t, path) {
+		if e.Event == "FleetNotification" {
+			t.Errorf("unexpected FleetNotification row for an unknown agent: %+v", e)
+		}
+	}
+}
+
+// A session's own permission prompt must keep behaving exactly as before.
+func TestOwnPermissionPromptStillFlipsToPrompt(t *testing.T) {
+	fixedClock(t, time.UnixMilli(1786714000000))
+	path := tempDBPath(t)
+	stubEnv(t, map[string]string{})
+	drive(t, path, `{"session_id":"s","hook_event_name":"UserPromptSubmit","cwd":"/repo"}`)
+	drive(t, path, `{"session_id":"s","hook_event_name":"Notification",
+		"message":"Claude needs your permission to use Bash","cwd":"/repo"}`)
+
+	s, _ := getRow(t, path, "s")
+	if s.State != string(state.Prompt) {
+		t.Errorf("state = %q, want prompt", s.State)
+	}
+	if s.NotifyKind.String != "prompt" {
+		t.Errorf("notify_kind = %+v, want prompt", s.NotifyKind)
+	}
+}
