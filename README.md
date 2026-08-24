@@ -35,9 +35,10 @@ niri window model and drives two renderers:
 | `daemon` | Long-lived reconciler. Watches the DB + niri event stream and sets/unsets workspace names. |
 | `install` | Idempotently merge our hooks into `~/.claude/settings.json`, add the `claude-resume` block to `.zshrc`, and print niri/waybar setup fragments. `--no-shell` skips the `.zshrc` edit; `--zshrc <path>` overrides its location. |
 | `uninstall` | Remove only our hook entries and the `.zshrc` block. `--purge` also drops the state dir + DB; `--no-shell` leaves the `.zshrc` block. |
-| `gc` | Run the dead-session reap pass once and report reaped rows. |
+| `gc` | Run the dead-session reap pass once and report reaped rows. `--orphans` instead sweeps windowless rows Claude Code no longer lists (dry run; `--yes` deletes, `--orphan-age` sets the floor). |
 | `gen-waybar` | Emit paste-ready waybar `format-icons` JSON and `style.css` fragments. |
 | `doctor` | Dump the DB schema/rows and the live niri windows list (debugging). |
+| `fleet` | Show background agents, who owns them, what they are waiting on, and each session's own-vs-fleet idle age. `--json`, `--cross-check` (diff against `claude agents --json`). |
 | `events` | Print the audit log (one row per hook), newest first. `--session <id>`, `--limit N`. |
 | `recap` | Summarize a time window of Claude sessions (topics, effort, streaks, metrics). `--period day\|week\|quarter`, `--since`, `--json`, `--metrics full\|none\|only`. |
 | `recap-prompt` | Emit the LLM instructions that turn a recap into a written report. `--period`. |
@@ -45,6 +46,84 @@ niri window model and drives two renderers:
 | `repo-backfill` | One-off, idempotent pass that backfills stored git repos for historical sessions (so old rows resolve in recap project metrics). |
 | `tile-data` | Emit the pwetty `claude`-tile JSON for one niri desktop, keyed by its per-output workspace index. Reads the daemon's precomputed tile cache (falls back to a live build when no daemon is up); always prints valid JSON. `--output` overrides the niri connector. |
 | `tile-watch` | Like `tile-data` but streams the payload for one desktop on every change (for a pwetty `stream: true` module) instead of printing once. |
+
+## Background agents
+
+Everything above assumes a session lives in a terminal window. Background agents do
+not, and that breaks enough assumptions to be worth spelling out.
+
+Two different things get called "background":
+
+- a **background session** — `claude --bg`, a `/`-command, a colony dispatch. Its own
+  process, its own `session_id`, and it fires all our hooks, so it has always had a
+  row. What it does not have is a terminal: `window_id` and `terminal_pid` are
+  permanently NULL, and those are the axes the glyphs, the tiles and the reap logic
+  are built on.
+- an **in-process task** — the `Agent`, `Monitor` and backgrounded `Bash` tools. No
+  process and no session id at all. Tracked only as a background session's in-flight
+  count today; for interactive parents it is not yet tracked (see the beads).
+
+A background session announces itself in `~/.claude/sessions/<pid>.json` with
+`kind: "bg"` and a `jobId`, which keys a much richer record at
+`~/.claude/jobs/<jobId>/state.json`: lifecycle, a human `detail` line, in-flight
+tasks, and `needs` — verbatim what it is waiting on from you. `internal/fleet` reads
+those (mtime-gated, and only for sessions the status files prove alive, because dead
+job directories linger on disk for months).
+
+**`needs` is the signal, not the lifecycle.** A job reports `working|blocked|done`,
+but "blocked" covers both "blocked on you" and "blocked on another agent". Only a
+non-empty `needs` means a person is required — and on a live colony, two agents
+asking a question ("confirm: …", "A or B") had a completely EMPTY first-party
+`waitingFor`, so keying on the status file alone loses those asks.
+
+**Two ownership edges, tracked separately**, because they are demonstrably different
+sessions:
+
+- `owner_session_id` — who spawned the fleet, from `CLAUDE_PID` in the agent's own
+  environment. (Caveat: agents are claimed from a pre-forked spare pool, so this
+  names the fleet ROOT, not the immediate parent. Good for "whose fleet is this",
+  useless for "which agent spawned which".) When the spawner has exited — agents
+  outlive their parent — attribution re-homes on the job's parent checkout.
+- `console_session_id` — who was last told an agent needs input, from the
+  `<agent> needs your input: <ask>` notifications. That is the desktop you would
+  actually walk to. On the machine this was built for, a fleet spawned from one
+  desktop was being watched from another, whose tile cheerfully read 19h idle.
+
+Which explains the other trap: **a parent's own status file freezes while its
+children work**, because its main loop is suspended on them. So `last_talk_ts` says
+"19 hours" while six agents are mid-flight. `claude-status fleet` prints both
+numbers side by side:
+
+```sh
+claude-status fleet          # OWN_IDLE vs FLEET_IDLE per session, plus every agent
+claude-status fleet --json   # same, for tooling
+```
+
+### On the tile
+
+A third kind of desktop turned out to matter most: the one running `claude agents`.
+That window is a **dashboard, not a conversation**, so describing it by its host
+session was the worst reading of all — the session can be a day idle while eleven
+agents move in front of you. A console is detected from the view's own title
+(`… · claude agents`) and the daemon keeps that marker **sticky** per window, because
+the view retitles its terminal to the focused agent as you scroll; deriving it from
+the current title alone makes the desktop flip back to "idle 22h" mid-navigation.
+
+So a desktop gets a fleet row when it is a console (showing every agent on the
+machine — the view is machine-wide) or when its session spawned agents (showing its
+own). A console row *replaces* the host session's row; an owner row sits beside the
+conversation. A console suppresses owned rows on the same desktop, since the whole set
+already contains them.
+
+The row is deliberately a **valid session row** carrying an additive `fleet` object:
+the contract's `kind` is a closed enum and rows are discriminated by `state`, so a
+`kind: "fleet"` row would be schema-invalid and might not paint. Its `state` is
+truthful — `prompt` when any agent waits on you (which is what pulses the tile),
+`working`, `shell` for a fleet blocked on itself, else `idle` aged on the *fleet's*
+newest activity. A fleet-unaware template therefore renders it sanely today; drawing
+the bead strip is `claude-status-db-7d8.2` in pwetty-box-rs.
+
+The workspace-name glyphs are **not** fed and won't be: those dots are dead config.
 
 ## Resume a dead session
 
@@ -172,11 +251,12 @@ internal/db          SQLite layer (schema, Session, Open/Upsert/LoadLive/...)
 internal/niri        niri IPC: ListWindows + event-stream client + window/workspace model
 internal/hook        hook subcommand (state derivation, /proc->window resolution, audit row)
 internal/clauded     reads Claude Code's first-party per-session status files (busy/idle/waiting)
+internal/fleet       reads background-agent job records; ownership + fleet roll-up
 internal/daemon      daemon subcommand (reconciler: aggregate, slots, decay, GC, tile cache)
 internal/tile        tile-data/tile-watch subcommands: pwetty tile payload model + cache
 internal/waybar      gen-waybar subcommand (format-icons + style.css generator)
 internal/install     install/uninstall subcommands (settings.json hook merge)
-internal/doctor      doctor + gc + events subcommands
+internal/doctor      doctor + fleet + gc + events subcommands
 internal/recap       recap/recap-prompt/repo-backfill subcommands (digest + LLM instructions)
 internal/transcript  reads session transcripts (ai-title, opening prompt, cwd)
 internal/git         best-effort git CLI wrapper for recap project metrics
