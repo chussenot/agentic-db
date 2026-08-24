@@ -55,6 +55,17 @@ var procExists = func(pid int) bool {
 // until SessionEnd deletes the row on a clean exit, or until first-party absence
 // confirms the process is gone. last_seen_ts remains in the schema purely as a
 // heartbeat/debug field, not a reap trigger.
+// A fourth signal, added with background awareness: claude_pid. A background agent
+// has no window and no terminal pid, so the first two checks above can never fire
+// for it — which is exactly why dead background rows used to accumulate forever
+// (two leaked in a single afternoon, both confirmed settled in the supervisor's own
+// log). claude_pid is the Claude PROCESS, recorded by the hook from its own
+// environment, so it is a window-independent liveness check that works for
+// background agents, ssh and tmux alike. It is paired with claude_proc_start: a pid
+// that exists but started at a different time is a DIFFERENT process that reused
+// the number, which matters here because background agents are claimed from a
+// pre-forked spare pool and pids churn fast. This one needs no debounce — pid plus
+// start time is unambiguous.
 func deadPredicate(model windowPresence, fpDead map[string]bool) func(db.Session) bool {
 	return func(s db.Session) bool {
 		if s.WindowID.Valid && !model.HasWindow(int(s.WindowID.Int64)) {
@@ -63,11 +74,39 @@ func deadPredicate(model windowPresence, fpDead map[string]bool) func(db.Session
 		if s.TerminalPID.Valid && !procExists(int(s.TerminalPID.Int64)) {
 			return true
 		}
+		if claudeProcessGone(s) {
+			return true
+		}
 		if fpDead[s.SessionID] {
 			return true
 		}
 		return false
 	}
+}
+
+// procStartOf is the process-start-time seam (stubbable in tests), mirroring the
+// procExists seam beside it.
+var procStartOf = clauded.ProcStartOf
+
+// claudeProcessGone reports whether the row's Claude process is provably gone. It
+// is deliberately conservative: an unrecorded pid, or a start time we cannot read,
+// yields false — "no evidence of death" rather than a guess.
+func claudeProcessGone(s db.Session) bool {
+	if !s.ClaudePID.Valid || s.ClaudePID.Int64 <= 0 {
+		return false
+	}
+	pid := int(s.ClaudePID.Int64)
+	if !procExists(pid) {
+		return true
+	}
+	if !s.ClaudeProcStart.Valid || s.ClaudeProcStart.String == "" {
+		return false
+	}
+	live, ok := procStartOf(pid)
+	if !ok {
+		return false
+	}
+	return live != s.ClaudeProcStart.String
 }
 
 // firstPartyDead folds this tick's first-party observation into the daemon's
@@ -102,8 +141,15 @@ func (d *daemon) firstPartyDead(sessions []db.Session, fp map[string]clauded.Ses
 	seen := make(map[string]bool, len(sessions))
 	var dead map[string]bool
 	for _, s := range sessions {
-		if !s.WindowID.Valid {
-			continue // non-local: no first-party file expected, never tracked
+		// A row with no window is normally untracked here (remote/ssh/tmux have no
+		// local first-party file by design, so their absence proves nothing). A
+		// BACKGROUND AGENT is the exception: it has no window either, but it does
+		// write a first-party file, so its absence is the same evidence of death
+		// that a windowed session's is. Note the test is POSITIVE identification
+		// (kind/job_id), never "has no window" — otherwise this would start reaping
+		// the ssh sessions it is meant to protect.
+		if !s.WindowID.Valid && !s.IsBackground() {
+			continue
 		}
 		seen[s.SessionID] = true
 		if _, live := fp[s.SessionID]; live {

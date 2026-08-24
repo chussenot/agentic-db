@@ -1,0 +1,284 @@
+package daemon
+
+import (
+	"database/sql"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/mrzor/claude-status/internal/clauded"
+	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/fleet"
+	"github.com/mrzor/claude-status/internal/niri"
+	"github.com/mrzor/claude-status/internal/state"
+)
+
+// fleetHarness builds a daemon over a temp DB and a job-record fixture.
+func fleetHarness(t *testing.T, jobs map[string]string) (*daemon, string) {
+	t.Helper()
+	root := t.TempDir()
+	jobsDir := filepath.Join(root, "jobs")
+	for id, body := range jobs {
+		dir := filepath.Join(jobsDir, id)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(body), 0o600); err != nil {
+			t.Fatalf("write job: %v", err)
+		}
+	}
+	dbPath := filepath.Join(root, "claude.sqlite")
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	return &daemon{
+		db:           database,
+		fleetReader:  fleet.NewReader(jobsDir),
+		owners:       fleet.NewOwnerResolver(),
+		identified:   map[string]identityRecord{},
+		lastFleetLog: map[string]string{},
+	}, dbPath
+}
+
+func bgFP(id, name, jobID string, pid int, status clauded.Status, needsPrompt bool) clauded.Session {
+	s := clauded.Session{
+		SessionID: id, Name: name, JobID: jobID, PID: pid, ProcStart: "1",
+		Kind: clauded.KindBackground, Status: status,
+		StatusUpdatedAt: time.UnixMilli(1786714000000), UpdatedAt: time.UnixMilli(1786714000000),
+	}
+	if needsPrompt {
+		s.WaitingFor = "permission prompt"
+	}
+	return s
+}
+
+func TestTickFleetPersistsIdentityOnceAndPrunes(t *testing.T) {
+	d, _ := fleetHarness(t, map[string]string{
+		"job1": `{"state":"working","tempo":"active","cwd":"/repo","name":"pm-3","sessionId":"bg-1"}`,
+	})
+	// The owner row exists (a hook created it) and so does the agent's.
+	for _, row := range []db.Session{
+		{SessionID: "owner-1", State: string(state.Idle), LastSeenTS: 1, CreatedTS: 1},
+		{SessionID: "bg-1", State: string(state.Working), LastSeenTS: 1, CreatedTS: 1},
+	} {
+		if err := d.db.Upsert(row); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+	d.sessions, _ = d.db.LoadLive()
+
+	fp := map[string]clauded.Session{
+		"owner-1": {SessionID: "owner-1", Name: "project-manager-f4", PID: 100, ProcStart: "1",
+			Kind: clauded.KindInteractive, Cwd: "/repo", Status: clauded.Idle},
+		"bg-1": bgFP("bg-1", "pm-3", "job1", 200, clauded.Busy, false),
+	}
+
+	d.tickFleet(fp)
+
+	// The agent's name — which the hook can never see — is now persisted, along
+	// with its kind, job and owner.
+	got, found, err := d.db.Get("bg-1")
+	if err != nil || !found {
+		t.Fatalf("get bg-1: found=%v err=%v", found, err)
+	}
+	if got.SessionName.String != "pm-3" || got.Kind.String != "bg" || got.JobID.String != "job1" {
+		t.Errorf("identity not persisted: %+v", got)
+	}
+	if got.OwnerSessionID.String != "owner-1" {
+		t.Errorf("owner = %+v, want owner-1 (re-homed on the job's cwd)", got.OwnerSessionID)
+	}
+	// The interactive session gets its name too — useful to recap, and free here.
+	owner, _, _ := d.db.Get("owner-1")
+	if owner.SessionName.String != "project-manager-f4" {
+		t.Errorf("owner name = %+v", owner.SessionName)
+	}
+
+	// A steady state writes nothing more.
+	if len(d.identified) != 2 {
+		t.Fatalf("identified = %d entries, want 2", len(d.identified))
+	}
+	before := d.identified["bg-1"]
+	for range 5 {
+		d.tickFleet(fp)
+	}
+	if d.identified["bg-1"] != before {
+		t.Errorf("identity record churned across ticks: %+v -> %+v", before, d.identified["bg-1"])
+	}
+
+	// When the agent goes away, its bookkeeping goes with it.
+	delete(fp, "bg-1")
+	d.tickFleet(fp)
+	if _, still := d.identified["bg-1"]; still {
+		t.Error("identity bookkeeping should be pruned once the session is gone")
+	}
+}
+
+func TestTickFleetComputesRollup(t *testing.T) {
+	d, _ := fleetHarness(t, map[string]string{
+		"job1": `{"state":"working","tempo":"blocked","cwd":"/repo","name":"pm-3","sessionId":"bg-1",
+			"needs":"approve Bash: rm -rf nothing","inFlight":{"tasks":2}}`,
+		"job2": `{"state":"working","tempo":"active","cwd":"/repo","name":"pm-5","sessionId":"bg-2"}`,
+		"job3": `{"state":"done","tempo":"idle","cwd":"/repo","name":"helpdesk","sessionId":"bg-3"}`,
+	})
+	fp := map[string]clauded.Session{
+		"owner-1": {SessionID: "owner-1", Name: "pm-f4", PID: 100, ProcStart: "1",
+			Kind: clauded.KindInteractive, Cwd: "/repo", Status: clauded.Idle},
+		"bg-1": bgFP("bg-1", "pm-3", "job1", 200, clauded.Waiting, true),
+		"bg-2": bgFP("bg-2", "pm-5", "job2", 201, clauded.Busy, false),
+		"bg-3": bgFP("bg-3", "helpdesk", "job3", 202, clauded.Idle, false),
+	}
+	d.tickFleet(fp)
+
+	r, ok := d.fleetRollups["owner-1"]
+	if !ok {
+		t.Fatalf("no rollup for the owner: %+v", d.fleetRollups)
+	}
+	if r.Total != 3 || r.Live != 2 {
+		t.Errorf("Total/Live = %d/%d, want 3/2", r.Total, r.Live)
+	}
+	if r.Worst != fleet.DemandHuman || r.Neediest.Name != "pm-3" {
+		t.Errorf("worst = %v via %q, want awaits-human via pm-3", r.Worst, r.Neediest.Name)
+	}
+	if len(d.fleetChildren) != 3 {
+		t.Errorf("children = %d, want 3 (interactive sessions are not children)", len(d.fleetChildren))
+	}
+}
+
+// With no first-party data (or the feature disabled) the daemon must hold no fleet
+// state at all, rather than a stale copy.
+func TestTickFleetClearsWhenNothingLive(t *testing.T) {
+	d, _ := fleetHarness(t, map[string]string{
+		"job1": `{"state":"working","cwd":"/repo","name":"pm-3","sessionId":"bg-1"}`,
+	})
+	fp := map[string]clauded.Session{
+		"owner-1": {SessionID: "owner-1", PID: 100, Kind: clauded.KindInteractive, Cwd: "/repo"},
+		"bg-1":    bgFP("bg-1", "pm-3", "job1", 200, clauded.Busy, false),
+	}
+	d.tickFleet(fp)
+	if len(d.fleetRollups) == 0 {
+		t.Fatal("expected a rollup before clearing")
+	}
+	d.tickFleet(map[string]clauded.Session{})
+	if len(d.fleetRollups) != 0 || len(d.fleetChildren) != 0 {
+		t.Errorf("fleet state should be cleared, got %d rollups / %d children",
+			len(d.fleetRollups), len(d.fleetChildren))
+	}
+}
+
+func TestTickFleetDisabledIsInert(t *testing.T) {
+	d, _ := fleetHarness(t, nil)
+	d.fleetReader = nil // --jobs-dir=""
+	d.tickFleet(map[string]clauded.Session{
+		"bg-1": bgFP("bg-1", "pm-3", "job1", 200, clauded.Busy, false),
+	})
+	if len(d.fleetRollups) != 0 {
+		t.Errorf("background tracking disabled should compute nothing, got %+v", d.fleetRollups)
+	}
+}
+
+// The guard for the whole exercise: none of this may reach the renderer yet. A
+// background agent has no window, so what the bar shows must be byte-identical
+// whether or not fleet data exists.
+func TestFleetDataDoesNotChangeWhatTheBarShows(t *testing.T) {
+	now := time.UnixMilli(1786714000000)
+	talk := now.Add(-19 * time.Hour).UnixMilli()
+	sessions := []db.Session{
+		// An interactive session with a window, idle for 19 hours.
+		{SessionID: "owner-1", State: string(state.Idle),
+			WindowID:   sql.NullInt64{Int64: 68, Valid: true},
+			LastTalkTS: sql.NullInt64{Int64: talk, Valid: true}, LastSeenTS: talk, CreatedTS: 1},
+		// Its background agents: windowless, and one of them is at a prompt.
+		{SessionID: "bg-1", State: string(state.Prompt), LastSeenTS: now.UnixMilli(), CreatedTS: 1,
+			Kind: sql.NullString{String: "bg", Valid: true}},
+		{SessionID: "bg-2", State: string(state.Working), LastSeenTS: now.UnixMilli(), CreatedTS: 1,
+			Kind: sql.NullString{String: "bg", Valid: true}},
+	}
+	resolve := mapResolver{68: 10}
+
+	want := aggregate([]db.Session{sessions[0]}, resolve, now)
+	got := aggregate(sessions, resolve, now)
+
+	if len(got) != len(want) {
+		t.Fatalf("workspace count changed: %d vs %d", len(got), len(want))
+	}
+	for ws, w := range want {
+		g, ok := got[ws]
+		if !ok {
+			t.Fatalf("workspace %d disappeared", ws)
+		}
+		if g != w {
+			t.Errorf("workspace %d changed: %+v -> %+v (background rows must not reach the bar yet)", ws, w, g)
+		}
+	}
+	// And specifically: the agent at a prompt must NOT have turned the owner's
+	// workspace into a "?" — that is the rendering decision, deliberately deferred.
+	if got[10].status == state.Prompt {
+		t.Error("a background agent's prompt leaked into the workspace glyph")
+	}
+}
+
+func TestPersistIdentitySkipsMissingRows(t *testing.T) {
+	d, _ := fleetHarness(t, map[string]string{
+		"job1": `{"state":"working","cwd":"/repo","name":"pm-3","sessionId":"bg-1"}`,
+	})
+	// No rows at all: the agent is live but no hook has fired for it yet.
+	fp := map[string]clauded.Session{
+		"bg-1": bgFP("bg-1", "pm-3", "job1", 200, clauded.Busy, false),
+	}
+	d.tickFleet(fp) // must not panic, must not record a write that never happened
+	if _, recorded := d.identified["bg-1"]; recorded {
+		t.Error("identity must not be recorded as written when the row does not exist")
+	}
+	// Once the row appears, the next tick fills it in.
+	if err := d.db.Upsert(db.Session{SessionID: "bg-1", State: string(state.Working), LastSeenTS: 1, CreatedTS: 1}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	d.sessions, _ = d.db.LoadLive()
+	d.tickFleet(fp)
+	got, _, _ := d.db.Get("bg-1")
+	if got.SessionName.String != "pm-3" {
+		t.Errorf("identity not backfilled after the row appeared: %+v", got.SessionName)
+	}
+}
+
+// The agent view retitles its terminal as you move through the list, so console
+// detection has to be sticky: a window that has BEEN a console stays one until it
+// closes. Without this, a console desktop flips back to reporting its resting host
+// session ("idle 22h") the instant you scroll.
+func TestNoteConsolesIsStickyUntilTheWindowCloses(t *testing.T) {
+	d := &daemon{consoleWins: map[int64]bool{}}
+
+	// Seen running the agent view.
+	d.noteConsoles([]niri.Window{{ID: 16, Title: "6 awaiting input · claude agents"}})
+	if !d.consoleWins[16] {
+		t.Fatal("the aggregate title should mark a console")
+	}
+
+	// The view retitles to the focused agent — still the same console.
+	d.noteConsoles([]niri.Window{{ID: 16, Title: "✳ project-manager-5"}})
+	if !d.consoleWins[16] {
+		t.Error("a console must stay one when its view retitles")
+	}
+
+	// An ordinary terminal is never a console, however it is titled.
+	d.noteConsoles([]niri.Window{
+		{ID: 16, Title: "✳ project-manager-5"},
+		{ID: 29, Title: "~/taf/project-manager"},
+	})
+	if d.consoleWins[29] {
+		t.Error("an ordinary terminal must not be marked")
+	}
+
+	// Closing the window is the one thing that clears it.
+	d.noteConsoles([]niri.Window{{ID: 29, Title: "~/taf/project-manager"}})
+	if d.consoleWins[16] {
+		t.Error("a closed window's console marker should be dropped")
+	}
+	if len(d.consoleWins) != 0 {
+		t.Errorf("console set should be empty, got %v", d.consoleWins)
+	}
+}

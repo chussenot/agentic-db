@@ -36,7 +36,7 @@ func TestPayloadForClaudeDesktop(t *testing.T) {
 	wins := []niri.Window{win(24, 50, "kitty", "Diagnose bug")}
 	sessions := []db.Session{claudeSession(24, "/home/x/claude-status-db", "working", 0)}
 
-	p := PayloadFor(w, wins, sessions, now)
+	p := PayloadFor(w, wins, sessions, FleetView{}, now)
 	if p.Shortcut != 5 || !p.Active || len(p.Items) != 1 {
 		t.Fatalf("claude payload wrong: %+v", p)
 	}
@@ -60,7 +60,7 @@ func TestPayloadForDualSharedWindow(t *testing.T) {
 		claudeSession(7, "/a/ci-base-idle", "idle", now.UnixMilli()),
 		claudeSession(7, "/a/ci-base-prompt", "prompt", 0),
 	}
-	p := PayloadFor(w, wins, sessions, now)
+	p := PayloadFor(w, wins, sessions, FleetView{}, now)
 	if len(p.Items) != 2 {
 		t.Fatalf("want 2 rows, got %d: %+v", len(p.Items), p)
 	}
@@ -87,7 +87,7 @@ func TestPayloadForMixedSessionAndApp(t *testing.T) {
 	wins := []niri.Window{win(9, 60, "firefox", "JSON Schema anyOf — Mozilla Firefox"), win(7, 60, "kitty", "unify rows")}
 	sessions := []db.Session{claudeSession(7, "/a/pwetty-box-rs", "working", 0)}
 
-	p := PayloadFor(w, wins, sessions, now)
+	p := PayloadFor(w, wins, sessions, FleetView{}, now)
 	if len(p.Items) != 2 {
 		t.Fatalf("want 2 rows (session + app), got %d: %+v", len(p.Items), p)
 	}
@@ -122,7 +122,7 @@ func TestPayloadForMixedSessionWinsTheCap(t *testing.T) {
 	}
 	sessions := []db.Session{claudeSession(20, "/a/repo", "idle", now.Add(-5*time.Minute).UnixMilli())}
 
-	p := PayloadFor(w, wins, sessions, now)
+	p := PayloadFor(w, wins, sessions, FleetView{}, now)
 	if len(p.Items) != 2 {
 		t.Fatalf("want cap of 2, got %d: %+v", len(p.Items), p)
 	}
@@ -145,7 +145,7 @@ func TestPayloadForCapsAtTwo(t *testing.T) {
 		claudeSession(7, "/a/two", "idle", now.UnixMilli()),
 		claudeSession(7, "/a/three", "prompt", 0),
 	}
-	p := PayloadFor(w, wins, sessions, now)
+	p := PayloadFor(w, wins, sessions, FleetView{}, now)
 	if len(p.Items) != 2 {
 		t.Fatalf("want cap of 2, got %d", len(p.Items))
 	}
@@ -161,7 +161,7 @@ func TestPayloadForIdleDecay(t *testing.T) {
 	wins := []niri.Window{win(7, 30, "kitty", "t")}
 	sessions := []db.Session{claudeSession(7, "/a/ci-base", "idle", talk)}
 
-	p := PayloadFor(w, wins, sessions, now)
+	p := PayloadFor(w, wins, sessions, FleetView{}, now)
 	if len(p.Items) != 1 {
 		t.Fatalf("want 1 row: %+v", p)
 	}
@@ -209,7 +209,7 @@ func TestPayloadForAppDesktop(t *testing.T) {
 	now := time.UnixMilli(1_000_000)
 	w := ws(1, "HDMI-A-1", 2, false)
 	wins := []niri.Window{win(15, 2, "org.keepassxc.KeePassXC", "Passbase")}
-	p := PayloadFor(w, wins, nil, now) // no tracked session
+	p := PayloadFor(w, wins, nil, FleetView{}, now) // no tracked session
 	if len(p.Items) != 1 {
 		t.Fatalf("want 1 app row: %+v", p)
 	}
@@ -259,7 +259,7 @@ func TestIconCandidatesCoversReverseDNS(t *testing.T) {
 
 func TestPayloadForEmptyDesktop(t *testing.T) {
 	now := time.UnixMilli(1_000_000)
-	p := PayloadFor(ws(8, "HDMI-A-1", 80, true), nil, nil, now)
+	p := PayloadFor(ws(8, "HDMI-A-1", 80, true), nil, nil, FleetView{}, now)
 	// A windowless desktop is a dimmed 1-row placeholder, never a 0-row items[]
 	// (the contract's minItems is 1); the real fix is the `empty` preset
 	// (claude-status-db-wsh).
@@ -280,7 +280,7 @@ func TestBuildAllKeysByOutputAndIdx(t *testing.T) {
 	windows := []niri.Window{win(24, 50, "kitty", "wt")}
 	sessions := []db.Session{claudeSession(24, "/x/repo", "working", 0)}
 
-	all := BuildAll(workspaces, windows, sessions, now)
+	all := BuildAll(workspaces, windows, sessions, FleetView{}, now)
 	if _, ok := all[Key("HDMI-A-1", 5)]; !ok {
 		t.Fatalf("missing HDMI-A-1:5 key; got %v", all)
 	}
@@ -296,8 +296,8 @@ func TestPayloadForDeterministicWindowPick(t *testing.T) {
 	now := time.UnixMilli(1_000_000)
 	w := ws(1, "HDMI-A-1", 2, false)
 	// Same two windows, opposite input orders (mimics randomized map iteration).
-	a := PayloadFor(w, []niri.Window{win(15, 2, "keepassxc", "KeePassXC"), win(9, 2, "firefox", "FF")}, nil, now)
-	b := PayloadFor(w, []niri.Window{win(9, 2, "firefox", "FF"), win(15, 2, "keepassxc", "KeePassXC")}, nil, now)
+	a := PayloadFor(w, []niri.Window{win(15, 2, "keepassxc", "KeePassXC"), win(9, 2, "firefox", "FF")}, nil, FleetView{}, now)
+	b := PayloadFor(w, []niri.Window{win(9, 2, "firefox", "FF"), win(15, 2, "keepassxc", "KeePassXC")}, nil, FleetView{}, now)
 	if len(a.Items) != 2 || len(b.Items) != 2 {
 		t.Fatalf("two windows -> two app rows: %+v / %+v", a, b)
 	}
@@ -318,7 +318,7 @@ func TestPayloadForWindowlessSessionHasNoWinID(t *testing.T) {
 	now := time.UnixMilli(1_000_000)
 	s := claudeSession(0, "/a/detached", "working", 0)
 	s.WindowID = sql.NullInt64{} // never learned
-	p := PayloadFor(ws(4, "HDMI-A-1", 40, false), nil, []db.Session{s}, now)
+	p := PayloadFor(ws(4, "HDMI-A-1", 40, false), nil, []db.Session{s}, FleetView{}, now)
 	if len(p.Items) != 1 {
 		t.Fatalf("want the lone session row, got %+v", p.Items)
 	}

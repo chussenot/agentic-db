@@ -38,6 +38,7 @@ import (
 
 	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/fleet"
 	"github.com/mrzor/claude-status/internal/niri"
 	"github.com/mrzor/claude-status/internal/state"
 	"github.com/mrzor/claude-status/internal/tile"
@@ -73,6 +74,7 @@ func Run(args []string) error {
 	poll := fs.Duration("poll", defaultPollInterval, "DB poll interval (how often the bar refreshes from hook state)")
 	deb := fs.Duration("debounce", defaultDebounce, "reconcile debounce window (coalesces event bursts; keep <= poll to feel the poll rate)")
 	sessionsDir := fs.String("sessions-dir", clauded.DefaultDir(), "Claude Code sessions dir for first-party status overlay (empty disables the overlay)")
+	jobsDir := fs.String("jobs-dir", fleet.DefaultJobsDir(), "Claude Code background-jobs dir for background-agent tracking (empty disables it)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -99,6 +101,13 @@ func Run(args []string) error {
 		fpMiss:       make(map[string]int),
 		tilePath:     tile.CachePath(*dbPath),
 		lastTitle:    make(map[string]string),
+		owners:       fleet.NewOwnerResolver(),
+		identified:   make(map[string]identityRecord),
+		consoleWins:  make(map[int64]bool),
+		lastFleetLog: make(map[string]string),
+	}
+	if *jobsDir != "" {
+		d.fleetReader = fleet.NewReader(*jobsDir)
 	}
 	// Seed last-recorded titles so a restart only emits TitleChanged rows for
 	// titles that actually drifted while we were down. Best effort: on a read
@@ -156,6 +165,30 @@ type daemon struct {
 	// tiles poll only once/sec, so rebuilding faster than tileBuildInterval is
 	// wasted CPU. See maybeWriteTiles.
 	lastTileBuild time.Time
+
+	// --- Background agents (see fleet.go). All actor-owned. ---
+
+	// fleetReader reads ~/.claude/jobs/<jobId>/state.json for live background
+	// agents, mtime-gated. Nil disables background tracking entirely.
+	fleetReader *fleet.Reader
+	// owners resolves a background agent's spawner from /proc, cached per process.
+	owners *fleet.OwnerResolver
+	// fleetChildren is the latest per-agent view, and fleetRollups the same data
+	// summarized per owning/watching session. Computed on the 1s tick and
+	// deliberately NOT consumed by reconcile or the tiles — `claude-status fleet`
+	// is what reads this shape today.
+	fleetChildren map[string]fleet.Child
+	fleetRollups  map[string]fleet.Rollup
+	// identified remembers the identity last persisted per session so a steady
+	// state writes nothing.
+	identified map[string]identityRecord
+	// consoleWins is the STICKY set of niri window ids seen running the agent view
+	// (see noteConsoles). Sticky because the view retitles its terminal as you move
+	// through the list.
+	consoleWins map[int64]bool
+	// lastFleetLog is the last log line emitted per fleet, so a steady state stays
+	// silent (see logFleetChanges).
+	lastFleetLog map[string]string
 
 	// lastTitle maps a live session_id to the niri window title we last recorded
 	// for it in the events log. captureTitleChanges diffs the model's current
@@ -237,7 +270,11 @@ func (d *daemon) run(ctx context.Context) error {
 			// Tick drives GC and forces a reconcile so decay buckets advance even
 			// with no niri/DB events (the bucket-crossing rename path). It also
 			// refreshes the pwetty tile cache so `tile-data` stays a cheap file read.
-			d.gc()
+			// One first-party read serves both the reap accounting and the
+			// background-agent build (see readFirstParty).
+			fp, fpAvailable := d.readFirstParty()
+			d.gc(fp, fpAvailable)
+			d.tickFleet(fp)
 			d.maybeWriteTiles()
 			markDirty()
 
@@ -348,21 +385,29 @@ func (d *daemon) pollTick(ctx context.Context, out chan<- struct{}) {
 // per hook, append-only) so the full history is always available for diagnosing
 // state drift. db.PruneEvents remains as a manual primitive but is no longer
 // called automatically.
-func (d *daemon) gc() {
-	// Read the first-party set (best effort). A read error or empty result means
-	// "not available" — firstPartyDead then reaps nothing and the predicate falls
-	// back to window/pid liveness only. This is a second read, independent of the
-	// overlay read in goroutine B; on this tiny set of files it is negligible and
-	// keeps fpMiss accounting on the actor goroutine.
-	var fp map[string]clauded.Session
-	fpAvailable := false
-	if d.sessionsDir != "" {
-		if m, err := clauded.ReadLive(d.sessionsDir); err != nil {
-			logf("gc first-party read: %v", err)
-		} else if len(m) > 0 {
-			fp, fpAvailable = m, true
-		}
+// readFirstParty reads the live first-party set on the actor goroutine (best
+// effort). available is false on a read error or an empty result, meaning "no
+// first-party data at all" — callers must fall back rather than read anything into
+// the absence. This is a second read, independent of the overlay read in goroutine
+// B; on this tiny set of files it is negligible, and it keeps both the fpMiss
+// accounting and the background-agent build on the actor side. ONE read per tick
+// serves both.
+func (d *daemon) readFirstParty() (map[string]clauded.Session, bool) {
+	if d.sessionsDir == "" {
+		return nil, false
 	}
+	m, err := clauded.ReadLive(d.sessionsDir)
+	if err != nil {
+		logf("first-party read: %v", err)
+		return nil, false
+	}
+	if len(m) == 0 {
+		return nil, false
+	}
+	return m, true
+}
+
+func (d *daemon) gc(fp map[string]clauded.Session, fpAvailable bool) {
 	fpDead := d.firstPartyDead(d.sessions, fp, fpAvailable)
 
 	pred := deadPredicate(d.model, fpDead)
@@ -402,7 +447,9 @@ func (d *daemon) writeTiles() {
 	for _, w := range d.model.Windows() {
 		windows = append(windows, w)
 	}
-	tiles := tile.BuildAll(d.model.Workspaces(), windows, d.sessions, db.Now())
+	d.noteConsoles(windows)
+	tiles := tile.BuildAll(d.model.Workspaces(), windows, d.sessions,
+		tile.FleetViewFrom(d.fleetChildren, d.fleetRollups, d.consoleWins), db.Now())
 	data, err := json.Marshal(tiles)
 	if err != nil {
 		logf("marshal tile cache: %v", err)

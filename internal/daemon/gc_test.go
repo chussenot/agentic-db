@@ -202,3 +202,126 @@ func TestDeadPredicate(t *testing.T) {
 		})
 	}
 }
+
+// stubProcStart makes the process-start seam serve fixed values.
+func stubProcStart(t *testing.T, start map[int]string) {
+	t.Helper()
+	orig := procStartOf
+	procStartOf = func(pid int) (string, bool) {
+		v, ok := start[pid]
+		return v, ok
+	}
+	t.Cleanup(func() { procStartOf = orig })
+}
+
+func TestClaudeProcessGone(t *testing.T) {
+	// 100, 200 and 300 are alive; only 100 and 200 have a readable start time.
+	orig := procExists
+	alive := map[int]bool{100: true, 200: true, 300: true}
+	procExists = func(pid int) bool { return alive[pid] }
+	t.Cleanup(func() { procExists = orig })
+	stubProcStart(t, map[int]string{100: "aaa", 200: "bbb"})
+
+	cases := []struct {
+		name string
+		row  db.Session
+		want bool
+	}{
+		{
+			name: "no recorded pid: no evidence either way",
+			row:  db.Session{},
+			want: false,
+		},
+		{
+			name: "pid alive, start time matches",
+			row: db.Session{
+				ClaudePID:       sql.NullInt64{Int64: 100, Valid: true},
+				ClaudeProcStart: sql.NullString{String: "aaa", Valid: true},
+			},
+			want: false,
+		},
+		{
+			name: "pid gone",
+			row:  db.Session{ClaudePID: sql.NullInt64{Int64: 999, Valid: true}},
+			want: true,
+		},
+		{
+			// Background agents come from a pre-forked spare pool, so pid reuse is
+			// routine rather than theoretical.
+			name: "pid reused by a different process",
+			row: db.Session{
+				ClaudePID:       sql.NullInt64{Int64: 100, Valid: true},
+				ClaudeProcStart: sql.NullString{String: "an-older-start", Valid: true},
+			},
+			want: true,
+		},
+		{
+			name: "pid alive, no recorded start time: not enough to condemn",
+			row:  db.Session{ClaudePID: sql.NullInt64{Int64: 200, Valid: true}},
+			want: false,
+		},
+		{
+			name: "pid alive, live start time unreadable: not enough to condemn",
+			row: db.Session{
+				ClaudePID:       sql.NullInt64{Int64: 300, Valid: true},
+				ClaudeProcStart: sql.NullString{String: "aaa", Valid: true},
+			},
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := claudeProcessGone(c.row); got != c.want {
+				t.Errorf("claudeProcessGone = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// A dead background agent must be reaped even though it never had a window — the
+// leak this whole change set exists to close.
+func TestFirstPartyDeadReapsBackgroundRows(t *testing.T) {
+	d := &daemon{fpMiss: map[string]int{}}
+	bg := db.Session{SessionID: "bg-1", Kind: sql.NullString{String: "bg", Valid: true}}
+	// Someone else is still live, so the first-party set is "available".
+	fp := map[string]clauded.Session{"other": {SessionID: "other"}}
+
+	for i := 1; i < firstPartyMissThreshold; i++ {
+		if dead := d.firstPartyDead([]db.Session{bg}, fp, true); dead["bg-1"] {
+			t.Fatalf("reaped after only %d miss(es); want %d", i, firstPartyMissThreshold)
+		}
+	}
+	if dead := d.firstPartyDead([]db.Session{bg}, fp, true); !dead["bg-1"] {
+		t.Errorf("a background row absent for %d ticks should be reaped", firstPartyMissThreshold)
+	}
+}
+
+// ...and an ssh/tmux row, which is ALSO windowless, must never be.
+func TestFirstPartyDeadNeverReapsWindowlessNonBackgroundRows(t *testing.T) {
+	d := &daemon{fpMiss: map[string]int{}}
+	ssh := db.Session{SessionID: "ssh-1"} // no window, no kind, no job
+	fp := map[string]clauded.Session{"other": {SessionID: "other"}}
+
+	for range firstPartyMissThreshold * 3 {
+		if dead := d.firstPartyDead([]db.Session{ssh}, fp, true); dead["ssh-1"] {
+			t.Fatal("a windowless row with no background marker must never be reaped here")
+		}
+	}
+	if len(d.fpMiss) != 0 {
+		t.Errorf("untracked rows should not even get a miss counter: %+v", d.fpMiss)
+	}
+}
+
+// A background agent that reappears has its counter cleared, like any other row.
+func TestFirstPartyDeadResetsBackgroundCounterOnReappearance(t *testing.T) {
+	d := &daemon{fpMiss: map[string]int{}}
+	bg := db.Session{SessionID: "bg-1", JobID: sql.NullString{String: "j", Valid: true}}
+	absent := map[string]clauded.Session{"other": {SessionID: "other"}}
+	present := map[string]clauded.Session{"bg-1": {SessionID: "bg-1"}}
+
+	d.firstPartyDead([]db.Session{bg}, absent, true)
+	d.firstPartyDead([]db.Session{bg}, present, true)
+	if d.fpMiss["bg-1"] != 0 {
+		t.Errorf("counter = %d after reappearance, want 0", d.fpMiss["bg-1"])
+	}
+}

@@ -35,7 +35,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
+	"github.com/mrzor/claude-status/internal/fleet"
 	"github.com/mrzor/claude-status/internal/niri"
 	"github.com/mrzor/claude-status/internal/state"
 )
@@ -86,12 +88,54 @@ type Item struct {
 	// disagreeing. Omitted (0) when the row has no window to focus: a session
 	// whose WindowID we never learned.
 	WinID int64 `json:"win_id,omitempty"` // both
+	// Fleet, when present, says this row stands for a set of BACKGROUND AGENTS —
+	// see FleetInfo. The row stays a plain session row at the top level (Kind
+	// session, a truthful State, a Folder and a Title), so a template that knows
+	// nothing about fleets renders it exactly as it renders any session; a template
+	// that does draws the bead strip instead. That is deliberate: `kind` is a
+	// CLOSED enum in the contract and rows are discriminated by `state`, so a
+	// `kind: "fleet"` row would be schema-invalid and might not paint at all.
+	// Presence of this object is the marker, and an unknown key is inert.
+	Fleet *FleetInfo `json:"fleet,omitempty"`
 }
 
-// The two row kinds, as the contract's `kind` discriminator spells them.
+// FleetInfo is the background-agent payload hung off a row.
+//
+// Demands is one entry per agent, worst first, and it is what the strip paints: one
+// bead per agent, coloured by what that agent wants. Counts come along so a renderer
+// can label the strip without counting beads, and Neediest/Needs name the agent that
+// set the worst demand plus its ask verbatim — the difference between "something
+// wants you" and "project-manager-7 wants you to approve a git mv".
+type FleetInfo struct {
+	Total    int `json:"total"`
+	Live     int `json:"live"`
+	Awaiting int `json:"awaiting"`
+	Working  int `json:"working"`
+	Blocked  int `json:"blocked"`
+	Idle     int `json:"idle,omitempty"`
+	Done     int `json:"done,omitempty"`
+	// Demands is one bead per agent: "awaits-human" | "working" | "blocked" |
+	// "idle" | "done".
+	Demands  []string `json:"demands"`
+	Neediest string   `json:"neediest,omitempty"`
+	Needs    string   `json:"needs,omitempty"`
+	// Scope is "whole" for a console desktop (the agent view lists every session on
+	// the machine) or "owned" for the desktop that spawned the agents. It tells a
+	// reader why this desktop is showing this set.
+	Scope string `json:"scope"`
+}
+
+// The two row kinds, as the contract's `kind` discriminator spells them. There is
+// deliberately no third kind for fleets — see Item.Fleet.
 const (
 	KindSession = "session"
 	KindApp     = "app"
+)
+
+// Fleet scopes.
+const (
+	ScopeWhole = "whole" // a console desktop: every agent on the machine
+	ScopeOwned = "owned" // the desktop whose session spawned these agents
 )
 
 // maxItemsPerTile caps the items array at the contract's maxItems (2). When a
@@ -146,6 +190,150 @@ func rowPriority(it Item) int {
 	}
 }
 
+// FleetView is everything the tile needs to know about background agents. The
+// daemon computes it once per tick and hands it in; the tile does no I/O.
+type FleetView struct {
+	// ByOwner maps a session id to the agents that session spawned, for the
+	// desktop that owns them.
+	ByOwner map[string]fleet.Summary
+	// Whole is every live agent on the machine, which is what a CONSOLE desktop
+	// shows: the agent view lists all sessions, not one owner's children.
+	Whole fleet.Summary
+	// Consoles is the set of niri window ids running the agent view.
+	Consoles map[int64]bool
+}
+
+// FleetViewFrom assembles the tile's view of background agents from the pieces the
+// daemon already computes on its tick, so the daemon does no extra work and the
+// fallback path below shares one implementation with it.
+//
+// consoles is the daemon's STICKY set of window ids that have been seen running the
+// agent view. It is passed in rather than derived from the current titles because the
+// view retitles its terminal as you move through the list: deriving it per rebuild
+// would make a console desktop flip back to describing its resting host session the
+// moment you scrolled.
+func FleetViewFrom(children map[string]fleet.Child, rollups map[string]fleet.Rollup, consoles map[int64]bool) FleetView {
+	fv := FleetView{
+		ByOwner:  make(map[string]fleet.Summary, len(rollups)),
+		Whole:    fleet.WholeFleet(children),
+		Consoles: consoles,
+	}
+	for id, r := range rollups {
+		fv.ByOwner[id] = fleet.Summarize(r)
+	}
+	if fv.Consoles == nil {
+		fv.Consoles = map[int64]bool{}
+	}
+	return fv
+}
+
+// LiveFleetView reads background-agent state straight off disk. It exists for the
+// no-daemon fallback path only: the daemon holds all of this in memory already and
+// goes through FleetViewFrom instead.
+func LiveFleetView(rows []db.Session, windows []niri.Window, now time.Time) FleetView {
+	live, err := clauded.ReadLive(clauded.DefaultDir())
+	if err != nil || len(live) == 0 {
+		return FleetView{}
+	}
+	jobIDs := make([]string, 0, len(live))
+	for _, s := range live {
+		if s.JobID != "" {
+			jobIDs = append(jobIDs, s.JobID)
+		}
+	}
+	jobs := fleet.NewReader(fleet.DefaultJobsDir()).ReadJobs(jobIDs)
+	children := fleet.Attribute(rows, live, jobs, fleet.NewOwnerResolver(), now)
+	// One-shot process: no history, so consoles can only be read off the titles
+	// visible right now. A console whose view happens to be showing an agent's name
+	// at this instant is therefore missed here — acceptable in a fallback that only
+	// runs when no daemon is up, and the reason the daemon keeps a sticky set.
+	consoles := map[int64]bool{}
+	for _, w := range windows {
+		if fleet.IsConsoleTitle(w.Title) {
+			consoles[int64(w.ID)] = true
+		}
+	}
+	return FleetViewFrom(children, fleet.Rollups(children), consoles)
+}
+
+// fleetItem builds a fleet row: a valid session row carrying a FleetInfo.
+//
+// The State it reports is what the whole tile reacts to, so it is chosen to be
+// honest about who is waiting on whom:
+//
+//   - any agent awaiting a human -> Prompt, which is what makes the tile pulse. This
+//     is the case the tile used to miss entirely.
+//   - else any agent working -> Working.
+//   - else any agent blocked -> Shell. Shell is the "parked, passively monitoring"
+//     indicator, which is exactly what a fleet blocked on ITSELF is; calling it
+//     Working would overstate it and Idle would hide it.
+//   - else Idle, aged on the fleet's newest activity rather than on the hosting
+//     session's last turn. That distinction is the entire point: a console desktop
+//     whose session last spoke a day ago is not a day idle if its agents moved a
+//     second ago.
+func fleetItem(sum fleet.Summary, scope, folder string, winID int64, now time.Time) Item {
+	it := Item{
+		Kind:   KindSession,
+		Folder: folder,
+		WinID:  winID,
+		Title:  fleetTitle(sum),
+		Fleet: &FleetInfo{
+			Total: sum.Total, Live: sum.Live, Awaiting: sum.Awaiting,
+			Working: sum.Working, Blocked: sum.Blocked, Idle: sum.Idle, Done: sum.Done,
+			Demands: demandStrings(sum.Demands), Neediest: sum.Neediest,
+			Needs: sum.Needs, Scope: scope,
+		},
+	}
+	switch {
+	case sum.Awaiting > 0:
+		it.State = string(state.Prompt)
+	case sum.Working > 0:
+		it.State = string(state.Working)
+	case sum.Blocked > 0:
+		it.State = string(state.Shell)
+	default:
+		it.State = string(state.Idle)
+		if sum.NewestActivity > 0 {
+			since := now.Sub(time.UnixMilli(sum.NewestActivity))
+			it.IdleLevel = state.DecayLevel(since)
+			it.IdleAgo = fmtAgo(since)
+		} else {
+			it.IdleLevel = state.DecayLevels - 1
+		}
+	}
+	return it
+}
+
+// fleetTitle is the row's human line. It carries the counts and the ask in text as
+// well as in FleetInfo, so a template that knows nothing about fleets still says
+// something true instead of describing a resting session.
+func fleetTitle(sum fleet.Summary) string {
+	head := fmt.Sprintf("%d agents", sum.Total)
+	if sum.Live != sum.Total {
+		head = fmt.Sprintf("%d/%d agents live", sum.Live, sum.Total)
+	}
+	switch {
+	case sum.Needs != "" && sum.Neediest != "":
+		return fmt.Sprintf("%s · %d awaiting · %s: %s", head, sum.Awaiting, sum.Neediest, sum.Needs)
+	case sum.Awaiting > 0:
+		return fmt.Sprintf("%s · %d awaiting you", head, sum.Awaiting)
+	case sum.Working > 0:
+		return fmt.Sprintf("%s · %d working", head, sum.Working)
+	case sum.Blocked > 0:
+		return fmt.Sprintf("%s · %d blocked", head, sum.Blocked)
+	}
+	return head
+}
+
+// demandStrings renders the bead strip's demands for the payload.
+func demandStrings(ds []fleet.Demand) []string {
+	out := make([]string, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, d.String())
+	}
+	return out
+}
+
 // sessionItem builds one session row from a DB session and its window title.
 func sessionItem(s db.Session, title string, now time.Time) Item {
 	it := Item{Kind: KindSession, State: s.State, Title: title}
@@ -183,8 +371,8 @@ func appItem(w niri.Window) Item {
 // (two kitty tabs) BOTH appear — they are grouped by workspace, not window, so
 // neither is masked. Note: the daemon passes its first-party overlaid sessions, so
 // each State is the effective state, not raw hooks.
-func PayloadFor(ws niri.Workspace, winsOnWs []niri.Window, sessionsOnWs []db.Session, now time.Time) Payload {
-	rows := desktopRows(winsOnWs, sessionsOnWs, now)
+func PayloadFor(ws niri.Workspace, winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView, now time.Time) Payload {
+	rows := desktopRows(winsOnWs, sessionsOnWs, fv, now)
 	if len(rows) == 0 {
 		return emptyPayload(ws.Idx, ws.IsFocused)
 	}
@@ -198,6 +386,10 @@ type row struct {
 	item      Item
 	winID     int64
 	sessionID string
+	// isFleet keeps a fleet row ahead of an ordinary session row of the same state
+	// when the cap has to choose. A desktop with agents waiting on you must not
+	// drop that row in favour of the resting conversation beside it.
+	isFleet bool
 }
 
 // desktopRows turns a desktop's windows and sessions into the tile's rows, in the
@@ -205,12 +397,23 @@ type row struct {
 // deterministic — the daemon groups windows and sessions out of maps (randomized
 // iteration), so without the tie-breaks the chosen/ordered rows would flip on
 // every cache rebuild and the tile would visibly blink between them.
-func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, now time.Time) []Item {
+func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView, now time.Time) []Item {
 	// Title comes from the session's niri window (sessions carry no title of their
 	// own); co-window sessions share it.
 	titleOf := make(map[int]string, len(winsOnWs))
 	for _, w := range winsOnWs {
 		titleOf[w.ID] = w.Title
+	}
+	// Does this desktop host an agent view? Decided before building any row, because
+	// a console row makes every owned fleet row on the same desktop redundant.
+	hasConsole := false
+	if !fv.Whole.Empty() {
+		for _, w := range winsOnWs {
+			if fv.Consoles[int64(w.ID)] {
+				hasConsole = true
+				break
+			}
+		}
 	}
 	hosted := make(map[int]bool, len(sessionsOnWs))
 	rows := make([]row, 0, len(sessionsOnWs)+len(winsOnWs))
@@ -222,7 +425,45 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, now time.Tim
 			title = titleOf[int(wid)]
 			hosted[int(wid)] = true
 		}
+		folder := ""
+		if s.Cwd.Valid {
+			folder = filepath.Base(s.Cwd.String)
+		}
+		// A CONSOLE window is running the agent view, not a conversation, so the
+		// fleet REPLACES its session row rather than sitting beside it. Describing
+		// that window by its host session's last turn is precisely the lie this
+		// fixes: the session may be a day idle while the dashboard in front of you
+		// shows eleven agents moving.
+		if wid != 0 && fv.Consoles[wid] && !fv.Whole.Empty() {
+			rows = append(rows, row{
+				item:      fleetItem(fv.Whole, ScopeWhole, "agents", wid, now),
+				winID:     wid,
+				sessionID: s.SessionID,
+				isFleet:   true,
+			})
+			continue
+		}
 		rows = append(rows, row{item: sessionItem(s, title, now), winID: wid, sessionID: s.SessionID})
+		// An OWNER desktop keeps its conversation row and gains a second row for the
+		// agents it spawned — the two-row layout finally earning its keep.
+		//
+		// Unless a console row is already on this desktop: the agent view lists
+		// EVERY agent, so an owned set is a subset of what that row already shows.
+		// Emitting both spent the tile's two rows on the same agents counted twice
+		// and pushed the actual conversations off the tile (seen live: one desktop
+		// showing "7 agents owned" beside "13 agents whole", with both sessions
+		// dropped).
+		if hasConsole {
+			continue
+		}
+		if sum, ok := fv.ByOwner[s.SessionID]; ok && !sum.Empty() {
+			rows = append(rows, row{
+				item:      fleetItem(sum, ScopeOwned, folder, wid, now),
+				winID:     wid,
+				sessionID: s.SessionID,
+				isFleet:   true,
+			})
+		}
 	}
 	// Windows with no tracked session are ordinary apps. A window hosting one is
 	// already represented by its session row(s) — an app row for it would be a
@@ -237,6 +478,9 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, now time.Tim
 		pi, pj := rowPriority(rows[i].item), rowPriority(rows[j].item)
 		if pi != pj {
 			return pi < pj
+		}
+		if rows[i].isFleet != rows[j].isFleet {
+			return rows[i].isFleet // a fleet row survives the cap first
 		}
 		if rows[i].winID != rows[j].winID {
 			return rows[i].winID < rows[j].winID // leftmost/oldest window first
@@ -663,7 +907,7 @@ func cleanAppLabel(appID string) string {
 // BuildAll computes payloads for every workspace, keyed by Key(output, idx). The
 // daemon calls this with its in-memory model + sessions (no IPC) and writes the
 // result via WriteCache.
-func BuildAll(workspaces map[int]niri.Workspace, windows []niri.Window, sessions []db.Session, now time.Time) map[string]Payload {
+func BuildAll(workspaces map[int]niri.Workspace, windows []niri.Window, sessions []db.Session, fv FleetView, now time.Time) map[string]Payload {
 	winByID := make(map[int]niri.Window, len(windows))
 	winsByWs := make(map[int][]niri.Window)
 	for _, w := range windows {
@@ -683,7 +927,7 @@ func BuildAll(workspaces map[int]niri.Workspace, windows []niri.Window, sessions
 	}
 	out := make(map[string]Payload, len(workspaces))
 	for _, ws := range workspaces {
-		out[Key(ws.Output, ws.Idx)] = PayloadFor(ws, winsByWs[ws.ID], sessByWs[ws.ID], now)
+		out[Key(ws.Output, ws.Idx)] = PayloadFor(ws, winsByWs[ws.ID], sessByWs[ws.ID], fv, now)
 	}
 	return out
 }
@@ -860,7 +1104,8 @@ func BuildLive(dbPath, output string, idx int) Payload {
 			sessOnWs = append(sessOnWs, s)
 		}
 	}
-	return PayloadFor(*ws, onWs, sessOnWs, db.Now())
+	now := db.Now()
+	return PayloadFor(*ws, onWs, sessOnWs, LiveFleetView(sessions, onWs, now), now)
 }
 
 // fmtAgo renders an elapsed duration as the tile's idle_ago: minutes under an
