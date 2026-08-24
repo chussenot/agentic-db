@@ -5,6 +5,7 @@
 package doctor
 
 import (
+	"database/sql"
 	"flag"
 	"fmt"
 	"io"
@@ -47,10 +48,17 @@ func run(w io.Writer, path string) error {
 	fmt.Fprintf(w, "sessions: %d row(s)\n", len(sessions))
 	if len(sessions) > 0 {
 		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-		fmt.Fprintln(tw, "SESSION_ID\tSTATE\tWINDOW\tTERM_PID\tCWD\tLAST_TALK\tLAST_SEEN")
+		// KIND/NAME/OWNER make the windowless rows legible: a bg row has no
+		// window and no terminal pid by nature, so without them it is
+		// indistinguishable from an ssh/tmux session.
+		fmt.Fprintln(tw, "SESSION_ID\tKIND\tNAME\tOWNER\tSTATE\tWINDOW\tTERM_PID\tCWD\tLAST_TALK\tLAST_SEEN")
 		for _, s := range sessions {
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
-				s.SessionID, s.State,
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\n",
+				s.SessionID,
+				nullStr(s.Kind.String, s.Kind.Valid),
+				nullStr(s.SessionName.String, s.SessionName.Valid),
+				shortNull(s.OwnerSessionID),
+				s.State,
 				nullInt(s.WindowID.Int64, s.WindowID.Valid),
 				nullInt(s.TerminalPID.Int64, s.TerminalPID.Valid),
 				nullStr(s.Cwd.String, s.Cwd.Valid),
@@ -111,7 +119,7 @@ func printFirstParty(w io.Writer, sessions []db.Session) {
 	sort.Strings(ids)
 
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "  SESSION\tPID\tFIRST_PARTY\tAGE\tHOOK_STATE\tEFFECTIVE\tSOURCE")
+	fmt.Fprintln(tw, "  SESSION\tPID\tKIND\tJOB\tNAME\tFIRST_PARTY\tWAITING_FOR\tAGE\tHOOK_STATE\tEFFECTIVE\tSOURCE")
 	for _, id := range ids {
 		f := fp[id]
 		hs, inDB := hookState[id]
@@ -122,11 +130,28 @@ func printFirstParty(w io.Writer, sessions []db.Session) {
 		if st, ok := effectiveState(f, hookSeen[id]); ok {
 			effective, source = string(st), "first-party"
 		}
-		fmt.Fprintf(tw, "  %s\t%d\t%s\t%s\t%s\t%s\t%s\n",
-			shortID(id), f.PID, string(f.Status), statusAge(f.StatusUpdatedAt),
+		fmt.Fprintf(tw, "  %s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			shortID(id), f.PID, blank(string(f.Kind)), blank(f.JobID), blank(f.Name),
+			string(f.Status), blank(f.WaitingFor), statusAge(f.StatusUpdatedAt),
 			hs, effective, source)
 	}
 	tw.Flush()
+}
+
+// blank renders an empty first-party field as an em dash.
+func blank(s string) string {
+	if s == "" {
+		return "—"
+	}
+	return s
+}
+
+// shortNull renders a nullable session id as its short form.
+func shortNull(v sql.NullString) string {
+	if !v.Valid || v.String == "" {
+		return "NULL"
+	}
+	return shortID(v.String)
 }
 
 // effectiveState mirrors daemon.firstPartyState's mapping for display (incl. the

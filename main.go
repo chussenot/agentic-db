@@ -32,6 +32,7 @@ commands:
   gc           run a single dead-session reap pass
   gen-waybar   emit waybar format-icons + style.css fragments
   doctor       dump the DB and live niri windows (debugging)
+  fleet        show background agents, who owns them, and what they need (--json)
   events       print the bounded audit log (--session, --limit)
   recap        summarize a time window of Claude sessions (--period, --json)
   recap-prompt emit the LLM instructions for turning a recap into a report
@@ -65,6 +66,8 @@ func main() {
 		err = waybar.Run(args)
 	case "doctor":
 		err = doctor.Run(args)
+	case "fleet":
+		err = doctor.RunFleet(args)
 	case "events":
 		err = doctor.RunEvents(args)
 	case "recap":
