@@ -404,17 +404,22 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 	for _, w := range winsOnWs {
 		titleOf[w.ID] = w.Title
 	}
-	// Does this desktop host an agent view? Decided before building any row, because
-	// a console row makes every owned fleet row on the same desktop redundant.
-	hasConsole := false
+	// Which window on this desktop is THE agent view? Decided before building any
+	// row, for two reasons: a console row makes every owned fleet row on the same
+	// desktop redundant, and a desktop can hold SEVERAL console windows — whose
+	// whole-scope summaries are machine-wide and therefore byte-identical, so
+	// emitting one per window fills the tile's two-row budget with the same
+	// dashboard twice (seen live) and pushes everything else off. At most one wins,
+	// and it is the lowest window id so the choice cannot flip between rebuilds.
+	consoleWin := int64(0)
 	if !fv.Whole.Empty() {
 		for _, w := range winsOnWs {
-			if fv.Consoles[int64(w.ID)] {
-				hasConsole = true
-				break
+			if fv.Consoles[int64(w.ID)] && (consoleWin == 0 || int64(w.ID) < consoleWin) {
+				consoleWin = int64(w.ID)
 			}
 		}
 	}
+	hasConsole := consoleWin != 0
 	hosted := make(map[int]bool, len(sessionsOnWs))
 	rows := make([]row, 0, len(sessionsOnWs)+len(winsOnWs))
 	for _, s := range sessionsOnWs {
@@ -434,7 +439,13 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 		// that window by its host session's last turn is precisely the lie this
 		// fixes: the session may be a day idle while the dashboard in front of you
 		// shows eleven agents moving.
-		if wid != 0 && fv.Consoles[wid] && !fv.Whole.Empty() {
+		// A LOSING console window gets no row at all. Falling back to its session
+		// row would put the "idle 22h" reading this epic exists to remove right back
+		// on the tile, and the winning row already describes the same dashboard.
+		if wid != 0 && wid != consoleWin && fv.Consoles[wid] && hasConsole {
+			continue
+		}
+		if wid != 0 && wid == consoleWin {
 			rows = append(rows, row{
 				item:      fleetItem(fv.Whole, ScopeWhole, "agents", wid, now),
 				winID:     wid,

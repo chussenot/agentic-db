@@ -368,3 +368,50 @@ func TestOwnedFleetRowStillAppearsWithoutAConsole(t *testing.T) {
 		t.Fatalf("want a session row plus an owned fleet row: %+v", p.Items)
 	}
 }
+
+// A desktop can hold several agent-view windows. Their whole-scope summaries are
+// machine-wide and therefore identical, so one row per window fills the tile's
+// two-row budget with the same dashboard twice — seen live, two byte-identical
+// "agents ⚠1 1/1" rows — and pushes everything else off.
+func TestMultipleConsoleWindowsCollapseToOneRow(t *testing.T) {
+	now := time.UnixMilli(1_000_000_000)
+	w := ws(3, "HDMI-A-1", 30, false)
+	wins := []niri.Window{
+		win(41, 30, "kitty", "3 awaiting input · claude agents"),
+		win(16, 30, "kitty", "2 awaiting input · claude agents"),
+		win(55, 30, "firefox", "a browser"),
+	}
+	a := claudeSession(41, "/home/e/one", "idle", now.Add(-22*time.Hour).UnixMilli())
+	b := claudeSession(16, "/home/e/two", "idle", now.Add(-22*time.Hour).UnixMilli())
+	fv := FleetView{
+		Whole:    fleetSummary(1, 0, 0, 0, 0, "worker-1", "approve rm"),
+		Consoles: map[int64]bool{41: true, 16: true},
+	}
+
+	p := PayloadFor(w, wins, []db.Session{a, b}, fv, now)
+	fleetRows := 0
+	for _, it := range p.Items {
+		if it.Fleet != nil {
+			fleetRows++
+			// Deterministically the lowest window id, so the tile cannot flip
+			// between the two consoles from one rebuild to the next.
+			if it.WinID != 16 {
+				t.Errorf("fleet row win_id = %d, want the lowest console id 16", it.WinID)
+			}
+		}
+	}
+	if fleetRows != 1 {
+		t.Fatalf("got %d fleet rows, want exactly 1: %+v", fleetRows, p.Items)
+	}
+	// The losing console must NOT reappear as a plain session row — that would put
+	// the "idle 22h" reading straight back on the tile.
+	for _, it := range p.Items {
+		if it.Fleet == nil && it.Kind == KindSession {
+			t.Errorf("a losing console fell back to a session row: %+v", it)
+		}
+	}
+	// And the freed row goes to the browser that was being pushed off.
+	if len(p.Items) != 2 || p.Items[1].Kind != KindApp {
+		t.Errorf("want the fleet row plus the app row, got %+v", p.Items)
+	}
+}
