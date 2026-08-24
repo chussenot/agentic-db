@@ -41,6 +41,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_window ON sessions(window_id);
 
+-- NOTE: repo_id and the session-identity columns (kind, session_name, job_id,
+-- claude_pid, claude_proc_start, owner_session_id, console_session_id,
+-- console_ts) are added by migrate, not here — see migrate for what they mean.
+
 -- events is an append-only audit log retained INDEFINITELY: it is not pruned
 -- automatically (PruneEvents exists as a manual primitive only). Two producers
 -- append here: the hook writes one row per invocation (recording what arrived
@@ -129,6 +133,35 @@ type Session struct {
 	LastSeenTS int64
 	// CreatedTS is the unix-ms row creation time. NOT NULL.
 	CreatedTS int64
+
+	// --- Identity (resolve-once; NULL means "not resolved yet", never "no") ---
+
+	// Kind is "interactive" or "bg" (a background agent), NULL when unknown.
+	Kind sql.NullString
+	// SessionName is the first-party display name, e.g. "project-manager-3". It
+	// is also the join key for fleet notifications, which name the child by name
+	// rather than by session id.
+	SessionName sql.NullString
+	// JobID keys a background agent's job record at ~/.claude/jobs/<JobID>/.
+	JobID sql.NullString
+	// ClaudePID is the Claude process pid — NOT TerminalPID, which is the kitty
+	// hosting it and does not exist for a background agent. Together with
+	// ClaudeProcStart it is the window-independent liveness ground truth.
+	ClaudePID sql.NullInt64
+	// ClaudeProcStart is ClaudePID's start time (/proc/<pid>/stat field 22), so a
+	// recycled pid cannot make a dead session look alive.
+	ClaudeProcStart sql.NullString
+	// OwnerSessionID is the SPAWN edge: the session whose fleet this one belongs
+	// to. NULL for ordinary sessions and for an orphaned background agent whose
+	// spawner could not be resolved.
+	OwnerSessionID sql.NullString
+	// ConsoleSessionID is the ATTENTION edge: the session last notified that this
+	// one needs input — i.e. where the human would go to answer. It is tracked
+	// separately from OwnerSessionID because they are demonstrably not the same
+	// session: a fleet can be spawned from one desktop and watched from another.
+	ConsoleSessionID sql.NullString
+	// ConsoleTS is the unix-ms time ConsoleSessionID was last stamped.
+	ConsoleTS sql.NullInt64
 }
 
 // Event is one row of the audit log: a single hook invocation and the
@@ -373,6 +406,36 @@ func migrate(sqldb *sql.DB) error {
 		!strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("add sessions.repo_id: %w", err)
 	}
+	// Session identity, for background awareness. A background agent has no
+	// terminal, so window_id/terminal_pid are permanently NULL for it and can
+	// serve as neither its identity nor its liveness; these columns are what let
+	// a windowless row be recognized, attributed and reaped. All of them are
+	// resolve-once values — see the COALESCE note on Upsert.
+	for _, c := range []struct{ col, decl, comment string }{
+		{"kind", "TEXT", `'interactive' | 'bg' | NULL when unknown`},
+		{"session_name", "TEXT", `first-party display name, e.g. "project-manager-3"`},
+		{"job_id", "TEXT", `a bg agent's ~/.claude/jobs/<job_id> key`},
+		{"claude_pid", "INTEGER", `the Claude process pid (NOT terminal_pid)`},
+		{"claude_proc_start", "TEXT", `that pid's start time, so pid reuse can't fake liveness`},
+		{"owner_session_id", "TEXT", `SPAWN edge: whose fleet this is`},
+		{"console_session_id", "TEXT", `ATTENTION edge: who was told this one needs input`},
+		{"console_ts", "INTEGER", `when that attention edge was last stamped`},
+	} {
+		if _, err := sqldb.Exec(`ALTER TABLE sessions ADD COLUMN ` + c.col + ` ` + c.decl); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("add sessions.%s: %w", c.col, err)
+		}
+	}
+	// Indexes live here rather than in schema because the columns they cover are
+	// added above (schema runs first, on a table that does not have them yet).
+	for _, idx := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(session_name)`,
+	} {
+		if _, err := sqldb.Exec(idx); err != nil {
+			return fmt.Errorf("create index: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -381,8 +444,16 @@ func (d *DB) Close() error { return d.sql.Close() }
 
 // Upsert inserts or replaces the row for s.SessionID inside an IMMEDIATE
 // transaction (the DSN's _txlock=immediate takes the write lock upfront,
-// avoiding BUSY upgrade deadlocks under hook bursts). All columns are written
-// from s as given; callers are responsible for populating timestamps.
+// avoiding BUSY upgrade deadlocks under hook bursts). The state/timestamp columns
+// are written from s as given; callers are responsible for populating timestamps.
+//
+// The identity columns are different: they are COALESCE(excluded, stored), so a
+// NULL in s PRESERVES what is already stored. Two writers reach these columns —
+// the hook (which knows its own kind/job/pid from its environment) and the daemon
+// (which resolves names and ownership from first-party files) — and a hook Upsert
+// built from a row read BEFORE the daemon's write would otherwise null the
+// daemon's work back out. Since every identity value is resolve-once, "last
+// non-NULL wins" is the correct merge, and it makes the two writers independent.
 func (d *DB) Upsert(s Session) error {
 	tx, err := d.sql.Begin()
 	if err != nil {
@@ -392,8 +463,10 @@ func (d *DB) Upsert(s Session) error {
 	_, err = tx.Exec(`
 INSERT INTO sessions
   (session_id, cwd, window_id, terminal_pid, repo_id, state, notify_kind,
-   last_talk_ts, last_event_ts, last_seen_ts, created_ts)
-VALUES (?,?,?,?,?,?,?,?,?,?,?)
+   last_talk_ts, last_event_ts, last_seen_ts, created_ts,
+   kind, session_name, job_id, claude_pid, claude_proc_start,
+   owner_session_id, console_session_id, console_ts)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(session_id) DO UPDATE SET
   cwd           = excluded.cwd,
   window_id     = excluded.window_id,
@@ -403,24 +476,148 @@ ON CONFLICT(session_id) DO UPDATE SET
   notify_kind   = excluded.notify_kind,
   last_talk_ts  = excluded.last_talk_ts,
   last_event_ts = excluded.last_event_ts,
-  last_seen_ts  = excluded.last_seen_ts
+  last_seen_ts  = excluded.last_seen_ts,
+  kind               = COALESCE(excluded.kind, sessions.kind),
+  session_name       = COALESCE(excluded.session_name, sessions.session_name),
+  job_id             = COALESCE(excluded.job_id, sessions.job_id),
+  claude_pid         = COALESCE(excluded.claude_pid, sessions.claude_pid),
+  claude_proc_start  = COALESCE(excluded.claude_proc_start, sessions.claude_proc_start),
+  owner_session_id   = COALESCE(excluded.owner_session_id, sessions.owner_session_id),
+  console_session_id = COALESCE(excluded.console_session_id, sessions.console_session_id),
+  console_ts         = COALESCE(excluded.console_ts, sessions.console_ts)
 `,
 		s.SessionID, s.Cwd, s.WindowID, s.TerminalPID, s.RepoID, s.State, s.NotifyKind,
-		s.LastTalkTS, s.LastEventTS, s.LastSeenTS, s.CreatedTS)
+		s.LastTalkTS, s.LastEventTS, s.LastSeenTS, s.CreatedTS,
+		s.Kind, s.SessionName, s.JobID, s.ClaudePID, s.ClaudeProcStart,
+		s.OwnerSessionID, s.ConsoleSessionID, s.ConsoleTS)
 	if err != nil {
 		return fmt.Errorf("upsert: %w", err)
 	}
 	return tx.Commit()
 }
 
+// Identity is a patch of resolve-once identity fields. A nil field is left
+// untouched, so a caller that learned only one thing writes only that one thing.
+type Identity struct {
+	Kind             *string
+	SessionName      *string
+	JobID            *string
+	ClaudePID        *int64
+	ClaudeProcStart  *string
+	OwnerSessionID   *string
+	ConsoleSessionID *string
+	ConsoleTS        *int64
+}
+
+// SetIdentity applies a narrow UPDATE for the non-nil fields of patch. changed
+// reports whether the row actually moved, so callers can log/emit once instead of
+// on every tick. A missing row is not an error (it may have just been reaped).
+//
+// Unlike Upsert this OVERWRITES the named columns, including over a previous
+// value: the console edge legitimately moves when the fleet is watched from
+// somewhere else, and a caller with better information should win.
+func (d *DB) SetIdentity(sessionID string, patch Identity) (changed bool, err error) {
+	sets := make([]string, 0, 8)
+	args := make([]any, 0, 9)
+	add := func(col string, v any) {
+		sets = append(sets, col+" = ?")
+		args = append(args, v)
+	}
+	if patch.Kind != nil {
+		add("kind", *patch.Kind)
+	}
+	if patch.SessionName != nil {
+		add("session_name", *patch.SessionName)
+	}
+	if patch.JobID != nil {
+		add("job_id", *patch.JobID)
+	}
+	if patch.ClaudePID != nil {
+		add("claude_pid", *patch.ClaudePID)
+	}
+	if patch.ClaudeProcStart != nil {
+		add("claude_proc_start", *patch.ClaudeProcStart)
+	}
+	if patch.OwnerSessionID != nil {
+		add("owner_session_id", *patch.OwnerSessionID)
+	}
+	if patch.ConsoleSessionID != nil {
+		add("console_session_id", *patch.ConsoleSessionID)
+	}
+	if patch.ConsoleTS != nil {
+		add("console_ts", *patch.ConsoleTS)
+	}
+	if len(sets) == 0 {
+		return false, nil
+	}
+	args = append(args, sessionID)
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE sessions SET `+strings.Join(sets, ", ")+` WHERE session_id = ?`, args...)
+	if err != nil {
+		return false, fmt.Errorf("set identity: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
+	}
+	return n > 0, nil
+}
+
 const selectCols = `session_id, cwd, window_id, terminal_pid, repo_id, state, notify_kind,
-  last_talk_ts, last_event_ts, last_seen_ts, created_ts`
+  last_talk_ts, last_event_ts, last_seen_ts, created_ts,
+  kind, session_name, job_id, claude_pid, claude_proc_start,
+  owner_session_id, console_session_id, console_ts`
 
 func scanSession(row interface{ Scan(...any) error }) (Session, error) {
 	var s Session
 	err := row.Scan(&s.SessionID, &s.Cwd, &s.WindowID, &s.TerminalPID, &s.RepoID, &s.State,
-		&s.NotifyKind, &s.LastTalkTS, &s.LastEventTS, &s.LastSeenTS, &s.CreatedTS)
+		&s.NotifyKind, &s.LastTalkTS, &s.LastEventTS, &s.LastSeenTS, &s.CreatedTS,
+		&s.Kind, &s.SessionName, &s.JobID, &s.ClaudePID, &s.ClaudeProcStart,
+		&s.OwnerSessionID, &s.ConsoleSessionID, &s.ConsoleTS)
 	return s, err
+}
+
+// IsBackground reports whether this row is a background agent. It keys on the
+// positive markers only (kind/job_id), never on the absence of a window: an
+// ssh/tmux session also has no window and must not be mistaken for one.
+func (s Session) IsBackground() bool {
+	return (s.Kind.Valid && s.Kind.String == "bg") || (s.JobID.Valid && s.JobID.String != "")
+}
+
+// GetByName returns the single row whose session_name is name. found is false when
+// there is no match OR when there is more than one: fleet notifications identify a
+// background agent by NAME rather than by session id, and two live agents sharing a
+// name cannot be told apart — attributing the notification to the wrong one is
+// worse than not attributing it, so an ambiguous name resolves to nothing.
+func (d *DB) GetByName(name string) (s Session, found bool, err error) {
+	if name == "" {
+		return Session{}, false, nil
+	}
+	rows, err := d.sql.Query(`SELECT `+selectCols+` FROM sessions WHERE session_name = ? LIMIT 2`, name)
+	if err != nil {
+		return Session{}, false, fmt.Errorf("get by name: %w", err)
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		got, serr := scanSession(rows)
+		if serr != nil {
+			return Session{}, false, fmt.Errorf("scan: %w", serr)
+		}
+		n++
+		s = got
+	}
+	if err := rows.Err(); err != nil {
+		return Session{}, false, err
+	}
+	if n != 1 {
+		return Session{}, false, nil
+	}
+	return s, true, nil
 }
 
 // LoadLive returns all current session rows. ("Live" reflects that the daemon
