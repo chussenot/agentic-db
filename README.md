@@ -9,14 +9,18 @@ activity" indicator in [waybar](https://github.com/Alexays/Waybar) under the
 
 Claude Code hooks invoke `claude-status hook`, which writes per-session state to a
 SQLite database. A long-lived `claude-status daemon` reads that database plus the
-niri window model and drives two renderers:
+niri window model and drives two renderers — of which only the second is still
+wired up:
 
-- **Workspace-name glyphs.** The daemon sets niri workspace **names**, which
-  waybar renders directly as glyphs:
-  - **Working** — blinking orange `●`
-  - **Prompt/waiting** — blinking yellow `?` (Claude needs you)
-  - **Idle** — a two-cell shade bar that fades over 60 minutes as the session goes stale
-- **The pwetty `claude` tile.** On each tick the daemon also precomputes a
+- **Workspace-name glyphs — VESTIGIAL.** The daemon sets niri workspace **names**,
+  which waybar used to render directly as glyphs (blinking orange `●` working,
+  blinking yellow `?` prompt, a two-cell shade bar fading over 60 minutes when
+  idle). That bar configuration is retired: nothing consumes the names any more,
+  and background agents are deliberately NOT fed into them. The code is kept
+  dormant rather than deleted, so the dots could come back, but treat the tile as
+  the renderer that matters — `aggregate`, the slot allocator, `internal/state`'s
+  name grammar and `gen-waybar` all serve this path alone.
+- **The pwetty `claude` tile — LIVE.** On each tick the daemon also precomputes a
   per-desktop payload and writes it to a tile cache. `claude-status tile-data`
   (and `tile-watch`) then serve that cache as the JSON a pwetty-hosted waybar
   tile expects — a cheap file read on the hot path, no `niri msg` spawn per

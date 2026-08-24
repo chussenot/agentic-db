@@ -3,6 +3,12 @@
 // (from the niri event stream), polls the sessions DB, advances decay buckets,
 // reaps dead sessions, and is the sole mutator of niri workspace names.
 //
+// The workspace-name half is VESTIGIAL: the waybar configuration that rendered
+// those names as glyphs is retired, so nothing consumes them any more. It is kept
+// dormant rather than deleted (the dots could come back), but the live renderer is
+// the pwetty tile cache below, which is why background agents feed that and are
+// deliberately kept out of aggregate().
+//
 // Concurrency model (the trickiest part, ported from niri-topic-namer's
 // single-threaded loop): one ACTOR goroutine owns all mutable state — the niri
 // Model, the slot allocator, and the `managed` map (workspace id -> the name we
