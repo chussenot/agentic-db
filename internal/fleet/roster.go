@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -61,6 +62,38 @@ type rawRoster struct {
 			Agent  string `json:"agent"`
 		} `json:"dispatch"`
 	} `json:"workers"`
+}
+
+// procExists reports whether /proc/<pid> exists (the process is alive). Package var
+// so tests can stub it, mirroring the identical seams in package clauded and the
+// daemon's gc: no test should depend on a particular pid being alive on the machine
+// that runs it.
+var procExists = func(pid int) bool {
+	_, err := os.Stat("/proc/" + strconv.Itoa(pid))
+	return err == nil
+}
+
+// SupervisorAlive reports whether the process this roster names still exists.
+//
+// A ROSTER OUTLIVES ITS SUPERVISOR. The file is rewritten on every dispatch and
+// never cleaned up, so a machine whose pool exited days ago still has a complete,
+// perfectly parseable roster.json — ReadRoster cannot tell the difference, because
+// nothing about the parse is wrong. Measured 2026-08-25: ~/.claude/daemon/roster.json
+// named supervisorPid 1260360 with one worker (whose job dir had an exit-cause
+// file), updatedAt was 4.8 days old, and /proc/1260360 did not exist — yet
+// `claude-status fleet` reported "supervisor: pid 1260360, 1 worker(s)" as current.
+// So liveness is a separate question from readability, and this is where it is asked.
+//
+// ONE-SIDED ON PURPOSE. The roster records a procStart for each WORKER but none for
+// the supervisor itself, so a recycled pid would read as alive. This can prove the
+// supervisor dead; it can never prove the pid is still the same process. That is the
+// right way round for suppressing a stale line — a false "alive" only leaves today's
+// behaviour, a false "dead" would hide a live fleet.
+func (r Roster) SupervisorAlive() bool {
+	if r.SupervisorPID <= 0 {
+		return false // no supervisor named: nothing to believe
+	}
+	return procExists(r.SupervisorPID)
 }
 
 // DefaultRosterPath returns $CLAUDE_CONFIG_DIR/daemon/roster.json when set, else

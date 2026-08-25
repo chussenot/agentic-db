@@ -64,6 +64,15 @@ type identityRecord struct {
 // describing its resting host session — "idle 22h" — the instant you scroll. Losing
 // the marker also has to be cheap and unambiguous, which is why the only thing that
 // clears it is the window closing.
+//
+// The price of that is a set of CANDIDATES, not of verdicts: a window keeps its
+// marker after the console behind it dies, and kitty keeps the stale title to match.
+// Whether a marker is still worth believing is a question about the host SESSION, not
+// about the title, and it is answered where the console row is built — see
+// tile.desktopRows and fleet.ConsoleHostLive. Deliberately not answered here: this
+// function's contract is "has this window EVER been a console", and a marker that
+// came back to life (the same window, a new console) must not have been forgotten in
+// the meantime.
 func (d *daemon) noteConsoles(windows []niri.Window) {
 	live := make(map[int64]bool, len(windows))
 	for _, w := range windows {

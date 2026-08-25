@@ -199,7 +199,8 @@ type FleetView struct {
 	// Whole is every live agent on the machine, which is what a CONSOLE desktop
 	// shows: the agent view lists all sessions, not one owner's children.
 	Whole fleet.Summary
-	// Consoles is the set of niri window ids running the agent view.
+	// Consoles is the set of niri window ids running the agent view — CANDIDATES:
+	// a marker can outlive the session that set it, which desktopRows filters.
 	Consoles map[int64]bool
 }
 
@@ -212,6 +213,11 @@ type FleetView struct {
 // view retitles its terminal as you move through the list: deriving it per rebuild
 // would make a console desktop flip back to describing its resting host session the
 // moment you scrolled.
+//
+// Stickiness means the set also holds windows whose console DIED, so membership here
+// is a candidate, not a verdict: desktopRows gates each marker on its host session
+// still being alive. Both this path and LiveFleetView below go through it, so the
+// gate covers the daemon and the no-daemon fallback alike.
 func FleetViewFrom(children map[string]fleet.Child, rollups map[string]fleet.Rollup, consoles map[int64]bool) FleetView {
 	fv := FleetView{
 		ByOwner:  make(map[string]fleet.Summary, len(rollups)),
@@ -404,6 +410,36 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 	for _, w := range winsOnWs {
 		titleOf[w.ID] = w.Title
 	}
+	// Which console markers on this desktop are still WORTH BELIEVING? The marker
+	// is sticky per window (see the daemon's noteConsoles) and the agent view sets
+	// its terminal title but never unsets it, so both outlive the session that
+	// earned them. Measured 2026-08-25: windows 12 and 34 were still titled "claude
+	// agents" with their host sessions silent for 188h and 187h — eight-day fossils
+	// of a pool that no longer exists. They failed to claim a console row only
+	// because the whole-fleet set happened to be empty that day; one background
+	// agent anywhere on the machine and a fossil would have taken the row AND
+	// suppressed every other fleet row on its desktop (see below), and dropped the
+	// session rows of the co-resident conversations with it.
+	//
+	// A marker is therefore believed only while the window still hosts a live
+	// session: iterating the desktop's sessions means a window whose Claude has
+	// exited (kitty keeps the stale title) drops out for free, and
+	// fleet.ConsoleHostLive judges the ones that remain. This is orthogonal to the
+	// stickiness it does not touch — a live console that retitles as you scroll
+	// keeps its marker and its row exactly as before.
+	consoles := make(map[int64]bool, len(fv.Consoles))
+	for _, s := range sessionsOnWs {
+		if !s.WindowID.Valid || !fv.Consoles[s.WindowID.Int64] {
+			continue
+		}
+		var lastTalk time.Time
+		if s.LastTalkTS.Valid {
+			lastTalk = time.UnixMilli(s.LastTalkTS.Int64)
+		}
+		if fleet.ConsoleHostLive(lastTalk, now) {
+			consoles[s.WindowID.Int64] = true
+		}
+	}
 	// Which window on this desktop is THE agent view? Decided before building any
 	// row, for two reasons: a console row makes every owned fleet row on the same
 	// desktop redundant, and a desktop can hold SEVERAL console windows — whose
@@ -414,7 +450,7 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 	consoleWin := int64(0)
 	if !fv.Whole.Empty() {
 		for _, w := range winsOnWs {
-			if fv.Consoles[int64(w.ID)] && (consoleWin == 0 || int64(w.ID) < consoleWin) {
+			if consoles[int64(w.ID)] && (consoleWin == 0 || int64(w.ID) < consoleWin) {
 				consoleWin = int64(w.ID)
 			}
 		}
@@ -442,7 +478,7 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 		// A LOSING console window gets no row at all. Falling back to its session
 		// row would put the "idle 22h" reading this epic exists to remove right back
 		// on the tile, and the winning row already describes the same dashboard.
-		if wid != 0 && wid != consoleWin && fv.Consoles[wid] && hasConsole {
+		if wid != 0 && wid != consoleWin && consoles[wid] && hasConsole {
 			continue
 		}
 		if wid != 0 && wid == consoleWin {

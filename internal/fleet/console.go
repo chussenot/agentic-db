@@ -29,6 +29,7 @@ package fleet
 
 import (
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -55,6 +56,43 @@ func IsConsoleTitle(title string) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(t), consoleTitleMark)
+}
+
+// consoleHostSilence is how long a console window's host session may go without
+// talking before its "claude agents" title stops being believed.
+//
+// A NUMBER, BECAUSE NEITHER SIDE OF THE QUESTION HAS A CRISPER SIGNAL. The title is
+// set by the agent view and never unset, and the daemon's marker is sticky per
+// window, so both outlive the session that earned them. Process liveness does NOT
+// separate the two cases and was REJECTED as the gate: measured 2026-08-25, the two
+// fossil windows (niri ids 12 and 34, both workspace 1) still had LIVE `claude
+// agents` processes — pids 1916662 and 2554350, up 7d21h — whose sessions had never
+// taken a turn since starting 188h and 187h earlier. Their kitty windows, their
+// claude processes and their titles were all present; only the point of them was
+// gone.
+//
+// So the limit is bounded by measurement on both sides. A genuine console's own
+// session goes quiet WHILE the view is open — 22h observed live, and that reading is
+// the entire reason this mechanism exists — so the limit cannot be tight. The
+// fossils sat at 187-188h. 72h is ~3x above the observed genuine case and ~2.5x
+// below the fossils; a console nobody has typed into for three days is not a
+// dashboard anybody is reading.
+const consoleHostSilence = 72 * time.Hour
+
+// ConsoleHostLive reports whether the session hosting a console window is still live
+// enough for that window's title to mean anything. lastTalk is the host session's
+// last_talk_ts; a zero value is BELIEVED (a session that has not talked yet is not a
+// fossil — absence of evidence is not evidence of death, the same way the daemon's
+// gc treats an unrecorded pid).
+//
+// This is deliberately NOT about the title: a live console retitles itself as you
+// scroll and must keep its marker across that (see the daemon's noteConsoles). The
+// question asked here is whether anything is still alive behind the marker.
+func ConsoleHostLive(lastTalk, now time.Time) bool {
+	if lastTalk.IsZero() {
+		return true
+	}
+	return now.Sub(lastTalk) < consoleHostSilence
 }
 
 // normalizeTitle strips Claude Code's leading status glyph (the Braille spinner, ✳,

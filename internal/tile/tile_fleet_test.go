@@ -415,3 +415,93 @@ func TestMultipleConsoleWindowsCollapseToOneRow(t *testing.T) {
 		t.Errorf("want the fleet row plus the app row, got %+v", p.Items)
 	}
 }
+
+// THE FOSSIL CONSOLE. Measured 2026-08-25: windows 12 and 34 were still titled
+// "claude agents" — sticky marker intact, kitty alive, `claude agents` process alive
+// — with their host sessions silent for 188h and 187h. They failed to claim a row
+// only because the whole-fleet set happened to be empty; the moment any background
+// agent exists, an eight-day fossil takes the desktop's console row. It must not.
+func TestFossilConsoleWindowIsNotBelieved(t *testing.T) {
+	now := time.UnixMilli(1_787_660_000_000)
+	w := ws(1, "HDMI-A-1", 11, false)
+	wins := []niri.Window{win(12, 11, "kitty", "0 awaiting input · claude agents")}
+	fossil := claudeSession(12, "/home/e/taf/project-manager", "idle", now.Add(-188*time.Hour).UnixMilli())
+	fv := FleetView{
+		Whole:    fleetSummary(1, 2, 0, 0, 0, "worker-1", "approve rm"),
+		Consoles: map[int64]bool{12: true},
+	}
+
+	p := PayloadFor(w, wins, []db.Session{fossil}, fv, now)
+	if len(p.Items) != 1 {
+		t.Fatalf("want a single row, got %d: %+v", len(p.Items), p.Items)
+	}
+	if p.Items[0].Fleet != nil {
+		t.Errorf("an eight-day-silent console must not claim a fleet row: %+v", p.Items[0])
+	}
+	// It is an ordinary resting conversation now, and saying so is the honest read.
+	if p.Items[0].Kind != KindSession || p.Items[0].IdleAgo == "" {
+		t.Errorf("want a plain session row carrying its age: %+v", p.Items[0])
+	}
+}
+
+// A console marker whose window hosts NO tracked session at all is the other fossil
+// shape: the claude exited and kitty kept the title. Believing it costs more than a
+// wrong row — hasConsole suppresses every owned fleet row on the desktop, so a
+// neighbour's live fleet would disappear behind a dashboard nobody is running.
+func TestConsoleMarkerWithNoLiveSessionDoesNotSuppressARealFleetRow(t *testing.T) {
+	now := time.UnixMilli(1_787_660_000_000)
+	w := ws(1, "HDMI-A-1", 11, false)
+	wins := []niri.Window{
+		win(12, 11, "kitty", "claude agents"), // fossil: titled, marked, no session
+		win(15, 11, "kitty", "a conversation"),
+	}
+	owner := claudeSession(15, "/home/e/taf/project-manager", "idle", now.Add(-time.Hour).UnixMilli())
+	fv := FleetView{
+		ByOwner:  map[string]fleet.Summary{owner.SessionID: fleetSummary(0, 2, 0, 0, 0, "", "")},
+		Whole:    fleetSummary(0, 2, 0, 0, 0, "", ""),
+		Consoles: map[int64]bool{12: true},
+	}
+
+	p := PayloadFor(w, wins, []db.Session{owner}, fv, now)
+	var owned, whole int
+	for _, it := range p.Items {
+		if it.Fleet == nil {
+			continue
+		}
+		switch it.Fleet.Scope {
+		case ScopeOwned:
+			owned++
+		case ScopeWhole:
+			whole++
+		}
+	}
+	if whole != 0 {
+		t.Errorf("a session-less console marker must not produce a whole-scope row: %+v", p.Items)
+	}
+	if owned != 1 {
+		t.Errorf("the owner's real fleet row should survive, got %d: %+v", owned, p.Items)
+	}
+}
+
+// The no-regression half, and the stickiness rationale intact: a console whose host
+// session is live keeps its row even once the view has retitled itself to something
+// that is not a console title at all (the daemon's sticky marker is what carries it).
+func TestLiveConsoleKeepsItsRowAcrossARetitle(t *testing.T) {
+	now := time.UnixMilli(1_787_660_000_000)
+	w := ws(1, "HDMI-A-1", 11, false)
+	// The view has scrolled onto an agent's name — no longer a console title.
+	wins := []niri.Window{win(16, 11, "kitty", "✳ project-manager-5")}
+	console := claudeSession(16, "/home/e/taf/project-manager", "idle", now.Add(-22*time.Hour).UnixMilli())
+	fv := FleetView{
+		Whole:    fleetSummary(1, 2, 0, 0, 0, "worker-1", "approve rm"),
+		Consoles: map[int64]bool{16: true},
+	}
+
+	p := PayloadFor(w, wins, []db.Session{console}, fv, now)
+	if len(p.Items) != 1 || p.Items[0].Fleet == nil {
+		t.Fatalf("a live console must keep its fleet row across a retitle: %+v", p.Items)
+	}
+	if p.Items[0].Fleet.Scope != ScopeWhole || p.Items[0].WinID != 16 {
+		t.Errorf("console row wrong: %+v", p.Items[0])
+	}
+}

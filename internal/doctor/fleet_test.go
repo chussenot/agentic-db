@@ -379,3 +379,94 @@ func TestOrphanSweepRefusesWithoutLivenessAuthority(t *testing.T) {
 		t.Errorf("the refusal must not delete anything; %d rows remain of 1", len(all))
 	}
 }
+
+// withRoster drops a minimal-but-faithful roster.json naming supervisorPID and one
+// worker, and returns opts pointing at it.
+func withRoster(t *testing.T, opts fleetOpts, supervisorPID int) fleetOpts {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "roster.json")
+	body := `{"proto":1,"supervisorPid":` + strconv.Itoa(supervisorPID) + `,
+		"updatedAt":1786713518000,
+		"workers":{"0ee16824":{"pid":1260408,"sessionId":"0ee16824-a00c-4620-819e-aed1b3412014",
+			"cwd":"/repo","dispatch":{"source":"shell"}}}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write roster: %v", err)
+	}
+	opts.rosterPath = path
+	return opts
+}
+
+// deadPID is above any pid Linux can hand out (pid_max caps at 2^22 = 4194304), so
+// /proc/<deadPID> cannot exist on any machine running this test. The liveness check
+// in package fleet is unexported, so this test exercises the real /proc read rather
+// than a stub.
+const deadPID = 0x7FFFFFFF
+
+// The live lie this fixes: roster.json survives its supervisor, so a pool that
+// exited 4.8 days ago still printed "supervisor: pid 1260360, 1 worker(s)" as
+// current. A dead supervisor now gets a warning naming the corpse and no
+// supervisor line at all.
+func TestFleetViewRefusesARosterWhoseSupervisorIsGone(t *testing.T) {
+	opts := withRoster(t, colonyFixture(t), deadPID)
+
+	v, err := buildFleetView(opts)
+	if err != nil {
+		t.Fatalf("buildFleetView: %v", err)
+	}
+	if v.Roster != nil {
+		t.Errorf("a dead supervisor must not be reported: %+v", v.Roster)
+	}
+	var warned bool
+	for _, w := range v.Warnings {
+		if strings.Contains(w, "stale roster") && strings.Contains(w, strconv.Itoa(deadPID)) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("expected a warning naming the gone supervisor, got %v", v.Warnings)
+	}
+
+	var out strings.Builder
+	if err := runFleet(&out, opts); err != nil {
+		t.Fatalf("runFleet: %v", err)
+	}
+	if strings.Contains(out.String(), "supervisor: pid") {
+		t.Errorf("a supervisor line was printed for a dead pid:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "stale roster") {
+		t.Errorf("the reason the roster vanished should be visible:\n%s", out.String())
+	}
+}
+
+// The no-regression half: a supervisor that IS alive still reports normally. This
+// test process is the supervisor, so its pid is genuinely alive.
+func TestFleetViewStillReportsALiveSupervisor(t *testing.T) {
+	opts := withRoster(t, colonyFixture(t), os.Getpid())
+
+	v, err := buildFleetView(opts)
+	if err != nil {
+		t.Fatalf("buildFleetView: %v", err)
+	}
+	if v.Roster == nil {
+		t.Fatal("a live supervisor's roster must still be reported")
+	}
+	if v.Roster.SupervisorPID != os.Getpid() || v.Roster.Workers != 1 {
+		t.Errorf("roster = %+v, want this pid with 1 worker", v.Roster)
+	}
+	if v.Roster.UpdatedAt == "" {
+		t.Error("updatedAt should still be carried")
+	}
+	for _, w := range v.Warnings {
+		if strings.Contains(w, "stale roster") {
+			t.Errorf("a live supervisor must not warn: %v", v.Warnings)
+		}
+	}
+
+	var out strings.Builder
+	if err := runFleet(&out, opts); err != nil {
+		t.Fatalf("runFleet: %v", err)
+	}
+	if !strings.Contains(out.String(), "supervisor: pid "+strconv.Itoa(os.Getpid())) {
+		t.Errorf("expected the supervisor line:\n%s", out.String())
+	}
+}

@@ -96,3 +96,35 @@ func TestReadRosterMissingOrMalformedIsNotFatal(t *testing.T) {
 		t.Errorf("empty roster mishandled: ok=%v %+v", ok, got)
 	}
 }
+
+// A roster OUTLIVES its supervisor: the file is rewritten on every dispatch and
+// never cleaned up, so a pool that exited days ago still parses perfectly. That is
+// how `claude-status fleet` came to announce "supervisor: pid 1260360, 1 worker(s)"
+// with /proc/1260360 long gone and the file 4.8 days old. ReadRoster is the wrong
+// place to answer it (the parse really did succeed); SupervisorAlive is.
+func TestSupervisorAliveIsWhatMakesARosterCurrent(t *testing.T) {
+	r, ok := ReadRoster(writeRoster(t, rosterJSON))
+	if !ok {
+		t.Fatal("ReadRoster not ok")
+	}
+
+	orig := procExists
+	t.Cleanup(func() { procExists = orig })
+
+	procExists = func(pid int) bool { return pid == r.SupervisorPID }
+	if !r.SupervisorAlive() {
+		t.Error("a roster whose supervisor pid is alive must still be reported")
+	}
+
+	procExists = func(int) bool { return false }
+	if r.SupervisorAlive() {
+		t.Error("a roster whose supervisor pid is gone must not be reported")
+	}
+
+	// A roster naming no supervisor is never alive, whatever /proc says: pid 0 is
+	// not a process, and asking about it would be a category error.
+	procExists = func(int) bool { return true }
+	if (Roster{}).SupervisorAlive() {
+		t.Error("a roster with no supervisorPid must not be reported")
+	}
+}

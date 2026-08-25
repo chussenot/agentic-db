@@ -246,26 +246,53 @@ func buildFleetView(o fleetOpts) (*fleetView, error) {
 	})
 
 	if r, ok := fleet.ReadRoster(o.rosterPath); ok {
-		rv := &rosterView{SupervisorPID: r.SupervisorPID, Workers: len(r.Workers)}
-		if !r.UpdatedAt.IsZero() {
-			rv.UpdatedAt = r.UpdatedAt.Format(time.RFC3339)
-		}
-		// The supervisor's environment names the session that caused the pool to
-		// exist, so this resolves the fleet root for every worker at once.
-		if sp, ok := resolver.Spawn(r.SupervisorPID, ""); ok && sp.SpawnerPID > 0 {
-			for id, s := range live {
-				if s.PID == sp.SpawnerPID {
-					rv.FleetRoot = id
+		// A PARSEABLE ROSTER IS NOT A LIVE ONE. The file survives its supervisor
+		// (see fleet.Roster.SupervisorAlive for the measurement), so reporting one
+		// on the strength of the parse alone is how this page came to announce a
+		// supervisor that had been dead for 4.8 days.
+		//
+		// A dead supervisor gets a WARNING rather than silence. Dropping the line
+		// with no trace would leave a human reading this page unable to tell "no
+		// roster on this machine" from "a roster we chose to disbelieve" — and this
+		// command exists to be read while debugging exactly that kind of question.
+		// The warning also carries into --json, so no consumer sees the stale pid
+		// presented as current.
+		if !r.SupervisorAlive() {
+			view.Warnings = append(view.Warnings, staleRoster(r))
+		} else {
+			rv := &rosterView{SupervisorPID: r.SupervisorPID, Workers: len(r.Workers)}
+			if !r.UpdatedAt.IsZero() {
+				rv.UpdatedAt = r.UpdatedAt.Format(time.RFC3339)
+			}
+			// The supervisor's environment names the session that caused the pool
+			// to exist, so this resolves the fleet root for every worker at once.
+			if sp, ok := resolver.Spawn(r.SupervisorPID, ""); ok && sp.SpawnerPID > 0 {
+				for id, s := range live {
+					if s.PID == sp.SpawnerPID {
+						rv.FleetRoot = id
+					}
 				}
 			}
+			view.Roster = rv
 		}
-		view.Roster = rv
 	}
 
 	if o.crossCheck {
 		view.Diff = crossCheckAgents(children)
 	}
 	return view, nil
+}
+
+// staleRoster is the one line a dead supervisor gets instead of a supervisor line.
+// It names the pid so the reader can confirm the corpse themselves, and the roster's
+// own updatedAt so "how stale" is answered without a second command.
+func staleRoster(r fleet.Roster) string {
+	msg := fmt.Sprintf("stale roster ignored: supervisor pid %d is gone (%d worker(s) recorded)",
+		r.SupervisorPID, len(r.Workers))
+	if !r.UpdatedAt.IsZero() {
+		msg += ", last written " + r.UpdatedAt.Format(time.RFC3339)
+	}
+	return msg
 }
 
 // ownIdle is how long since the session itself last talked — the number the bar
