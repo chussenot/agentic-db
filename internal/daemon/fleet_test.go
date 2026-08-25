@@ -479,3 +479,115 @@ func TestPersistHerdMembershipIsQuietWhenItAgrees(t *testing.T) {
 		t.Errorf("a steady state changed the row: %+v -> %+v", before, after)
 	}
 }
+
+// row is a session row shaped for the cwd-join tests: only the four fields the join
+// looks at.
+func joinRow(id string, win int64, cwd, ws string) db.Session {
+	s := db.Session{
+		SessionID: id,
+		Cwd:       sql.NullString{String: cwd, Valid: cwd != ""},
+		WindowID:  sql.NullInt64{Int64: win, Valid: win != 0},
+	}
+	if ws != "" {
+		s.HerdrWorkspaceID = sql.NullString{String: ws, Valid: true}
+	}
+	return s
+}
+
+// The live shape that motivated the fallback: window 33 hosts a herd that IS bound
+// (w1, via a session herdr could name), and beside it two panes herdr cannot name at
+// all — their workspaces bind to no window, so their sessions leak onto the bar as
+// separate rows. cwd is the only key both sides share.
+func TestJoinByCwdClaimsPanesHerdrCannotName(t *testing.T) {
+	rows := []db.Session{
+		joinRow("aaaa", 33, "/w/project-manager", "w1"), // bound: makes 33 a herd window
+		joinRow("bbbb", 33, "/w/worktrees/pm-7", ""),    // wA's occupant, unreachable
+		joinRow("cccc", 9, "/w/worktrees/pm-7", ""),     // same cwd, WRONG window
+	}
+	g := fleet.Group{
+		Key:     fleet.GroupKey{Provider: fleet.ProviderHerdr, Key: "wA"},
+		Members: []fleet.Member{{Name: "pm-7", Ref: "wA:p1", Cwd: "/w/worktrees/pm-7"}},
+	}
+
+	got := joinByCwd(g, rows, map[int64]bool{33: true})
+	if len(got) != 1 {
+		t.Fatalf("want one join, got %+v", got)
+	}
+	// The window fence is what picked bbbb over cccc: both share the cwd, only one
+	// sits in a window that hosts a herd.
+	if got[0].sessionID != "bbbb" {
+		t.Errorf("joined %q, want the row in the herd's window", got[0].sessionID)
+	}
+	if got[0].patch.HerdrWorkspaceID == nil || *got[0].patch.HerdrWorkspaceID != "wA" {
+		t.Errorf("workspace not written: %+v", got[0].patch)
+	}
+	if got[0].patch.HerdrPaneID == nil || *got[0].patch.HerdrPaneID != "wA:p1" {
+		t.Errorf("pane not written: %+v", got[0].patch)
+	}
+}
+
+// Every fence, each on its own: an ambiguous cwd is left alone rather than assigned,
+// because a row in the wrong herd lies while a stray row at least tells the truth.
+func TestJoinByCwdRefusesEveryAmbiguousCase(t *testing.T) {
+	bound := joinRow("aaaa", 33, "/w/project-manager", "w1")
+	wins := map[int64]bool{33: true}
+
+	t.Run("two nameless members share one checkout", func(t *testing.T) {
+		g := fleet.Group{
+			Key: fleet.GroupKey{Provider: fleet.ProviderHerdr, Key: "w1"},
+			Members: []fleet.Member{
+				{Name: "keeper", Cwd: "/w/pm"},
+				{Name: "helpdesk", Cwd: "/w/pm"},
+			},
+		}
+		rows := []db.Session{bound, joinRow("bbbb", 33, "/w/pm", "")}
+		if got := joinByCwd(g, rows, wins); len(got) != 0 {
+			t.Errorf("claimed an ambiguous member: %+v", got)
+		}
+	})
+
+	t.Run("two candidate rows share the member's checkout", func(t *testing.T) {
+		g := fleet.Group{
+			Key:     fleet.GroupKey{Provider: fleet.ProviderHerdr, Key: "w9"},
+			Members: []fleet.Member{{Name: "pm-6", Cwd: "/w/pm-6"}},
+		}
+		rows := []db.Session{bound,
+			joinRow("bbbb", 33, "/w/pm-6", ""), joinRow("cccc", 33, "/w/pm-6", "")}
+		if got := joinByCwd(g, rows, wins); len(got) != 0 {
+			t.Errorf("picked one of two equally good rows: %+v", got)
+		}
+	})
+
+	t.Run("no herd is bound anywhere", func(t *testing.T) {
+		g := fleet.Group{
+			Key:     fleet.GroupKey{Provider: fleet.ProviderHerdr, Key: "w9"},
+			Members: []fleet.Member{{Name: "pm-6", Cwd: "/w/pm-6"}},
+		}
+		rows := []db.Session{joinRow("bbbb", 33, "/w/pm-6", "")}
+		if got := joinByCwd(g, rows, map[int64]bool{}); len(got) != 0 {
+			t.Errorf("joined with no window fence to stand on: %+v", got)
+		}
+	})
+
+	t.Run("a row placed by a real key is never overwritten", func(t *testing.T) {
+		g := fleet.Group{
+			Key:     fleet.GroupKey{Provider: fleet.ProviderHerdr, Key: "w9"},
+			Members: []fleet.Member{{Name: "pm-6", Cwd: "/w/pm-6"}},
+		}
+		rows := []db.Session{bound, joinRow("bbbb", 33, "/w/pm-6", "wB")}
+		if got := joinByCwd(g, rows, wins); len(got) != 0 {
+			t.Errorf("overwrote an exact join with a guess: %+v", got)
+		}
+	})
+
+	t.Run("a member already joined is not re-joined", func(t *testing.T) {
+		g := fleet.Group{
+			Key:     fleet.GroupKey{Provider: fleet.ProviderHerdr, Key: "w9"},
+			Members: []fleet.Member{{Name: "pm-6", SessionID: "bbbb", Cwd: "/w/pm-6"}},
+		}
+		rows := []db.Session{bound, joinRow("bbbb", 33, "/w/pm-6", "")}
+		if got := joinByCwd(g, rows, wins); len(got) != 0 {
+			t.Errorf("re-joined a member that has a session id: %+v", got)
+		}
+	})
+}

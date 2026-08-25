@@ -80,6 +80,14 @@ type Member struct {
 	// session at all, and it is still an agent that must be counted. This is why
 	// the member set comes from the provider and our rows only enrich it.
 	SessionID string
+	// Cwd is the agent's working directory as its substrate reports it. Carried
+	// because it is the ONLY join key left when a pane hosts a Claude session that
+	// herdr cannot name: a pane started before the integration shipped has no
+	// agent_session, so name and pane id both fail to reach our rows. It is a weak
+	// key — several sessions share one checkout — and must never be used without a
+	// second discriminator (see the daemon's cwd join, which also requires the
+	// window and requires the match to be unique on both sides).
+	Cwd string
 	// Demand is what this agent wants, on the one ladder both providers share.
 	Demand Demand
 	// Needs is the verbatim ask when a human is being waited on, empty otherwise.

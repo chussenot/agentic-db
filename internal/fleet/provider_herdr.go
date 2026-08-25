@@ -229,7 +229,7 @@ func (p *HerdrProvider) Groups(ctx context.Context, in Input) ([]Group, error) {
 // `pane process-info -> pid -> ~/.claude/sessions/<pid>.json` bridge. Two rungs that
 // cost nothing already cover both live shapes.
 func (p *HerdrProvider) member(a herdr.Agent, in Input, rowBySession map[string]db.Session, rowByPane map[string]db.Session) Member {
-	m := Member{Name: a.Name, Ref: a.PaneID, Demand: DemandOfHerdrStatus(a.Status)}
+	m := Member{Name: a.Name, Ref: a.PaneID, Cwd: a.Cwd, Demand: DemandOfHerdrStatus(a.Status)}
 
 	sid := ""
 	if a.HasSession && a.Session.Kind == "id" && a.Session.Value != "" {
