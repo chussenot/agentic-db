@@ -34,6 +34,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
@@ -323,12 +325,72 @@ func LiveFleetView(rows []db.Session, windows []niri.Window, now time.Time) Flee
 //     session's last turn. That distinction is the entire point: a console desktop
 //     whose session last spoke a day ago is not a day idle if its agents moved a
 //     second ago.
+//
+// herdLabel is what a herd row puts where a session row puts its folder: the
+// project AND how many agents are in it.
+//
+// NEITHER HALF SURVIVES ALONE. The full label loses that contest on width — at the
+// real 179px "project-manager" measures about 141px on its own, and that line also
+// carries the big shortcut digit and the mascot, so it clipped to "project-…", a stub
+// every workspace cut from one checkout shares. But a bare count ("6 agents") is no
+// better: it says nothing about WHICH herd, and in the two-row layout there is no
+// third line to say it either.
+//
+// So the project is abbreviated rather than dropped. A multi-word label goes to its
+// initials — "project-manager" to "PM" — which is short enough to leave the count
+// room and, unlike a head-clip, stays distinct between two projects that begin alike.
+// The full spelling is still on the title line whenever the layout has one.
+func herdLabel(label string, total int) string {
+	suffix := fmt.Sprintf(" ×%d", total)
+	// What the label line leaves beside the count and the mascot, measured at 179px.
+	const budget = 7
+	name := strings.TrimSpace(label)
+	switch {
+	case name == "":
+		return "herd" + suffix
+	case len(name) <= budget:
+	default:
+		if in := initials(name); in != "" {
+			name = in
+		} else {
+			name = name[:budget-1] + "…"
+		}
+	}
+	return name + suffix
+}
+
+// initials abbreviates a multi-word label by its word heads, uppercased. Returns
+// empty for a single word, which has no initials worth the loss — a one-word label is
+// better clipped than reduced to one letter.
+func initials(label string) string {
+	parts := strings.FieldsFunc(label, func(r rune) bool {
+		return r == '-' || r == '_' || r == '.' || r == ' ' || r == '/'
+	})
+	if len(parts) < 2 {
+		return ""
+	}
+	if len(parts) > 4 {
+		parts = parts[:4] // four letters is already at the budget
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		r, _ := utf8.DecodeRuneInString(p)
+		b.WriteRune(unicode.ToUpper(r))
+	}
+	return b.String()
+}
+
 func fleetItem(sum fleet.Summary, scope, folder string, winID int64, now time.Time) Item {
+	label, title := folder, fleetTitle(sum)
+	if scope == ScopeHerd {
+		label = herdLabel(folder, sum.Total)
+		title = herdTitle(folder, sum)
+	}
 	it := Item{
 		Kind:   KindSession,
-		Folder: folder,
+		Folder: label,
 		WinID:  winID,
-		Title:  fleetTitle(sum),
+		Title:  title,
 		Fleet: &FleetInfo{
 			Total: sum.Total, Live: sum.Live, Awaiting: sum.Awaiting,
 			Working: sum.Working, Blocked: sum.Blocked, Idle: sum.Idle,
@@ -450,6 +512,13 @@ type row struct {
 	// winID, and letting a session uuid break that tie would reinstate the exact
 	// row lottery this change exists to remove.
 	sessionID string
+	// summary is the group behind a herd row, kept so herds sharing a window can be
+	// merged without re-deriving it from the rendered Item.
+	summary fleet.Summary
+	// label is a herd row's workspace label — the repository. It is kept apart
+	// from item.Folder because a herd row shows its agent COUNT there, so merging
+	// several herds must read the repository from here or it would fold counts.
+	label string
 	// isFleet keeps a fleet row ahead of an ordinary session row of the same state
 	// when the cap has to choose. A desktop with agents waiting on you must not
 	// drop that row in favour of the resting conversation beside it.
@@ -610,8 +679,9 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 		if key, g, ok := herdOf(s, fv.Herds); ok {
 			h, seen := herds[key]
 			if !seen {
-				h = row{item: fleetItem(g.Summarize(), ScopeHerd, g.Label, wid, now),
-					winID: wid, sessionID: key, isFleet: true}
+				sum := g.Summarize()
+				h = row{item: fleetItem(sum, ScopeHerd, g.Label, wid, now), label: g.Label,
+					winID: wid, sessionID: key, summary: sum, isFleet: true}
 			} else if wid != 0 && (h.winID == 0 || wid < h.winID) {
 				// Lowest window id wins, so a click lands somewhere stable when the
 				// herd's panes are spread over more than one window.
@@ -639,10 +709,18 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 			continue
 		}
 		hosted[int(win)] = true
-		herds[ws] = row{item: fleetItem(g.Summarize(), ScopeHerd, g.Label, win, now),
-			winID: win, sessionID: ws, isFleet: true}
+		sum := g.Summarize()
+		herds[ws] = row{item: fleetItem(sum, ScopeHerd, g.Label, win, now), label: g.Label,
+			winID: win, sessionID: ws, summary: sum, isFleet: true}
 	}
-	for _, h := range herds {
+	// Herds sharing ONE WINDOW collapse into a single row. A herdr window hosts many
+	// workspaces (five here) and most hold exactly one agent, so a row per workspace
+	// spent the whole tile on single-bead rows whose labels all clipped to the same
+	// string — rendered at the real width, "project-manager-8" and
+	// "project-manager-9" both read "project-…" — while the 2-row cap silently
+	// dropped the rest. One row carrying every agent's bead says more in less space.
+	// A window with a single herd keeps its own label and is untouched.
+	for _, h := range mergeHerdsPerWindow(herds, now) {
 		rows = append(rows, h)
 	}
 	// Windows with no tracked session are ordinary apps. A window hosting one is
@@ -1335,4 +1413,104 @@ func herdOf(s db.Session, herds map[string]fleet.Group) (string, fleet.Group, bo
 		return "", fleet.Group{}, false
 	}
 	return s.HerdrWorkspaceID.String, g, true
+}
+
+// mergeHerdsPerWindow folds the herds of one window into one row each.
+func mergeHerdsPerWindow(herds map[string]row, now time.Time) []row {
+	byWin := map[int64][]string{}
+	for key, h := range herds {
+		byWin[h.winID] = append(byWin[h.winID], key)
+	}
+	out := make([]row, 0, len(byWin))
+	for win, keys := range byWin {
+		if len(keys) == 1 {
+			out = append(out, herds[keys[0]])
+			continue
+		}
+		sort.Strings(keys) // deterministic label and identity
+		sums := make([]fleet.Summary, 0, len(keys))
+		labels := make([]string, 0, len(keys))
+		for _, k := range keys {
+			h := herds[k]
+			if h.item.Fleet == nil {
+				continue
+			}
+			sums = append(sums, h.summary)
+			labels = append(labels, h.label)
+		}
+		merged := fleet.MergeSummaries(sums)
+		shared := sharedLabel(labels)
+		out = append(out, row{
+			item:  fleetItem(merged, ScopeHerd, shared, win, now),
+			label: shared,
+			winID: win,
+			// Identity is the window's herds, so the row is stable while they are.
+			sessionID: strings.Join(keys, "+"),
+			isFleet:   true,
+		})
+	}
+	return out
+}
+
+// sharedLabel names a set of herds with what they have in common, which for herdr
+// workspaces cut from one checkout is the repository: {project-manager,
+// project-manager-6, project-manager-9} -> "project-manager". Falls back to a count
+// when they share nothing, because "3 herds" is honest where a truncated common
+// prefix would be a different repo's name. Returns EMPTY when they share nothing:
+// the caller composes the label, and "3 herds" there would have collided with the
+// agent count beside it ("3 herds ×3", which invites reading three as both).
+func sharedLabel(labels []string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	prefix := labels[0]
+	for _, l := range labels[1:] {
+		for !strings.HasPrefix(l, prefix) {
+			prefix = prefix[:len(prefix)-1]
+			if prefix == "" {
+				break
+			}
+		}
+	}
+	prefix = strings.TrimRight(prefix, "-_. /")
+	if len(prefix) < 3 {
+		return ""
+	}
+	return prefix
+}
+
+// herdTitle names the repository and, when something is waiting on a person, the
+// agent that is — the two things the label line has no room for.
+//
+// ORDER IS THE POINT, because this line is clipped to a bit over thirty characters
+// and the clip eats the tail. When a human is being waited on, the ask leads and the
+// repository is what gets sacrificed; when nothing is waiting, the repository leads,
+// since it is then the only thing on the tile that says WHICH herd this is.
+func herdTitle(label string, sum fleet.Summary) string {
+	// NOTHING IS SAID TWICE. How many are working is already on the tile twice over —
+	// the mascot's colour and the lit beads — and spelling it out here was enough to
+	// wrap the line onto a fourth row that the 56px bar cuts off. So this line speaks
+	// only when a person is being waited on, which no bead can say in words.
+	ask := ""
+	switch {
+	case sum.Needs != "" && sum.Neediest != "":
+		ask = sum.Neediest + ": " + sum.Needs
+	case sum.Neediest != "" && sum.Awaiting > 0:
+		ask = sum.Neediest + " needs you"
+	case sum.Awaiting > 0:
+		ask = fmt.Sprintf("%d awaiting you", sum.Awaiting)
+	}
+	parts := []string{}
+	if ask != "" {
+		parts = append(parts, ask, label) // the ask first: it is why you would look
+	} else {
+		parts = append(parts, label)
+	}
+	kept := parts[:0]
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, " · ")
 }

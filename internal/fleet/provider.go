@@ -253,3 +253,53 @@ func SortGroups(gs []Group) {
 		return gs[i].Key.Key < gs[j].Key.Key
 	})
 }
+
+// MergeSummaries folds several groups' summaries into one, for a renderer that has
+// to show them in a single row.
+//
+// It exists because a herdr WINDOW hosts many workspaces — five on the machine this
+// was written for — while most of those workspaces hold exactly ONE agent. Rendering
+// a row per workspace then spends the tile's whole row budget on single-bead rows
+// whose labels, clipped to the tile width, all read the same ("project-…"), and
+// silently drops whichever herds do not fit. One row with every agent's bead says
+// strictly more in less space.
+//
+// Demands are re-sorted rather than concatenated: each group's own list is worst-
+// first, so appending them would interleave severities and the strip would stop
+// reading left-to-right by urgency. Neediest comes from whichever group actually
+// holds the worst demand, so the named agent matches the leftmost bead.
+func MergeSummaries(in []Summary) Summary {
+	var out Summary
+	if len(in) == 0 {
+		return out
+	}
+	out.Worst = DemandDone
+	worstSeen := false
+	for _, s := range in {
+		out.Total += s.Total
+		out.Live += s.Live
+		out.Awaiting += s.Awaiting
+		out.Working += s.Working
+		out.Blocked += s.Blocked
+		out.Idle += s.Idle
+		out.Unknown += s.Unknown
+		out.Done += s.Done
+		out.Demands = append(out.Demands, s.Demands...)
+		if s.NewestActivity > out.NewestActivity {
+			out.NewestActivity = s.NewestActivity
+		}
+		// A group with no members has no opinion about the worst demand, and its
+		// zero-valued Worst (DemandHuman) would otherwise win every comparison.
+		if s.Total == 0 {
+			continue
+		}
+		if !worstSeen || s.Worst < out.Worst {
+			worstSeen = true
+			out.Worst = s.Worst
+			out.Neediest = s.Neediest
+			out.Needs = s.Needs
+		}
+	}
+	sort.Slice(out.Demands, func(i, j int) bool { return out.Demands[i] < out.Demands[j] })
+	return out
+}

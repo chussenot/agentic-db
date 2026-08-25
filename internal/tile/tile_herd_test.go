@@ -80,8 +80,15 @@ func TestHerdrWindowEmitsOneGroupRowNotNSessionRows(t *testing.T) {
 	if it.Fleet.Scope != ScopeHerd {
 		t.Errorf("scope = %q, want %q", it.Fleet.Scope, ScopeHerd)
 	}
-	if it.Folder != "project-manager" {
-		t.Errorf("label = %q, want the workspace's DisplayLabel — a worktree basename is what it replaces", it.Folder)
+	// The label slot carries the COUNT (it always fits at 179px); the repository
+	// moves to the wrapped title, where a clipped "project-…" would have identified
+	// nothing.
+	// The project, abbreviated, AND the count — the full spelling goes to the title.
+	if it.Folder != "PM ×4" {
+		t.Errorf("label = %q, want the project initials and the count", it.Folder)
+	}
+	if !strings.Contains(it.Title, "project-manager") {
+		t.Errorf("title = %q, want it to name the repository", it.Title)
 	}
 	if it.Fleet.Total != 4 || it.Fleet.Live != 4 {
 		t.Errorf("counts = %d/%d, want 4/4 agents", it.Fleet.Live, it.Fleet.Total)
@@ -186,7 +193,13 @@ func TestIdleHerdAgesOnTheGroupNotOnASession(t *testing.T) {
 // One herdr WINDOW holds several herdr WORKSPACES — w1, w9 and wA were all live
 // behind niri window 33. Each gets its own row, distinguished by its own label, and
 // the two-row cap keeps them worst-first (deterministically, not by session uuid).
-func TestSeveralWorkspacesInOneWindowGetSeparateRowsWorstFirst(t *testing.T) {
+// Herds sharing ONE WINDOW merge into ONE row. This reverses the earlier
+// per-workspace contract, and the evidence is a render at the real 179px width: two
+// bound herds produced two rows whose labels BOTH clipped to "project-…", so they
+// read as the same thing twice, while the 2-row cap was about to drop three more of
+// the five herds bound to that window. Most herdr workspaces here hold exactly one
+// agent, so a row per workspace spends the whole tile on single-bead rows.
+func TestHerdsSharingOneWindowMergeIntoOneRow(t *testing.T) {
 	now := time.UnixMilli(1_000_000_000)
 	fresh := now.Add(-time.Second)
 	w := ws(3, "HDMI-A-1", 30, false)
@@ -196,8 +209,6 @@ func TestSeveralWorkspacesInOneWindowGetSeparateRowsWorstFirst(t *testing.T) {
 		herdSession("bbb", 33, "w9", "w9:pA", "/home/e/wt/6", "idle", fresh.UnixMilli()),
 		herdSession("ccc", 33, "wA", "wA:pA", "/home/e/wt/7", "idle", fresh.UnixMilli()),
 	}
-	// All three carry worktree_space.label "project-manager"; only custom_name tells
-	// them apart, which is why Workspace.DisplayLabel puts it first.
 	fv := FleetView{Herds: map[string]fleet.Group{
 		"w1": herd("w1", "project-manager", fresh, mem("keeper", fleet.DemandIdle, fresh)),
 		"w9": herd("w9", "project-manager-6", fresh, mem("helpdesk", fleet.DemandHuman, fresh)),
@@ -205,20 +216,81 @@ func TestSeveralWorkspacesInOneWindowGetSeparateRowsWorstFirst(t *testing.T) {
 	}}
 
 	p := PayloadFor(w, wins, sessions, fv, now)
+	if len(p.Items) != 1 {
+		t.Fatalf("want ONE merged row, got %d: %+v", len(p.Items), p.Items)
+	}
+	it := p.Items[0]
+	if it.Fleet == nil {
+		t.Fatal("merged row carries no fleet")
+	}
+	// Every agent is represented — nothing is dropped by the cap any more.
+	if it.Fleet.Total != 3 || len(it.Fleet.Demands) != 3 {
+		t.Errorf("want 3 agents and 3 beads, got total=%d beads=%v", it.Fleet.Total, it.Fleet.Demands)
+	}
+	// Beads re-sorted worst-first ACROSS the herds, not concatenated per herd.
+	if it.Fleet.Demands[0] != "awaits-human" || it.Fleet.Demands[2] != "idle" {
+		t.Errorf("beads not globally worst-first: %v", it.Fleet.Demands)
+	}
+	// The row is named by what the herds share — the repository — not by a
+	// truncation of one of them.
+	if it.Folder != "PM ×3" {
+		t.Errorf("label = %q, want the shared project and the count", it.Folder)
+	}
+	// The shared prefix — the repository — is what the title carries.
+	if !strings.Contains(it.Title, "project-manager") {
+		t.Errorf("title = %q, want the shared prefix", it.Title)
+	}
+	// The worst demand still drives the row's state and names its agent.
+	if it.State != string(state.Prompt) || it.Fleet.Neediest != "helpdesk" {
+		t.Errorf("state=%q neediest=%q, want prompt/helpdesk", it.State, it.Fleet.Neediest)
+	}
+	// Stable across rebuilds: the herds come out of a map.
+	for range 20 {
+		q := PayloadFor(w, wins, sessions, fv, now)
+		if len(q.Items) != 1 || q.Items[0].Folder != it.Folder ||
+			!reflect.DeepEqual(q.Items[0].Fleet.Demands, it.Fleet.Demands) {
+			t.Fatalf("merged row flipped between rebuilds: %+v vs %+v", q.Items, p.Items)
+		}
+	}
+}
+
+// Herds on DIFFERENT windows stay separate rows, and the cap orders them worst-first
+// with a deterministic tie-break — the property the old per-window test protected.
+func TestHerdsOnDifferentWindowsStaySeparateAndOrderedWorstFirst(t *testing.T) {
+	now := time.UnixMilli(1_000_000_000)
+	fresh := now.Add(-time.Second)
+	w := ws(3, "HDMI-A-1", 30, false)
+	wins := []niri.Window{
+		win(33, 30, "kitty", "herdr one"),
+		win(44, 30, "kitty", "herdr two"),
+		win(55, 30, "kitty", "herdr three"),
+	}
+	sessions := []db.Session{
+		herdSession("aaa", 33, "w1", "w1:pA", "/home/e/a", "idle", fresh.UnixMilli()),
+		herdSession("bbb", 44, "w9", "w9:pA", "/home/e/b", "idle", fresh.UnixMilli()),
+		herdSession("ccc", 55, "wA", "wA:pA", "/home/e/c", "idle", fresh.UnixMilli()),
+	}
+	fv := FleetView{Herds: map[string]fleet.Group{
+		"w1": herd("w1", "alpha", fresh, mem("a", fleet.DemandIdle, fresh)),
+		"w9": herd("w9", "bravo", fresh, mem("b", fleet.DemandHuman, fresh)),
+		"wA": herd("wA", "charlie", fresh, mem("c", fleet.DemandWorking, fresh)),
+	}}
+
+	p := PayloadFor(w, wins, sessions, fv, now)
 	if len(p.Items) != maxItemsPerTile {
 		t.Fatalf("want %d rows, got %d: %+v", maxItemsPerTile, len(p.Items), p.Items)
 	}
-	// Worst first: the herd awaiting a human, then the one working. The idle herd is
-	// the one that loses the cap, which is the right way round.
-	if got := []string{p.Items[0].Folder, p.Items[1].Folder}; !reflect.DeepEqual(
-		got, []string{"project-manager-6", "project-manager-7"}) {
-		t.Errorf("rows = %v, want the awaiting herd then the working one", got)
+	// Every single-agent herd labels "1 agent" now, so the repository is read off the
+	// title instead.
+	// Contains, not HasPrefix: an awaiting herd leads its title with the ask, so the
+	// repository is not always first — see herdTitle.
+	if !strings.Contains(p.Items[0].Title, "bravo") || !strings.Contains(p.Items[1].Title, "charlie") {
+		t.Errorf("rows = [%q %q], want the awaiting herd then the working one",
+			p.Items[0].Title, p.Items[1].Title)
 	}
-	// And it must not flip between rebuilds — the herds come out of a map, and the
-	// old tie-break was the session uuid.
 	for range 20 {
 		q := PayloadFor(w, wins, sessions, fv, now)
-		if q.Items[0].Folder != p.Items[0].Folder || q.Items[1].Folder != p.Items[1].Folder {
+		if q.Items[0].Title != p.Items[0].Title || q.Items[1].Title != p.Items[1].Title {
 			t.Fatalf("row choice flipped between rebuilds: %v vs %v", q.Items, p.Items)
 		}
 	}
@@ -395,7 +467,11 @@ func TestUnknownAgentsAreTheirOwnBead(t *testing.T) {
 // must not depend on a session id. Session ids churn at ~30 an hour behind one herdr
 // window, so tie-breaking on one puts the row lottery straight back — the two rows
 // would swap the moment a tick recycled. The tie-break is the GROUP KEY.
-func TestEquallyUrgentHerdsAreOrderedByGroupKeyNotBySessionID(t *testing.T) {
+// The row must not change when the sessions underneath it recycle. Same intent as
+// before the merge landed — only now the herds of one window are one row, so the
+// assertion is that the MERGED row is identical across two ticks whose session ids
+// are all different and arrive in a different order, which is what a recycle does.
+func TestMergedHerdRowIsIdenticalAcrossSessionRecycles(t *testing.T) {
 	now := time.UnixMilli(1_000_000_000)
 	fresh := now.Add(-time.Second)
 	w := ws(3, "HDMI-A-1", 30, false)
@@ -405,8 +481,6 @@ func TestEquallyUrgentHerdsAreOrderedByGroupKeyNotBySessionID(t *testing.T) {
 		"w9": herd("w9", "bravo", fresh, mem("b", fleet.DemandIdle, fresh)),
 		"wA": herd("wA", "charlie", fresh, mem("c", fleet.DemandIdle, fresh)),
 	}}
-	// Two consecutive ticks. Every session id is different, and the order they
-	// arrive in is different too — exactly what a recycle does.
 	tick1 := []db.Session{
 		herdSession("f00d", 33, "w1", "w1:pA", "/home/e/a", "idle", fresh.UnixMilli()),
 		herdSession("0001", 33, "w9", "w9:pA", "/home/e/b", "idle", fresh.UnixMilli()),
@@ -417,19 +491,24 @@ func TestEquallyUrgentHerdsAreOrderedByGroupKeyNotBySessionID(t *testing.T) {
 		herdSession("ffff", 33, "w9", "w9:pB", "/home/e/b", "idle", fresh.UnixMilli()),
 		herdSession("5555", 33, "w1", "w1:pB", "/home/e/a", "idle", fresh.UnixMilli()),
 	}
-	labels := func(sessions []db.Session) []string {
-		var out []string
-		for _, it := range PayloadFor(w, wins, sessions, fv, now).Items {
-			out = append(out, it.Folder)
-		}
-		return out
+	render := func(sessions []db.Session) []Item {
+		return PayloadFor(w, wins, sessions, fv, now).Items
 	}
-	first, second := labels(tick1), labels(tick2)
+	first, second := render(tick1), render(tick2)
+
+	if len(first) != 1 {
+		t.Fatalf("want one merged row, got %+v", first)
+	}
 	if !reflect.DeepEqual(first, second) {
-		t.Errorf("the surviving herds changed when only the session ids did: %v vs %v", first, second)
+		t.Errorf("the row changed when the sessions recycled:\n  %+v\n  %+v", first, second)
 	}
-	if !reflect.DeepEqual(first, []string{"alpha", "bravo"}) {
-		t.Errorf("rows = %v, want the two lowest group keys (w1, w9)", first)
+	// Herds sharing no prefix get no project name at all rather than a misleading
+	// stub — the count is all that is claimed.
+	if first[0].Folder != "herd ×3" {
+		t.Errorf("label = %q, want an unnamed herd and the count", first[0].Folder)
+	}
+	if first[0].Fleet == nil || first[0].Fleet.Total != 3 {
+		t.Errorf("merged fleet wrong: %+v", first[0].Fleet)
 	}
 }
 
@@ -464,8 +543,11 @@ func TestHerdRowSurvivesEveryMemberSessionEnding(t *testing.T) {
 	if it.Fleet == nil || it.Fleet.Scope != ScopeHerd {
 		t.Fatalf("want a herd row, got %+v", it)
 	}
-	if it.Fleet.Total != 2 || it.Folder != "project-manager" {
+	if it.Fleet.Total != 2 || it.Folder != "PM ×2" {
 		t.Errorf("herd row wrong: folder=%q fleet=%+v", it.Folder, it.Fleet)
+	}
+	if !strings.Contains(it.Title, "project-manager") {
+		t.Errorf("title = %q, want it to name the repository", it.Title)
 	}
 	if it.WinID != 33 {
 		t.Errorf("win_id = %d, want the bound window 33", it.WinID)
@@ -494,6 +576,32 @@ func TestHerdRowOnlyOnItsOwnDesktop(t *testing.T) {
 	for _, it := range p.Items {
 		if it.Fleet != nil {
 			t.Errorf("a herd bound to window 33 leaked onto another desktop: %+v", it)
+		}
+	}
+}
+
+// The label line is the one place a herd row can be read at a glance, and it has
+// about ten characters at 179px. Both halves have to survive in them.
+func TestHerdLabelKeepsBothTheProjectAndTheCount(t *testing.T) {
+	for _, c := range []struct{ label, want string }{
+		// A multi-word project goes to its initials: "project-…" was the stub every
+		// workspace of one checkout shared, and it named none of them.
+		{"project-manager", "PM ×6"},
+		// Distinct projects stay distinct, which a head-clip would not manage.
+		{"agentic-colony", "AC ×6"},
+		// Short enough to spell out: no reason to abbreviate.
+		{"gitlab", "gitlab ×6"},
+		{"ezsre", "ezsre ×6"},
+		// One long word has no initials worth having — one letter names nothing — so
+		// it is clipped instead.
+		{"monobuilder", "monobu… ×6"},
+		// Deep worktree labels stop at four letters rather than growing unbounded.
+		{"a-b-c-d-e-f", "ABCD ×6"},
+		// Nothing shared: the count is all that is claimed.
+		{"", "herd ×6"},
+	} {
+		if got := herdLabel(c.label, 6); got != c.want {
+			t.Errorf("herdLabel(%q) = %q, want %q", c.label, got, c.want)
 		}
 	}
 }
