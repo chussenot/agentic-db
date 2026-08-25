@@ -48,6 +48,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"sort"
@@ -273,7 +274,25 @@ var runAgentList = func(ctx context.Context) ([]byte, error) {
 		return nil, ErrNotInstalled
 	}
 	cmd := exec.CommandContext(ctx, path, "agent", "list")
+	// WaitDelay is what actually makes the caller's deadline a BOUND. Output()
+	// waits for stdout EOF, and that needs every inheritor of the pipe to close it
+	// — cancelling the context kills the direct child only. Measured: a `sleep 5`
+	// stand-in took the full 5s against a 400ms deadline. herdr 0.8.2 happens to be
+	// a static binary that forks nothing, so today the deadline holds by luck; a
+	// wrapper script, a shim, or a herdr that spawns its own server re-opens it.
+	// This runs on the daemon's actor goroutine, so "by luck" is not good enough.
+	cmd.WaitDelay = time.Second
 	out, err := cmd.Output() // stderr deliberately dropped: the JSON is on stdout
+	// A non-zero exit with output is NORMAL: herdr reports refusals as an error
+	// envelope on stdout (see ServerError), so the output is the diagnosable part
+	// and must not be thrown away. But that tolerance must not swallow a TRUNCATED
+	// read: a deadline kill mid-write also leaves output behind, and treating those
+	// bytes as a roster reported "no herdr agents", wiped every herd row off the bar
+	// and pruned the freshness ratchet the churn resistance depends on — with no
+	// diagnostic. So the context's own failure always wins over the bytes.
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
 	if len(out) > 0 {
 		return out, nil
 	}
@@ -361,12 +380,20 @@ type rawAgentSession struct {
 func ParseAgentList(data []byte) ([]Agent, error) {
 	var env rawEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
-		return nil, nil
+		// An UNPARSEABLE payload is an error, never an empty roster. Tolerance
+		// belongs on unknown FIELDS (herdr adds them, and there is a test for
+		// that); it must not extend to bytes that are not a payload at all,
+		// because "zero agents" is a meaningful answer here — it wipes every herd
+		// row off the bar and prunes the freshness ratchet. A truncated read must
+		// look like a failure so the caller keeps the state it already had.
+		return nil, fmt.Errorf("herdr agent list: %w", err)
 	}
 	if env.Error != nil {
 		return nil, &ServerError{Code: env.Error.Code, Message: env.Error.Message}
 	}
 	if env.Result == nil {
+		// Valid payload carrying neither result nor error: genuinely nothing to
+		// report, as distinct from the unparseable case above.
 		return nil, nil
 	}
 	out := make([]Agent, 0, len(env.Result.Agents))

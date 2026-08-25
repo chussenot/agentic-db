@@ -333,7 +333,14 @@ func TestTickHerdsBuildsGroupsFromTheRoster(t *testing.T) {
 
 // A herdr that is not there must not leave a stale herd on the bar, and must not
 // take the tick down either.
-func TestTickHerdsClearsOnFailureAndToleratesNoProvider(t *testing.T) {
+// A failed roster read is TOLERATED for a few ticks and only then believed. The
+// original contract cleared on the first failure, on the reasoning that an
+// unreachable herdr means no herd — right about a herdr that is genuinely gone, and
+// destructive about a flaky read: one bad tick wiped every herd row off the bar AND
+// pruned the per-workspace freshness ratchet, i.e. it destroyed the churn resistance
+// this code exists to provide, a second before the next read succeeded. A stale herd
+// row beats no row; three consecutive failures is a state worth believing.
+func TestTickHerdsHoldsHerdsAcrossTransientFailuresThenClears(t *testing.T) {
 	d := herdrHarness(t, herdrSessionFixture, []herdr.Agent{
 		{Kind: "claude", Status: herdr.StatusIdle, WorkspaceID: "w1", PaneID: "w1:pA", Name: "keeper"},
 	})
@@ -341,16 +348,57 @@ func TestTickHerdsClearsOnFailureAndToleratesNoProvider(t *testing.T) {
 	if len(d.herds) != 1 {
 		t.Fatalf("setup: want one herd, got %+v", d.herds)
 	}
+
 	d.herdr = fleet.NewHerdrProviderFrom(
 		func(context.Context) ([]herdr.Agent, error) {
 			return nil, &herdr.ServerError{Code: "server_not_running"}
 		},
 		filepath.Join(t.TempDir(), "session.json"))
+
+	for i := 1; i < herdrMissThreshold; i++ {
+		d.tickHerds(context.Background(), nil)
+		if len(d.herds) != 1 {
+			t.Fatalf("failure %d of %d already dropped the herd: %+v", i, herdrMissThreshold, d.herds)
+		}
+	}
 	d.tickHerds(context.Background(), nil)
 	if d.herds != nil {
-		t.Errorf("a refusal left %+v on the bar; an unreachable herdr means no herd, not the last one", d.herds)
+		t.Errorf("after %d consecutive failures the herd should be gone, got %+v", herdrMissThreshold, d.herds)
 	}
 
 	d.herdr = nil
 	d.tickHerds(context.Background(), nil) // must not panic
+}
+
+// A failure streak that recovers must not leave the counter armed, or the next
+// isolated hiccup would clear immediately.
+func TestTickHerdsResetsToleranceOnRecovery(t *testing.T) {
+	agents := []herdr.Agent{
+		{Kind: "claude", Status: herdr.StatusIdle, WorkspaceID: "w1", PaneID: "w1:pA", Name: "keeper"},
+	}
+	d := herdrHarness(t, herdrSessionFixture, agents)
+	d.tickHerds(context.Background(), nil)
+
+	failing := fleet.NewHerdrProviderFrom(
+		func(context.Context) ([]herdr.Agent, error) {
+			return nil, &herdr.ServerError{Code: "server_not_running"}
+		},
+		filepath.Join(t.TempDir(), "session.json"))
+	good := d.herdr
+
+	for i := 1; i < herdrMissThreshold; i++ {
+		d.herdr = failing
+		d.tickHerds(context.Background(), nil)
+	}
+	d.herdr = good
+	d.tickHerds(context.Background(), nil)
+	if d.herdrMiss != 0 {
+		t.Fatalf("a good read left the tolerance counter at %d", d.herdrMiss)
+	}
+	// One isolated failure after recovery must still be tolerated.
+	d.herdr = failing
+	d.tickHerds(context.Background(), nil)
+	if len(d.herds) != 1 {
+		t.Errorf("an isolated failure after recovery dropped the herd: %+v", d.herds)
+	}
 }

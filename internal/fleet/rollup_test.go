@@ -316,3 +316,31 @@ func TestEffectiveActivityWithNoFleetIsTheSessionsOwn(t *testing.T) {
 		t.Errorf("EffectiveActivity = %v, want %v", got, own)
 	}
 }
+
+// Every Demand rung must have its own bucket, and the buckets must sum to Total.
+// This is the concrete hazard of inserting a rung into an iota enum: DemandUnknown
+// was added between DemandIdle and DemandDone, and a switch missing that case does
+// not merely lose a count — the agent still counts in Live and still appears in
+// Demands, so the summary silently stops adding up.
+func TestRollupBucketsCoverEveryDemandRung(t *testing.T) {
+	kids := []Child{}
+	for d := DemandHuman; d <= DemandDone; d++ {
+		kids = append(kids, Child{SessionID: d.String(), Demand: d})
+	}
+	r := summarize("owner", kids)
+
+	if r.Total != len(kids) {
+		t.Fatalf("Total = %d, want %d", r.Total, len(kids))
+	}
+	sum := r.AwaitingHuman + r.Working + r.Blocked + r.Idle + r.Unknown + r.Done
+	if sum != r.Total {
+		t.Errorf("buckets sum to %d but Total is %d — a rung has no bucket: %+v", sum, r.Total, r)
+	}
+	if r.Unknown != 1 {
+		t.Errorf("Unknown = %d, want 1", r.Unknown)
+	}
+	// And the reduction a renderer sees must carry it too.
+	if got := Summarize(r); got.Unknown != 1 {
+		t.Errorf("Summary.Unknown = %d, want 1", got.Unknown)
+	}
+}

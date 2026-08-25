@@ -159,7 +159,7 @@ func Summarize(r Rollup) Summary {
 	s := Summary{
 		Total: r.Total, Live: r.Live,
 		Awaiting: r.AwaitingHuman, Working: r.Working, Blocked: r.Blocked,
-		Idle: r.Idle, Done: r.Done,
+		Idle: r.Idle, Unknown: r.Unknown, Done: r.Done,
 		Neediest: r.Neediest.Name, Needs: r.Neediest.Needs,
 		Worst: r.Worst,
 	}

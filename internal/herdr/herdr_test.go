@@ -218,13 +218,10 @@ func TestParseAgentListStatusVocabulary(t *testing.T) {
 }
 
 func TestParseAgentListDegradesToNoData(t *testing.T) {
-	// Every one of these is "herdr told me nothing usable", which is an empty
-	// roster and NOT an error: this runs once a second, and an error here would
-	// only teach callers to ignore errors.
+	// A payload that IS a payload but reports nothing usable: an empty roster and
+	// NOT an error. This runs once a second, and an error here would only teach
+	// callers to ignore errors.
 	for _, tc := range []struct{ name, payload string }{
-		{"garbage", `not json at all`},
-		{"truncated", `{"id":"cli:agent:list","result":{"agents":[{"agent":"cl`},
-		{"empty", ``},
 		{"no result", `{"id":"cli:agent:list"}`},
 		{"result without agents", `{"id":"cli:agent:list","result":{"type":"agent_list"}}`},
 		{"agents at the top level", `{"agents":[{"agent":"claude","pane_id":"w1:p1"}]}`},
@@ -237,6 +234,31 @@ func TestParseAgentListDegradesToNoData(t *testing.T) {
 			}
 			if len(got) != 0 {
 				t.Errorf("want no agents, got %+v", got)
+			}
+		})
+	}
+}
+
+// Bytes that are NOT a payload must be an ERROR, not an empty roster — the
+// distinction the original table missed, and it is destructive rather than
+// cosmetic. "Zero agents" is a meaningful answer here: it wipes every herd row off
+// the bar and prunes the per-workspace freshness ratchet that the churn resistance
+// depends on. A truncated or killed read must therefore look like a failure so the
+// caller keeps the state it already had, rather than confidently reporting that the
+// herds went away.
+func TestParseAgentListRejectsNonPayloads(t *testing.T) {
+	for _, tc := range []struct{ name, payload string }{
+		{"garbage", `not json at all`},
+		{"truncated mid-write", `{"id":"cli:agent:list","result":{"agents":[{"agent":"cl`},
+		{"empty", ``},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseAgentList([]byte(tc.payload))
+			if err == nil {
+				t.Fatalf("want an error for a non-payload, got none (agents=%+v)", got)
+			}
+			if len(got) != 0 {
+				t.Errorf("want no agents alongside the error, got %+v", got)
 			}
 		})
 	}

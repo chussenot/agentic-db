@@ -208,6 +208,9 @@ type daemon struct {
 	herdr *fleet.HerdrProvider
 	// herds is the latest group set, fed to the tile as FleetView.Herds.
 	herds []fleet.Group
+	// herdrMiss counts consecutive failed roster reads. The herds above are held
+	// across a few of them rather than cleared on the first — see tickHerds.
+	herdrMiss int
 	// lastHerdFP is the roster fingerprint the log last spoke about, so a steady
 	// herd is silent (the group BUILD still runs every tick — see
 	// fleet.HerdrProvider.Fingerprint for why it must).

@@ -127,11 +127,16 @@ type Rollup struct {
 	// Live counts children that have not finished; Total counts all of them.
 	Live  int
 	Total int
-	// AwaitingHuman, Working, Blocked, Idle, Done are the per-demand counts.
+	// AwaitingHuman, Working, Blocked, Idle, Unknown, Done are the per-demand
+	// counts. There is ONE PER RUNG deliberately: a missing bucket does not just
+	// lose a number, it makes the buckets stop summing to Total while the agent
+	// still counts in Live and still appears in Demands — which is the whole
+	// hazard of inserting a rung into an iota enum.
 	AwaitingHuman int
 	Working       int
 	Blocked       int
 	Idle          int
+	Unknown       int
 	Done          int
 	// Worst is the highest-precedence demand across the fleet (DemandDone when
 	// every child has finished).
@@ -369,6 +374,8 @@ func summarize(sessionID string, kids []Child) Rollup {
 			r.Blocked++
 		case DemandIdle:
 			r.Idle++
+		case DemandUnknown:
+			r.Unknown++
 		case DemandDone:
 			r.Done++
 		}

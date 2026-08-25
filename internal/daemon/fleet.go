@@ -230,6 +230,11 @@ func (d *daemon) logFleetChanges(next map[string]fleet.Rollup) {
 // tick's budget instead of a human's patience.
 const herdrTickTimeout = 400 * time.Millisecond
 
+// herdrMissThreshold is how many consecutive failed roster reads are tolerated
+// before the herds are dropped. Mirrors firstPartyMissThreshold, and for the same
+// reason: one bad read is noise, three in a row is a state worth believing.
+const herdrMissThreshold = 3
+
 // tickHerds refreshes the herd groups from herdr's live roster.
 //
 // SEPARATE FROM tickFleet, and not merged into it, because the two substrates fail
@@ -261,10 +266,22 @@ func (d *daemon) tickHerds(ctx context.Context, fp map[string]clauded.Session) {
 			d.herdrQuiet = msg
 			logf("herdr roster: %s", msg)
 		}
-		d.herds = nil
+		// KEEP the last known herds for a few ticks rather than clearing on the
+		// first failure. Clearing immediately made one flaky read equivalent to
+		// "the herds went away": every herd row vanished from the bar, and the
+		// per-workspace freshness ratchet was pruned with them — destroying exactly
+		// the churn resistance this code exists to provide, for a read that a
+		// second later succeeds again. A stale herd row is a far better answer than
+		// no row, and the same 3-tick tolerance the first-party reap already uses
+		// (firstPartyMissThreshold) bounds how long we will insist on it.
+		d.herdrMiss++
+		if d.herdrMiss >= herdrMissThreshold {
+			d.herds = nil
+		}
 		return
 	}
 	d.herdrQuiet = ""
+	d.herdrMiss = 0
 	d.herds = groups
 	d.logHerdChanges()
 }
