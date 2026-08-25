@@ -133,6 +133,11 @@ func TestIdentityRoundTrip(t *testing.T) {
 		ClaudePID:       newInt(2920644),
 		ClaudeProcStart: newStr("27771327"),
 		OwnerSessionID:  newStr("2e1ce074"),
+		// A herdr pane is an ordinary interactive session that happens to live in a
+		// multiplexer, so the pane identity travels alongside — not instead of — the
+		// rest of it.
+		HerdrPaneID:      newStr("w1:p8V"),
+		HerdrWorkspaceID: newStr("w1"),
 	}
 	if err := d.Upsert(s); err != nil {
 		t.Fatalf("Upsert: %v", err)
@@ -143,7 +148,8 @@ func TestIdentityRoundTrip(t *testing.T) {
 	}
 	if got.Kind != s.Kind || got.SessionName != s.SessionName || got.JobID != s.JobID ||
 		got.ClaudePID != s.ClaudePID || got.ClaudeProcStart != s.ClaudeProcStart ||
-		got.OwnerSessionID != s.OwnerSessionID {
+		got.OwnerSessionID != s.OwnerSessionID || got.HerdrPaneID != s.HerdrPaneID ||
+		got.HerdrWorkspaceID != s.HerdrWorkspaceID {
 		t.Errorf("identity round-trip mismatch:\n got %+v\nwant %+v", got, s)
 	}
 	if !got.IsBackground() {
@@ -195,10 +201,13 @@ func TestUpsertDoesNotClobberDaemonIdentity(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	// 2. The daemon resolves the name and the owner.
+	// 2. The daemon resolves the name and the owner. It also learns the pane, which
+	// the hook may well have written first — either way the merge below must keep it.
 	changed, err := d.SetIdentity("bg-2", Identity{
-		SessionName:    strp("project-manager-3"),
-		OwnerSessionID: strp("2e1ce074"),
+		SessionName:      strp("project-manager-3"),
+		OwnerSessionID:   strp("2e1ce074"),
+		HerdrPaneID:      strp("w1:p8V"),
+		HerdrWorkspaceID: strp("w1"),
 	})
 	if err != nil || !changed {
 		t.Fatalf("SetIdentity: changed=%v err=%v", changed, err)
@@ -219,6 +228,14 @@ func TestUpsertDoesNotClobberDaemonIdentity(t *testing.T) {
 	}
 	if got.OwnerSessionID.String != "2e1ce074" {
 		t.Errorf("owner_session_id clobbered by hook Upsert: %+v", got.OwnerSessionID)
+	}
+	// The pane join is the reason a colony tick is attributable at all; a hook
+	// Upsert built from a stale read must not null it back out.
+	if got.HerdrPaneID.String != "w1:p8V" {
+		t.Errorf("herdr_pane_id clobbered by hook Upsert: %+v", got.HerdrPaneID)
+	}
+	if got.HerdrWorkspaceID.String != "w1" {
+		t.Errorf("herdr_workspace_id clobbered by hook Upsert: %+v", got.HerdrWorkspaceID)
 	}
 	if got.LastSeenTS != 2000 {
 		t.Errorf("last_seen_ts = %d, want 2000 (non-identity columns still overwrite)", got.LastSeenTS)
@@ -303,14 +320,21 @@ VALUES ('legacy', '/home/e/old', 'idle', 42, 42);`); err != nil {
 	if got.Cwd.String != "/home/e/old" || got.LastSeenTS != 42 {
 		t.Errorf("legacy row corrupted: %+v", got)
 	}
-	if got.Kind.Valid || got.JobID.Valid || got.ClaudePID.Valid || got.OwnerSessionID.Valid {
+	if got.Kind.Valid || got.JobID.Valid || got.ClaudePID.Valid || got.OwnerSessionID.Valid ||
+		got.HerdrPaneID.Valid || got.HerdrWorkspaceID.Valid {
 		t.Errorf("new columns should be NULL on a migrated row: %+v", got)
 	}
 	if got.IsBackground() {
 		t.Error("a migrated legacy row must not read as background")
 	}
-	// And the migrated DB is writable through the new path.
-	if changed, err := d.SetIdentity("legacy", Identity{Kind: strp("interactive")}); err != nil || !changed {
+	// And the migrated DB is writable through the new path, herdr columns included.
+	if changed, err := d.SetIdentity("legacy", Identity{
+		Kind:        strp("interactive"),
+		HerdrPaneID: strp("w1:p8V"),
+	}); err != nil || !changed {
 		t.Fatalf("SetIdentity on migrated row: changed=%v err=%v", changed, err)
+	}
+	if got, _, _ := d.Get("legacy"); got.HerdrPaneID.String != "w1:p8V" {
+		t.Errorf("herdr_pane_id after migrate+write = %+v, want w1:p8V", got.HerdrPaneID)
 	}
 }

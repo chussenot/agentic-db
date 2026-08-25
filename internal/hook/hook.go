@@ -74,9 +74,28 @@ const fleetNotifySep = " needs your input: "
 // CLAUDE_CODE_SESSION_NAME are NOT inherited by children — they exist only on the
 // background process itself — so the hook cannot read them and does not try; the
 // daemon picks the name up from the first-party status file instead.
+//
+// HERDR_PANE_ID / HERDR_WORKSPACE_ID come from a different producer: herdr, the
+// multiplexer that hosts many Claude agents inside ONE terminal window. It injects
+// them into every pane it runs, and a hook is a child of the pane's claude, so it
+// inherits them — verified on a live tool child of a herdr-hosted claude (the
+// child's /proc/<pid>/environ carries HERDR_PANE_ID, HERDR_TAB_ID and
+// HERDR_WORKSPACE_ID, identical to its parent's). This is the same free ride
+// CLAUDE_JOB_DIR gave us: an exact session<->pane join with no socket roundtrip, no
+// file read, and no dependence on herdr's Claude integration being installed.
+//
+// It matters because a herdr pane's claude is an ORDINARY interactive session —
+// kind "interactive", no jobId, no CLAUDE_CODE_SESSION_KIND=bg — so the whole
+// background-agent machinery is blind to it, while window_id/terminal_pid are
+// shared by every pane of the multiplexer and can no longer tell two agents apart.
+// The pane id is what makes a 34-second colony tick attributable to the pane that
+// ran it. HERDR_AGENT_NAME is deliberately NOT injected: a child cannot learn its
+// own agent name from the environment, so the PANE ID is the join key, not the name.
 const (
-	envClaudePID = "CLAUDE_PID"
-	envJobDir    = "CLAUDE_JOB_DIR"
+	envClaudePID        = "CLAUDE_PID"
+	envJobDir           = "CLAUDE_JOB_DIR"
+	envHerdrPaneID      = "HERDR_PANE_ID"
+	envHerdrWorkspaceID = "HERDR_WORKSPACE_ID"
 )
 
 // lookupEnv is the environment seam, so tests can drive identity without setting
@@ -103,6 +122,13 @@ type selfIdentity struct {
 	// ProcStart is ClaudePID's start time, so a recycled pid cannot later make a
 	// dead session look alive.
 	ProcStart string
+	// HerdrPaneID is the herdr pane hosting this session, e.g. "w1:p8V"; empty
+	// when we are not running under herdr. Unlike Kind it says nothing about the
+	// session's lifecycle — a herdr pane is interactive — it says WHERE it lives.
+	HerdrPaneID string
+	// HerdrWorkspaceID is that pane's herdr workspace, e.g. "w1": the level bound
+	// to a git checkout, so it is the grouping key for the panes of one herd.
+	HerdrWorkspaceID string
 }
 
 // isBackground reports whether the environment identified this as a background
@@ -127,6 +153,12 @@ func readSelfIdentity() selfIdentity {
 			}
 		}
 	}
+	// Pane identity, when herdr is the host. Read unconditionally and kept
+	// independent of Kind: a herdr pane's claude looks exactly like any other
+	// interactive session, so there is no marker to gate this on but the variables
+	// themselves.
+	id.HerdrPaneID = lookupEnv(envHerdrPaneID)
+	id.HerdrWorkspaceID = lookupEnv(envHerdrWorkspaceID)
 	return id
 }
 
@@ -256,6 +288,20 @@ func run(r io.Reader, dbPath string, startPID int) error {
 		}
 		if self.ProcStart != "" {
 			s.ClaudeProcStart = nullString(self.ProcStart)
+		}
+		// Same resolve-once gate on purpose, rather than one keyed on
+		// !s.HerdrPaneID.Valid: for the overwhelming majority of sessions there is no
+		// pane id to find, so a gate of its own would be permanently open and would
+		// drag the ProcStart /proc read back onto every single hook. A herdr pane's
+		// claude exports CLAUDE_PID, so SessionStart already opens this gate for the
+		// sessions that have something to record. Sessions already running when this
+		// shipped pick their pane up at their next SessionStart, which for a colony
+		// tick is a minute away.
+		if self.HerdrPaneID != "" {
+			s.HerdrPaneID = nullString(self.HerdrPaneID)
+		}
+		if self.HerdrWorkspaceID != "" {
+			s.HerdrWorkspaceID = nullString(self.HerdrWorkspaceID)
 		}
 	}
 

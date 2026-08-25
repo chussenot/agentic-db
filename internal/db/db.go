@@ -43,7 +43,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_window ON sessions(window_id);
 
 -- NOTE: repo_id and the session-identity columns (kind, session_name, job_id,
 -- claude_pid, claude_proc_start, owner_session_id, console_session_id,
--- console_ts) are added by migrate, not here — see migrate for what they mean.
+-- console_ts, herdr_pane_id, herdr_workspace_id) are added by migrate, not here
+-- — see migrate for what they mean.
 
 -- events is an append-only audit log retained INDEFINITELY: it is not pruned
 -- automatically (PruneEvents exists as a manual primitive only). Two producers
@@ -162,6 +163,15 @@ type Session struct {
 	ConsoleSessionID sql.NullString
 	// ConsoleTS is the unix-ms time ConsoleSessionID was last stamped.
 	ConsoleTS sql.NullInt64
+	// HerdrPaneID is the herdr pane that hosts this session, e.g. "w1:p8V". herdr
+	// is a MULTIPLEXER: N Claude sessions share one terminal window, so window_id
+	// and terminal_pid stop being an identity there (four live agents measured on
+	// window 33, terminal_pid 2289519). The pane id is what tells them apart.
+	// NULL for any session not running under herdr, which is most of them.
+	HerdrPaneID sql.NullString
+	// HerdrWorkspaceID is the pane's herdr workspace, e.g. "w1" — the level bound
+	// to a git checkout, and therefore the grouping key for "one row per herd".
+	HerdrWorkspaceID sql.NullString
 }
 
 // Event is one row of the audit log: a single hook invocation and the
@@ -420,6 +430,28 @@ func migrate(sqldb *sql.DB) error {
 		{"owner_session_id", "TEXT", `SPAWN edge: whose fleet this is`},
 		{"console_session_id", "TEXT", `ATTENTION edge: who was told this one needs input`},
 		{"console_ts", "INTEGER", `when that attention edge was last stamped`},
+		// herdr pane identity. herdr hosts many Claude agents inside ONE terminal
+		// window, so window_id/terminal_pid collapse: they are shared by every pane
+		// of the multiplexer and can no longer name a session. These two columns are
+		// the pane-level identity, and the hook gets them FREE — herdr injects
+		// HERDR_PANE_ID/HERDR_WORKSPACE_ID into every pane it runs and the hook is a
+		// child of the pane's claude, so it inherits them (the same trick
+		// CLAUDE_JOB_DIR gave us: no API call, no socket, no file read).
+		//
+		// Worth having even with herdr's Claude integration installed: this is an
+		// EXACT session<->pane join recorded at ingest, so a 34-second colony tick
+		// stays attributable to the pane that ran it long after the pane's occupant
+		// is gone — and it keeps working when the integration is not installed.
+		//
+		// A herdr pane's claude is an ORDINARY interactive session — kind
+		// 'interactive', no job_id, no CLAUDE_CODE_SESSION_KIND=bg — which is exactly
+		// why the background-agent machinery cannot see it: IsBackground() is false
+		// for every herdr agent. These columns are the only marker that it is one.
+		//
+		// Note HERDR_AGENT_NAME is NOT injected: a child cannot learn its own agent
+		// name from the environment, so the pane id is the join key, never the name.
+		{"herdr_pane_id", "TEXT", `herdr pane hosting this session, e.g. "w1:p8V"`},
+		{"herdr_workspace_id", "TEXT", `that pane's herdr workspace, e.g. "w1"`},
 	} {
 		if _, err := sqldb.Exec(`ALTER TABLE sessions ADD COLUMN ` + c.col + ` ` + c.decl); err != nil &&
 			!strings.Contains(err.Error(), "duplicate column name") {
@@ -465,8 +497,9 @@ INSERT INTO sessions
   (session_id, cwd, window_id, terminal_pid, repo_id, state, notify_kind,
    last_talk_ts, last_event_ts, last_seen_ts, created_ts,
    kind, session_name, job_id, claude_pid, claude_proc_start,
-   owner_session_id, console_session_id, console_ts)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+   owner_session_id, console_session_id, console_ts,
+   herdr_pane_id, herdr_workspace_id)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(session_id) DO UPDATE SET
   cwd           = excluded.cwd,
   window_id     = excluded.window_id,
@@ -484,12 +517,15 @@ ON CONFLICT(session_id) DO UPDATE SET
   claude_proc_start  = COALESCE(excluded.claude_proc_start, sessions.claude_proc_start),
   owner_session_id   = COALESCE(excluded.owner_session_id, sessions.owner_session_id),
   console_session_id = COALESCE(excluded.console_session_id, sessions.console_session_id),
-  console_ts         = COALESCE(excluded.console_ts, sessions.console_ts)
+  console_ts         = COALESCE(excluded.console_ts, sessions.console_ts),
+  herdr_pane_id      = COALESCE(excluded.herdr_pane_id, sessions.herdr_pane_id),
+  herdr_workspace_id = COALESCE(excluded.herdr_workspace_id, sessions.herdr_workspace_id)
 `,
 		s.SessionID, s.Cwd, s.WindowID, s.TerminalPID, s.RepoID, s.State, s.NotifyKind,
 		s.LastTalkTS, s.LastEventTS, s.LastSeenTS, s.CreatedTS,
 		s.Kind, s.SessionName, s.JobID, s.ClaudePID, s.ClaudeProcStart,
-		s.OwnerSessionID, s.ConsoleSessionID, s.ConsoleTS)
+		s.OwnerSessionID, s.ConsoleSessionID, s.ConsoleTS,
+		s.HerdrPaneID, s.HerdrWorkspaceID)
 	if err != nil {
 		return fmt.Errorf("upsert: %w", err)
 	}
@@ -507,6 +543,8 @@ type Identity struct {
 	OwnerSessionID   *string
 	ConsoleSessionID *string
 	ConsoleTS        *int64
+	HerdrPaneID      *string
+	HerdrWorkspaceID *string
 }
 
 // SetIdentity applies a narrow UPDATE for the non-nil fields of patch. changed
@@ -517,8 +555,8 @@ type Identity struct {
 // value: the console edge legitimately moves when the fleet is watched from
 // somewhere else, and a caller with better information should win.
 func (d *DB) SetIdentity(sessionID string, patch Identity) (changed bool, err error) {
-	sets := make([]string, 0, 8)
-	args := make([]any, 0, 9)
+	sets := make([]string, 0, 10)
+	args := make([]any, 0, 11)
 	add := func(col string, v any) {
 		sets = append(sets, col+" = ?")
 		args = append(args, v)
@@ -547,6 +585,12 @@ func (d *DB) SetIdentity(sessionID string, patch Identity) (changed bool, err er
 	if patch.ConsoleTS != nil {
 		add("console_ts", *patch.ConsoleTS)
 	}
+	if patch.HerdrPaneID != nil {
+		add("herdr_pane_id", *patch.HerdrPaneID)
+	}
+	if patch.HerdrWorkspaceID != nil {
+		add("herdr_workspace_id", *patch.HerdrWorkspaceID)
+	}
 	if len(sets) == 0 {
 		return false, nil
 	}
@@ -570,14 +614,16 @@ func (d *DB) SetIdentity(sessionID string, patch Identity) (changed bool, err er
 const selectCols = `session_id, cwd, window_id, terminal_pid, repo_id, state, notify_kind,
   last_talk_ts, last_event_ts, last_seen_ts, created_ts,
   kind, session_name, job_id, claude_pid, claude_proc_start,
-  owner_session_id, console_session_id, console_ts`
+  owner_session_id, console_session_id, console_ts,
+  herdr_pane_id, herdr_workspace_id`
 
 func scanSession(row interface{ Scan(...any) error }) (Session, error) {
 	var s Session
 	err := row.Scan(&s.SessionID, &s.Cwd, &s.WindowID, &s.TerminalPID, &s.RepoID, &s.State,
 		&s.NotifyKind, &s.LastTalkTS, &s.LastEventTS, &s.LastSeenTS, &s.CreatedTS,
 		&s.Kind, &s.SessionName, &s.JobID, &s.ClaudePID, &s.ClaudeProcStart,
-		&s.OwnerSessionID, &s.ConsoleSessionID, &s.ConsoleTS)
+		&s.OwnerSessionID, &s.ConsoleSessionID, &s.ConsoleTS,
+		&s.HerdrPaneID, &s.HerdrWorkspaceID)
 	return s, err
 }
 

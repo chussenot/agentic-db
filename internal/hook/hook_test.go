@@ -554,8 +554,77 @@ func TestNoEnvIdentityLeavesColumnsNull(t *testing.T) {
 	if s.Kind.Valid || s.JobID.Valid || s.ClaudePID.Valid || s.ClaudeProcStart.Valid {
 		t.Errorf("identity should be NULL with an empty environment: %+v", s)
 	}
+	// No herdr, no pane: the columns stay NULL rather than recording "" — NULL
+	// means "not resolved", and outside herdr there is nothing to resolve.
+	if s.HerdrPaneID.Valid || s.HerdrWorkspaceID.Valid {
+		t.Errorf("herdr columns should be NULL with an empty environment: %+v", s)
+	}
 	if s.State != string(state.Idle) {
 		t.Errorf("state = %q, want idle (unchanged behaviour)", s.State)
+	}
+}
+
+// A herdr pane's hook inherits HERDR_PANE_ID/HERDR_WORKSPACE_ID from the pane's
+// claude, and that is the ONLY thing that distinguishes it: the session itself is
+// an ordinary interactive one (no job dir, IsBackground() false), and its window is
+// the multiplexer's, shared with every other pane. So the pane columns must be
+// recorded independently of kind, not derived from it.
+func TestHerdrPaneIdentityFromEnv(t *testing.T) {
+	fixedClock(t, time.UnixMilli(1786714000000))
+	path := tempDBPath(t)
+	stubEnv(t, map[string]string{
+		"CLAUDE_PID":         strconv.Itoa(os.Getpid()),
+		"HERDR_PANE_ID":      "w1:p8V",
+		"HERDR_WORKSPACE_ID": "w1",
+		"HERDR_TAB_ID":       "w1:t8V",
+		"HERDR_SOCKET_PATH":  "/home/e/.config/herdr/herdr.sock",
+	})
+	drive(t, path, `{"session_id":"pane-1","hook_event_name":"SessionStart","cwd":"/repo"}`)
+
+	s, found := getRow(t, path, "pane-1")
+	if !found {
+		t.Fatal("row not created")
+	}
+	if s.HerdrPaneID.String != "w1:p8V" {
+		t.Errorf("herdr_pane_id = %+v, want w1:p8V", s.HerdrPaneID)
+	}
+	if s.HerdrWorkspaceID.String != "w1" {
+		t.Errorf("herdr_workspace_id = %+v, want w1", s.HerdrWorkspaceID)
+	}
+	// Everything else reads exactly as it did before: a herdr agent is interactive,
+	// which is precisely why the bg-agent machinery cannot see it.
+	if s.Kind.String != "interactive" {
+		t.Errorf("kind = %+v, want interactive for a herdr pane", s.Kind)
+	}
+	if s.JobID.Valid {
+		t.Errorf("job_id = %+v, want NULL for a herdr pane", s.JobID)
+	}
+	if s.IsBackground() {
+		t.Error("a herdr pane must not read as a background agent")
+	}
+}
+
+// The pane id survives later hooks that no longer carry the environment (and,
+// through Upsert's COALESCE, a row read before it was written). Also proves it is
+// not re-derived on every hook: the value stored at SessionStart is the one served.
+func TestHerdrPaneIDSurvivesLaterHooks(t *testing.T) {
+	fixedClock(t, time.UnixMilli(1786714000000))
+	path := tempDBPath(t)
+	stubEnv(t, map[string]string{
+		"CLAUDE_PID":         strconv.Itoa(os.Getpid()),
+		"HERDR_PANE_ID":      "w1:p8V",
+		"HERDR_WORKSPACE_ID": "w1",
+	})
+	drive(t, path, `{"session_id":"pane-2","hook_event_name":"SessionStart","cwd":"/repo"}`)
+
+	// A later hook with a bare environment — e.g. the same session after a
+	// re-exec, or a writer that simply does not know about herdr.
+	stubEnv(t, map[string]string{})
+	drive(t, path, `{"session_id":"pane-2","hook_event_name":"Stop","cwd":"/repo"}`)
+
+	s, _ := getRow(t, path, "pane-2")
+	if s.HerdrPaneID.String != "w1:p8V" || s.HerdrWorkspaceID.String != "w1" {
+		t.Errorf("pane identity lost by a later hook: %+v / %+v", s.HerdrPaneID, s.HerdrWorkspaceID)
 	}
 }
 
