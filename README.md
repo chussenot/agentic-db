@@ -42,21 +42,27 @@ wired up:
 | `gc` | Run the dead-session reap pass once and report reaped rows. `--orphans` instead sweeps windowless rows Claude Code no longer lists (dry run; `--yes` deletes, `--orphan-age` sets the floor). |
 | `gen-waybar` | Emit paste-ready waybar `format-icons` JSON and `style.css` fragments. |
 | `doctor` | Dump the DB schema/rows and the live niri windows list (debugging). |
-| `fleet` | Show background agents, who owns them, what they are waiting on, and each session's own-vs-fleet idle age. `--json`, `--cross-check` (diff against `claude agents --json`). |
+| `fleet` | Show agent groups — herds from herdr and fleets from Claude Code's own background agents — who owns them, what they are waiting on, and each session's own-vs-group idle age. `--json`, `--cross-check` (diff against `claude agents --json`), `--herdr-session` (herd labels). |
 | `events` | Print the audit log (one row per hook), newest first. `--session <id>`, `--limit N`. |
-| `recap` | Summarize a time window of Claude sessions (topics, effort, streaks, metrics). `--period day\|week\|quarter`, `--since`, `--json`, `--metrics full\|none\|only`. |
+| `recap` | Summarize a time window of Claude sessions (topics, effort, streaks, metrics), naming herdr-hosted runs after their agent rather than the multiplexer's window title. `--period day\|week\|quarter`, `--since`, `--json`, `--metrics full\|none\|only`, `--herdr-session`. |
 | `recap-prompt` | Emit the LLM instructions that turn a recap into a written report. `--period`. |
 | `resume` | Backend for the `claude-resume` picker: `--list` (fzf rows), `--show <id>` (preview), `--init zsh` (shell integration). Bare prints setup help. |
 | `repo-backfill` | One-off, idempotent pass that backfills stored git repos for historical sessions (so old rows resolve in recap project metrics). |
 | `tile-data` | Emit the pwetty `claude`-tile JSON for one niri desktop, keyed by its per-output workspace index. Reads the daemon's precomputed tile cache (falls back to a live build when no daemon is up); always prints valid JSON. `--output` overrides the niri connector. |
 | `tile-watch` | Like `tile-data` but streams the payload for one desktop on every change (for a pwetty `stream: true` module) instead of printing once. |
 
-## Background agents
+## Agent groups
 
-Everything above assumes a session lives in a terminal window. Background agents do
-not, and that breaks enough assumptions to be worth spelling out.
+Everything above assumes a session lives in a terminal window, one session per
+window. Agent groups break that in two different ways, and the tracker now models
+both through one `Provider` interface in `internal/fleet` (`ClaudeCodeProvider`,
+`HerdrProvider`), so a group is a group whatever produced it.
 
-Two different things get called "background":
+**herdr** is the live substrate here (see below). Claude Code's own background
+agents came first and are kept as the second provider — `claude --bg` still exists,
+even though this machine no longer uses it.
+
+Under Claude Code's own mechanism, two different things get called "background":
 
 - a **background session** — `claude --bg`, a `/`-command, a colony dispatch. Its own
   process, its own `session_id`, and it fires all our hooks, so it has always had a
@@ -103,6 +109,46 @@ claude-status fleet          # OWN_IDLE vs FLEET_IDLE per session, plus every ag
 claude-status fleet --json   # same, for tooling
 ```
 
+### herdr: many agents, one window
+
+herdr is a terminal **multiplexer** for coding agents — `workspace` (bound to a git
+checkout) → `tab` → `pane`, where an "agent" is not an object but an *aspect* of a
+pane: whatever currently occupies it. It is **lifecycle-agnostic**: the same surface
+serves a 34-second run and an 8-day session, so nothing here may assume either. (The
+one-shot "tick" pattern belongs to whatever drives herdr, not to herdr.)
+
+That breaks the window axis completely: every pane's Claude is an ORDINARY
+interactive session — `kind: "interactive"`, no `jobId` — and they all resolve to the
+multiplexer's single window. Four agents were measured sharing one `window_id`, one
+`terminal_pid` and one title, with a single title change fanning out to all four in
+the same second. The old 2-row cap then picked two of them by window id and then
+*lexicographically by session UUID*, so which agent you saw was a lottery that
+reshuffled on every run.
+
+What the tracker keys on instead:
+
+- **`(workspace_id, name)` is the identity.** `name` is nullable and is cleared when
+  a pane's occupant exits; `pane_id` is stable only while alive and **churns
+  mid-session** (one agent was watched moving `w1:pCD → w1:pCH → w1:pCJ` while its
+  name never changed), so a pane id is a lookup handle and never a key.
+- **`HERDR_PANE_ID` / `HERDR_WORKSPACE_ID`,** which herdr injects into every pane and
+  a hook inherits — an exact session↔pane join at ingest with no socket call.
+  Verified on a live tool child. (`HERDR_AGENT_NAME` is deliberately not injected, so
+  a session cannot learn its own agent name; the pane id is the join key.)
+- **`herdr agent list`** for the live roster, one socket roundtrip on the 1s tick and
+  never on the 13ms poll. Status is exactly `idle | working | blocked | done |
+  unknown`; `blocked` is the attention signal. `done` maps to idle and is the COMMON
+  case, not an edge one — it is sticky, because CLI reads never mark it seen.
+- **`~/.config/herdr/session.json`** for labels: `custom_name` beats
+  `worktree_space.label`, and that precedence is load-bearing — three live workspaces
+  all carried the label `project-manager`, so label-first painted one herd as three
+  identical rows.
+
+Installing herdr's Claude integration (`herdr integration install claude`) makes
+status *reported* rather than regex-over-a-screen and fills `agent_session` with the
+real Claude session id, collapsing the join to zero hops. The install is purely
+additive to `~/.claude/settings.json` and registers on `SessionStart` only.
+
 ### On the tile
 
 A third kind of desktop turned out to matter most: the one running `claude agents`.
@@ -126,6 +172,18 @@ truthful — `prompt` when any agent waits on you (which is what pulses the tile
 `working`, `shell` for a fleet blocked on itself, else `idle` aged on the *fleet's*
 newest activity. A fleet-unaware template therefore renders it sanely today; drawing
 the bead strip is `claude-status-db-7d8.2` in pwetty-box-rs.
+
+A **herd row** works the same way and is the case that matters now: a window is a
+herdr host iff its sessions carry a `herdr_workspace_id` — no title sniffing and no
+process-tree walking — and each workspace on that desktop collapses to ONE row,
+labelled with the workspace and carrying one bead per agent, worst demand first. A
+herd whose rows have no workspace id yet (a session predating the capture) renders
+exactly as it did before.
+
+Freshness needs two mechanisms, not one: a group's age is the max over its members
+AND a per-workspace high-water mark. The max alone still lies — when the short run
+carrying the herd's only recent activity exits and its row is reaped, a pure max
+jumps the age *backwards*.
 
 The workspace-name glyphs are **not** fed and won't be: those dots are dead config.
 
@@ -256,6 +314,7 @@ internal/niri        niri IPC: ListWindows + event-stream client + window/worksp
 internal/hook        hook subcommand (state derivation, /proc->window resolution, audit row)
 internal/clauded     reads Claude Code's first-party per-session status files (busy/idle/waiting)
 internal/fleet       reads background-agent job records; ownership + fleet roll-up
+internal/herdr       reads herdr's live agent roster + workspace labels (the herd substrate)
 internal/daemon      daemon subcommand (reconciler: aggregate, slots, decay, GC, tile cache)
 internal/tile        tile-data/tile-watch subcommands: pwetty tile payload model + cache
 internal/waybar      gen-waybar subcommand (format-icons + style.css generator)
