@@ -313,7 +313,62 @@ func (d *daemon) tickHerds(ctx context.Context, fp map[string]clauded.Session) {
 	d.herdrQuiet = ""
 	d.herdrMiss = 0
 	d.herds = groups
+	d.persistHerdMembership(groups)
 	d.logHerdChanges()
+}
+
+// persistHerdMembership writes a member's workspace back onto its session row.
+//
+// WHY IT IS NOT ENOUGH TO JOIN IN MEMORY. The hook records the pane from the pane's
+// own environment, which only happens at SessionStart — so a pane whose session
+// started before that hook shipped, or which simply runs for hours, never gets one.
+// Observed on the bar: six live herdr panes on one window, five of them rendering as
+// individual "active claude" rows instead of collapsing into their herds, three of
+// them started that morning and therefore never going to restart on their own.
+// Meanwhile herdr's roster names the session for two of the five outright.
+//
+// The tile keys its herd grouping on the ROW's workspace id, so a join the daemon
+// makes only in memory cannot collapse anything. Writing it back is what closes that
+// gap, and it also repairs the row over time: SetIdentity overwrites (unlike the
+// hook's COALESCE), so a pane id that changed under a live session — they churn —
+// gets corrected on the next tick instead of being wrong until the session ends.
+func (d *daemon) persistHerdMembership(groups []fleet.Group) {
+	if len(groups) == 0 {
+		return
+	}
+	have := make(map[string]db.Session, len(d.sessions))
+	for _, s := range d.sessions {
+		have[s.SessionID] = s
+	}
+	for _, g := range groups {
+		if g.Key.Provider != fleet.ProviderHerdr {
+			continue
+		}
+		ws := g.Key.Key
+		for _, m := range g.Members {
+			if m.SessionID == "" {
+				continue
+			}
+			row, ok := have[m.SessionID]
+			if !ok {
+				continue // no row yet; the next tick will find it
+			}
+			patch := db.Identity{}
+			if row.HerdrWorkspaceID.String != ws {
+				patch.HerdrWorkspaceID = &ws
+			}
+			if m.Ref != "" && row.HerdrPaneID.String != m.Ref {
+				ref := m.Ref
+				patch.HerdrPaneID = &ref
+			}
+			if patch.HerdrWorkspaceID == nil && patch.HerdrPaneID == nil {
+				continue // already agrees; the steady state writes nothing
+			}
+			if _, err := d.db.SetIdentity(m.SessionID, patch); err != nil {
+				logf("herd membership %s: %v", shortID(m.SessionID), err)
+			}
+		}
+	}
 }
 
 // logHerdChanges says something only when herdr's OWN change counters moved.

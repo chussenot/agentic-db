@@ -293,7 +293,13 @@ func herdrHarness(t *testing.T, sessionJSON string, agents []herdr.Agent) *daemo
 	if err := os.WriteFile(path, []byte(sessionJSON), 0o600); err != nil {
 		t.Fatalf("write session.json: %v", err)
 	}
+	database, err := db.Open(filepath.Join(t.TempDir(), "claude.sqlite"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
 	return &daemon{
+		db: database,
 		herdr: fleet.NewHerdrProviderFrom(
 			func(context.Context) ([]herdr.Agent, error) { return agents, nil }, path),
 	}
@@ -400,5 +406,76 @@ func TestTickHerdsResetsToleranceOnRecovery(t *testing.T) {
 	d.tickHerds(context.Background(), nil)
 	if len(d.herds) != 1 {
 		t.Errorf("an isolated failure after recovery dropped the herd: %+v", d.herds)
+	}
+}
+
+// The hook can only record a pane at SessionStart, so a pane that started earlier —
+// or that simply runs for hours — never gets one, and the tile (which groups on the
+// ROW's workspace id) cannot collapse it. herdr's roster names the session, so the
+// daemon writes the membership back.
+func TestPersistHerdMembershipBackfillsAndCorrects(t *testing.T) {
+	d := herdrHarness(t, herdrSessionFixture, nil)
+	rows := []db.Session{
+		// A long-lived pane with no ids at all: the "active claude" case.
+		{SessionID: "long-lived", State: string(state.Working), LastSeenTS: 1, CreatedTS: 1},
+		// A pane whose id is STALE — herdr pane ids churn under a live session.
+		{SessionID: "moved", State: string(state.Working), LastSeenTS: 1, CreatedTS: 1,
+			HerdrWorkspaceID: sql.NullString{String: "w1", Valid: true},
+			HerdrPaneID:      sql.NullString{String: "w1:pOLD", Valid: true}},
+	}
+	for _, r := range rows {
+		if err := d.db.Upsert(r); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+	d.sessions, _ = d.db.LoadLive()
+
+	d.persistHerdMembership([]fleet.Group{{
+		Key:   fleet.GroupKey{Provider: fleet.ProviderHerdr, Key: "w1"},
+		Label: "project-manager",
+		Members: []fleet.Member{
+			{Name: "keeper", Ref: "w1:pNEW", SessionID: "long-lived"},
+			{Name: "helpdesk", Ref: "w1:pNOW", SessionID: "moved"},
+			{Name: "between-runs", Ref: "w1:pX"}, // no session: must be skipped, not panic
+			{Name: "no-row", Ref: "w1:pY", SessionID: "absent"},
+		},
+	}})
+
+	got, _, err := d.db.Get("long-lived")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.HerdrWorkspaceID.String != "w1" || got.HerdrPaneID.String != "w1:pNEW" {
+		t.Errorf("backfill failed: ws=%+v pane=%+v", got.HerdrWorkspaceID, got.HerdrPaneID)
+	}
+	// A churned pane id is CORRECTED, which the hook's COALESCE merge cannot do.
+	moved, _, _ := d.db.Get("moved")
+	if moved.HerdrPaneID.String != "w1:pNOW" {
+		t.Errorf("stale pane id not corrected: %+v", moved.HerdrPaneID)
+	}
+}
+
+// A steady state must write nothing at all — this runs every tick.
+func TestPersistHerdMembershipIsQuietWhenItAgrees(t *testing.T) {
+	d := herdrHarness(t, herdrSessionFixture, nil)
+	if err := d.db.Upsert(db.Session{
+		SessionID: "s", State: string(state.Working), LastSeenTS: 1, CreatedTS: 1,
+		HerdrWorkspaceID: sql.NullString{String: "w1", Valid: true},
+		HerdrPaneID:      sql.NullString{String: "w1:pA", Valid: true},
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	d.sessions, _ = d.db.LoadLive()
+	before, _, _ := d.db.Get("s")
+
+	for range 5 {
+		d.persistHerdMembership([]fleet.Group{{
+			Key:     fleet.GroupKey{Provider: fleet.ProviderHerdr, Key: "w1"},
+			Members: []fleet.Member{{Name: "keeper", Ref: "w1:pA", SessionID: "s"}},
+		}})
+	}
+	after, _, _ := d.db.Get("s")
+	if before.HerdrWorkspaceID != after.HerdrWorkspaceID || before.HerdrPaneID != after.HerdrPaneID {
+		t.Errorf("a steady state changed the row: %+v -> %+v", before, after)
 	}
 }
