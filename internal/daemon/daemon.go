@@ -113,6 +113,7 @@ func Run(args []string) error {
 		identified:   make(map[string]identityRecord),
 		consoleWins:  make(map[int64]bool),
 		lastFleetLog: make(map[string]string),
+		herdWins:     make(map[string]int64),
 	}
 	if *jobsDir != "" {
 		d.fleetReader = fleet.NewReader(*jobsDir)
@@ -211,6 +212,8 @@ type daemon struct {
 	// herdrMiss counts consecutive failed roster reads. The herds above are held
 	// across a few of them rather than cleared on the first — see tickHerds.
 	herdrMiss int
+	// herdWins remembers which window hosts each herd (see noteHerdWindows).
+	herdWins map[string]int64
 	// lastHerdFP is the roster fingerprint the log last spoke about, so a steady
 	// herd is silent (the group BUILD still runs every tick — see
 	// fleet.HerdrProvider.Fingerprint for why it must).
@@ -477,8 +480,9 @@ func (d *daemon) writeTiles() {
 		windows = append(windows, w)
 	}
 	d.noteConsoles(windows)
+	d.noteHerdWindows(windows)
 	tiles := tile.BuildAll(d.model.Workspaces(), windows, d.sessions,
-		tile.FleetViewFrom(d.fleetChildren, d.fleetRollups, d.consoleWins, d.herds), db.Now())
+		tile.FleetViewFrom(d.fleetChildren, d.fleetRollups, d.consoleWins, d.herds, d.herdWins), db.Now())
 	data, err := json.Marshal(tiles)
 	if err != nil {
 		logf("marshal tile cache: %v", err)

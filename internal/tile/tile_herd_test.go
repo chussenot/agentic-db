@@ -432,3 +432,68 @@ func TestEquallyUrgentHerdsAreOrderedByGroupKeyNotBySessionID(t *testing.T) {
 		t.Errorf("rows = %v, want the two lowest group keys (w1, w9)", first)
 	}
 }
+
+// A herd row must outlive its panes' sessions. herdr panes are driven by whatever
+// runs them, and a colony tick lives ~81s: when the last session carrying the
+// workspace id ends, a binding DERIVED from the rows loses the herd entirely and the
+// row blinks out. Observed on the live bar after deploying, which is the only place
+// it could show up — every earlier test supplied a row.
+func TestHerdRowSurvivesEveryMemberSessionEnding(t *testing.T) {
+	now := time.UnixMilli(1_000_000_000)
+	w := ws(3, "HDMI-A-1", 30, false)
+	wins := []niri.Window{win(33, 30, "kitty", "herdr")}
+	group := fleet.Group{
+		Key:   fleet.GroupKey{Provider: fleet.ProviderHerdr, Key: "w1"},
+		Label: "project-manager",
+		Members: []fleet.Member{
+			{Name: "keeper", Demand: fleet.DemandWorking},
+			{Name: "helpdesk", Demand: fleet.DemandIdle},
+		},
+	}
+	fv := FleetView{
+		Herds:       map[string]fleet.Group{"w1": group},
+		HerdWindows: map[string]int64{"w1": 33},
+	}
+
+	// NOT ONE SESSION ROW: every pane's tick has ended and been reaped.
+	p := PayloadFor(w, wins, nil, fv, now)
+	if len(p.Items) != 1 {
+		t.Fatalf("want the herd row, got %d items: %+v", len(p.Items), p.Items)
+	}
+	it := p.Items[0]
+	if it.Fleet == nil || it.Fleet.Scope != ScopeHerd {
+		t.Fatalf("want a herd row, got %+v", it)
+	}
+	if it.Fleet.Total != 2 || it.Folder != "project-manager" {
+		t.Errorf("herd row wrong: folder=%q fleet=%+v", it.Folder, it.Fleet)
+	}
+	if it.WinID != 33 {
+		t.Errorf("win_id = %d, want the bound window 33", it.WinID)
+	}
+	// And the window must not ALSO surface as a bare app row.
+	for _, i := range p.Items {
+		if i.Kind == KindApp {
+			t.Errorf("the herd's window also rendered as an app row: %+v", p.Items)
+		}
+	}
+}
+
+// The binding is per-desktop: a herd bound to a window elsewhere must not appear here.
+func TestHerdRowOnlyOnItsOwnDesktop(t *testing.T) {
+	now := time.UnixMilli(1_000_000_000)
+	fv := FleetView{
+		Herds: map[string]fleet.Group{"w1": {
+			Key:     fleet.GroupKey{Provider: fleet.ProviderHerdr, Key: "w1"},
+			Label:   "project-manager",
+			Members: []fleet.Member{{Name: "keeper", Demand: fleet.DemandWorking}},
+		}},
+		HerdWindows: map[string]int64{"w1": 33},
+	}
+	other := ws(7, "HDMI-A-1", 70, false)
+	p := PayloadFor(other, []niri.Window{win(50, 70, "kitty", "elsewhere")}, nil, fv, now)
+	for _, it := range p.Items {
+		if it.Fleet != nil {
+			t.Errorf("a herd bound to window 33 leaked onto another desktop: %+v", it)
+		}
+	}
+}

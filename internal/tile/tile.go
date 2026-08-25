@@ -220,6 +220,16 @@ type FleetView struct {
 	//
 	// Empty on the no-daemon fallback path, on purpose — see LiveFleetView.
 	Herds map[string]fleet.Group
+	// HerdWindows binds a herd's workspace id to the niri window hosting it, and it
+	// is REMEMBERED by the daemon rather than derived from the rows on hand.
+	//
+	// Without it a herd row exists only while one of its panes has a live session
+	// row carrying the workspace id — and a herdr pane's sessions are as short as
+	// whatever drives them (median 81s here). Measured after deploying: the row
+	// appeared when a fresh pane's session started and vanished the moment it ended,
+	// so the herd blinked in and out every couple of minutes. That is the same
+	// display churn this whole mechanism exists to remove, arriving by a new route.
+	HerdWindows map[string]int64
 }
 
 // FleetViewFrom assembles the tile's view of background agents from the pieces the
@@ -236,12 +246,13 @@ type FleetView struct {
 // is a candidate, not a verdict: desktopRows gates each marker on its host session
 // still being alive. Both this path and LiveFleetView below go through it, so the
 // gate covers the daemon and the no-daemon fallback alike.
-func FleetViewFrom(children map[string]fleet.Child, rollups map[string]fleet.Rollup, consoles map[int64]bool, herds []fleet.Group) FleetView {
+func FleetViewFrom(children map[string]fleet.Child, rollups map[string]fleet.Rollup, consoles map[int64]bool, herds []fleet.Group, herdWindows map[string]int64) FleetView {
 	fv := FleetView{
-		ByOwner:  make(map[string]fleet.Summary, len(rollups)),
-		Whole:    fleet.WholeFleet(children),
-		Consoles: consoles,
-		Herds:    fleet.GroupsByKey(herds, fleet.ProviderHerdr),
+		ByOwner:     make(map[string]fleet.Summary, len(rollups)),
+		Whole:       fleet.WholeFleet(children),
+		Consoles:    consoles,
+		Herds:       fleet.GroupsByKey(herds, fleet.ProviderHerdr),
+		HerdWindows: herdWindows,
 	}
 	for id, r := range rollups {
 		fv.ByOwner[id] = fleet.Summarize(r)
@@ -284,7 +295,17 @@ func LiveFleetView(rows []db.Session, windows []niri.Window, now time.Time) Flee
 	// that changes at human speed. The daemon is the only caller that may pay it
 	// (see the cost note in package herdr), so with no daemon up a herdr host window
 	// degrades to the session rows it shows today.
-	return FleetViewFrom(children, fleet.Rollups(children), consoles, nil)
+	// No daemon, so no remembered bindings: bind from the rows on hand. A herd whose
+	// panes have no live session right now is therefore invisible on this path —
+	// acceptable in a fallback that only runs when no daemon is up, and the reason
+	// the daemon keeps the map instead of recomputing it.
+	herdWins := map[string]int64{}
+	for _, r := range rows {
+		if r.HerdrWorkspaceID.Valid && r.HerdrWorkspaceID.String != "" && r.WindowID.Valid {
+			herdWins[r.HerdrWorkspaceID.String] = r.WindowID.Int64
+		}
+	}
+	return FleetViewFrom(children, fleet.Rollups(children), consoles, nil, herdWins)
 }
 
 // fleetItem builds a fleet row: a valid session row carrying a FleetInfo.
@@ -513,6 +534,10 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 	// workspace is the level bound to a git checkout, which is what a human means by
 	// "that herd".
 	herds := map[string]row{}
+	winOnDesktop := make(map[int64]bool, len(winsOnWs))
+	for _, w := range winsOnWs {
+		winOnDesktop[int64(w.ID)] = true
+	}
 	hosted := make(map[int]bool, len(sessionsOnWs))
 	rows := make([]row, 0, len(sessionsOnWs)+len(winsOnWs))
 	// An OWNER desktop keeps its own row and GAINS one for the agents it spawned —
@@ -598,6 +623,24 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 		}
 		rows = append(rows, row{item: sessionItem(s, title, now), winID: wid, sessionID: s.SessionID})
 		addOwned(s, wid, folder)
+	}
+	// A herd bound to a window ON THIS DESKTOP gets its row even when none of its
+	// panes currently has a session row — see FleetView.HerdWindows. The group is
+	// the whole truth about the herd; a member row was only ever how we FOUND it.
+	for ws, win := range fv.HerdWindows {
+		if _, already := herds[ws]; already {
+			continue
+		}
+		if !winOnDesktop[win] {
+			continue
+		}
+		g, ok := fv.Herds[ws]
+		if !ok || len(g.Members) == 0 {
+			continue
+		}
+		hosted[int(win)] = true
+		herds[ws] = row{item: fleetItem(g.Summarize(), ScopeHerd, g.Label, win, now),
+			winID: win, sessionID: ws, isFleet: true}
 	}
 	for _, h := range herds {
 		rows = append(rows, h)

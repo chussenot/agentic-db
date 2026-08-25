@@ -75,6 +75,36 @@ type identityRecord struct {
 // function's contract is "has this window EVER been a console", and a marker that
 // came back to life (the same window, a new console) must not have been forgotten in
 // the meantime.
+// noteHerdWindows remembers which niri window hosts each herd, so a herd row does
+// not depend on one of its panes having a live session row at this instant.
+//
+// It has to be remembered rather than derived: a herdr pane's sessions are as short
+// as whatever drives them, and when the last one with a workspace id ends, deriving
+// the binding loses the herd entirely. Observed on the bar after deploying — the herd
+// row appeared with a fresh pane's session and vanished when it ended, blinking every
+// couple of minutes. Pruned only when the WINDOW goes away: a herd momentarily absent
+// from herdr's roster simply has no group, which already yields no row, so forgetting
+// the window as well would just make it rediscover the same binding a second later.
+func (d *daemon) noteHerdWindows(windows []niri.Window) {
+	live := make(map[int64]bool, len(windows))
+	for _, w := range windows {
+		live[int64(w.ID)] = true
+	}
+	for _, s := range d.sessions {
+		if !s.HerdrWorkspaceID.Valid || s.HerdrWorkspaceID.String == "" || !s.WindowID.Valid {
+			continue
+		}
+		if live[s.WindowID.Int64] {
+			d.herdWins[s.HerdrWorkspaceID.String] = s.WindowID.Int64
+		}
+	}
+	for ws, win := range d.herdWins {
+		if !live[win] {
+			delete(d.herdWins, ws)
+		}
+	}
+}
+
 func (d *daemon) noteConsoles(windows []niri.Window) {
 	live := make(map[int64]bool, len(windows))
 	for _, w := range windows {

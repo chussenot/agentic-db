@@ -289,7 +289,7 @@ func TestFleetViewFromDetectsConsolesAndSummarizes(t *testing.T) {
 			OwnerSessionID: "owner"},
 	}
 	rollups := fleet.Rollups(children)
-	fv := FleetViewFrom(children, rollups, map[int64]bool{16: true}, nil)
+	fv := FleetViewFrom(children, rollups, map[int64]bool{16: true}, nil, nil)
 	if !fv.Consoles[16] {
 		t.Error("the sticky console set should carry through")
 	}
