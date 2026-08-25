@@ -10,6 +10,7 @@ import (
 
 	"github.com/mrzor/claude-status/internal/db"
 	"github.com/mrzor/claude-status/internal/git"
+	"github.com/mrzor/claude-status/internal/herdr"
 	"github.com/mrzor/claude-status/internal/transcript"
 )
 
@@ -63,6 +64,7 @@ func RunRecap(args []string) error {
 	fs := flag.NewFlagSet("recap", flag.ContinueOnError)
 	dbPath := fs.String("db", db.DefaultDBPath(), "path to the claude-status sqlite database")
 	tdir := fs.String("transcripts", transcript.DefaultDir(), "Claude Code transcripts root")
+	hsession := fs.String("herdr-session", herdr.DefaultSessionPath(), "herdr session.json, for naming herdr-hosted agents")
 	period := fs.String("period", "day", "window: day|week|quarter (trailing)")
 	since := fs.String("since", "", "override start: a duration (e.g. 48h) or a date (YYYY-MM-DD)")
 	until := fs.String("until", "", "end date (YYYY-MM-DD); defaults to now")
@@ -125,7 +127,7 @@ func RunRecap(args []string) error {
 		return refs[0], true
 	}
 
-	d := Build(events, lookup, repoLookup, from, to, *top)
+	d := Build(events, lookup, repoLookup, herdrAgents(database, *hsession), from, to, *top)
 	enrichProjects(d.Projects, from, to)
 	if *asJSON {
 		return JSON(os.Stdout, d)
@@ -140,6 +142,26 @@ func RunRecap(args []string) error {
 		MetricsMarkdown(os.Stdout, d)
 	}
 	return nil
+}
+
+// herdrAgents builds the herdr AgentLookup from the two sources that know:
+// the sessions table (which pane hosted a session, captured at hook time) and
+// herdr's own session.json (which agent name that pane carries, durably).
+//
+// Tolerant on purpose, in the style of internal/herdr: a machine that never ran
+// herdr, a session file mid-rewrite, or a read error all yield a nil lookup, and
+// Build then takes the pre-herdr path for every session. Naming is a nicety —
+// it must never be able to fail a recap.
+func herdrAgents(database *db.DB, sessionPath string) AgentLookup {
+	rows, err := database.LoadLive()
+	if err != nil {
+		return nil
+	}
+	ws, err := herdr.ReadSession(sessionPath)
+	if err != nil {
+		return nil
+	}
+	return AgentLookupFor(rows, ws)
 }
 
 // RunRepoBackfill implements `claude-status repo-backfill`. It walks every

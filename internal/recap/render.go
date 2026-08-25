@@ -15,8 +15,14 @@ import (
 func Markdown(w io.Writer, d Digest) {
 	fmt.Fprintf(w, "# Claude recap — %s → %s\n\n",
 		d.From.Format("Mon Jan 2 15:04"), d.To.Format("Mon Jan 2 15:04"))
-	fmt.Fprintf(w, "**%d session%s · %s active · %d prompts · %d turns · %d project%s**\n",
-		d.Totals.Sessions, plural(d.Totals.Sessions), fmtDur(d.Totals.Active),
+	// The tick count is shown only when it exceeds the row count, i.e. when herdr
+	// ticks were folded into agents. Otherwise the headline is unchanged.
+	ticks := ""
+	if d.Totals.Ticks > d.Totals.Sessions {
+		ticks = fmt.Sprintf(" (%d ticks)", d.Totals.Ticks)
+	}
+	fmt.Fprintf(w, "**%d session%s%s · %s active · %d prompts · %d turns · %d project%s**\n",
+		d.Totals.Sessions, plural(d.Totals.Sessions), ticks, fmtDur(d.Totals.Active),
 		d.Totals.Questions, d.Totals.Turns, len(d.Projects), plural(len(d.Projects)))
 
 	if len(d.Sessions) == 0 {
@@ -40,8 +46,15 @@ func Markdown(w io.Writer, d Digest) {
 			if s.Branch != "" {
 				branch = fmt.Sprintf(" (%s)", s.Branch)
 			}
-			fmt.Fprintf(w, "- **%s**%s — %s, %d turns, %d prompts\n",
-				topic, branch, fmtDur(s.Active), s.Turns, s.Questions)
+			// A herdr agent's row stands for N ticks; say so, since "1h33m" over
+			// twelve 80-second lives is a different fact from one long session.
+			// Ticks <= 1 leaves the line byte-identical to the pre-herdr format.
+			ticks := ""
+			if s.Ticks > 1 {
+				ticks = fmt.Sprintf(" across %d ticks", s.Ticks)
+			}
+			fmt.Fprintf(w, "- **%s**%s — %s%s, %d turns, %d prompts\n",
+				topic, branch, fmtDur(s.Active), ticks, s.Turns, s.Questions)
 			if s.Ask != "" {
 				fmt.Fprintf(w, "  ↳ %q\n", oneLine(s.Ask))
 			}

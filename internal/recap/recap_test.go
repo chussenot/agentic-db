@@ -45,7 +45,7 @@ func TestRepoLookupGroupsBySharedRemote(t *testing.T) {
 	repoLookup := func(sid string) (db.RepoRef, bool) {
 		return db.RepoRef{Remote: "gh/owner/proj", Root: "/home/zor/wt-" + sid, Branch: "b-" + sid}, true
 	}
-	d := Build(events, lookup, repoLookup, from, to, 10)
+	d := Build(events, lookup, repoLookup, nil, from, to, 10)
 
 	if len(d.Projects) != 1 {
 		t.Fatalf("projects = %d, want 1 (both sessions collapse into the shared repo)", len(d.Projects))
@@ -77,7 +77,7 @@ func TestRepoLookupFallsBackToCwd(t *testing.T) {
 	// repoLookup returns false (an un-backfilled session): must fall back to the
 	// transcript cwd basename, exactly as before normalization.
 	noRepo := func(string) (db.RepoRef, bool) { return db.RepoRef{}, false }
-	d := Build(events, lookup, noRepo, from, to, 10)
+	d := Build(events, lookup, noRepo, nil, from, to, 10)
 	if len(d.Projects) != 1 || d.Projects[0].Name != "legacy-proj" {
 		t.Fatalf("want fallback project 'legacy-proj', got %+v", d.Projects)
 	}
@@ -98,7 +98,7 @@ func TestBuildEffortAndWindowing(t *testing.T) {
 		// Out-of-window event must be ignored entirely.
 		ev(5000*min, "A", "PostToolUse", "working"),
 	}
-	d := Build(events, noLookup, nil, from, to, 10)
+	d := Build(events, noLookup, nil, nil, from, to, 10)
 
 	if d.Totals.Sessions != 1 {
 		t.Fatalf("sessions = %d, want 1 (out-of-window excluded)", d.Totals.Sessions)
@@ -135,7 +135,7 @@ func TestTimelineWorkWait(t *testing.T) {
 		ev(15*min, "A", "Stop", "idle"),                // -> waiting on me...
 		ev(20*min, "A", "SessionEnd", "deleted"),       // ...but [15,20] into SessionEnd is unattributed
 	}
-	d := Build(events, noLookup, nil, from, to, 10)
+	d := Build(events, noLookup, nil, nil, from, to, 10)
 	s := d.Sessions[0]
 	if s.Working != 4*time.Minute { // [0,2] + [10,11] + [14,15]
 		t.Errorf("working = %s, want 4m", s.Working)
@@ -170,7 +170,7 @@ func TestFrozenWorkingIsBounded(t *testing.T) {
 		ev(1*min, "Z", "PostToolUse", "unchanged"),
 		// ...then silence until far later (frozen). No further events.
 	}
-	d := Build(events, noLookup, nil, from, to, 10)
+	d := Build(events, noLookup, nil, nil, from, to, 10)
 	if got := d.Sessions[0].Active; got > 6*time.Minute {
 		t.Errorf("frozen working active = %s, want bounded ~5m by heartbeat cap", got)
 	}
@@ -187,7 +187,7 @@ func TestStreaksMergeAcrossSessions(t *testing.T) {
 		ev(1*min, "B", "UserPromptSubmit", "working"),
 		ev(3*min, "B", "PostToolUse", "unchanged"),
 	}
-	d := Build(events, noLookup, nil, from, to, 10)
+	d := Build(events, noLookup, nil, nil, from, to, 10)
 	if len(d.Streaks) != 1 {
 		t.Fatalf("streaks = %d, want 1 merged span", len(d.Streaks))
 	}
@@ -209,7 +209,7 @@ func TestInsubstantialSessionsDropped(t *testing.T) {
 		ev(2*min, "B", "SessionStart", "idle"),
 		titleEv(2*min, "B", "resumed but untouched"),
 	}
-	d := Build(events, noLookup, nil, from, to, 10)
+	d := Build(events, noLookup, nil, nil, from, to, 10)
 	if d.Totals.Sessions != 1 || d.Sessions[0].ID != "A" {
 		t.Fatalf("insubstantial session B should be dropped, got %+v", d.Sessions)
 	}
@@ -226,7 +226,7 @@ func TestTopicPrefersInWindowTitle(t *testing.T) {
 	lookup := func(string) (Meta, bool) {
 		return Meta{Title: "transcript fallback", Ask: "the ask", Cwd: "/home/zor/proj", Branch: "main"}, true
 	}
-	d := Build(events, lookup, nil, from, to, 10)
+	d := Build(events, lookup, nil, nil, from, to, 10)
 	s := d.Sessions[0]
 	if s.Topic != "Refined title" {
 		t.Errorf("topic = %q, want the latest in-window TitleChanged", s.Topic)
@@ -261,7 +261,7 @@ func TestTopNCapAndProjectRollup(t *testing.T) {
 		cwds[sp.sid] = "/x/" + sp.proj
 	}
 	lookup := func(sid string) (Meta, bool) { return Meta{Cwd: cwds[sid]}, true }
-	d := Build(events, lookup, nil, from, to, 2) // detail only top 2
+	d := Build(events, lookup, nil, nil, from, to, 2) // detail only top 2
 
 	if len(d.Sessions) != 2 || d.Sessions[0].ID != "S1" {
 		t.Fatalf("expected top-2 detailed sessions led by S1, got %+v", d.Sessions)

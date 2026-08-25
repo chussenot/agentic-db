@@ -72,7 +72,12 @@ type Digest struct {
 // Totals are the window-wide roll-ups.
 type Totals struct {
 	Sessions int
-	Active   time.Duration // total wall-clock (union across sessions; overlaps merged)
+	// Ticks is the raw session-id count behind Sessions. The two differ only when
+	// a herdr agent's short-lived ticks were folded into one row: a colony
+	// afternoon can be 121 ticks over 38 agents-and-sessions. Equal to Sessions
+	// when nothing coalesced, which is every non-herdr recap.
+	Ticks  int
+	Active time.Duration // total wall-clock (union across sessions; overlaps merged)
 	// Per-session active-time distribution (each session's own active time; the
 	// average is the mean of those, so Avg*Sessions can exceed Active when
 	// sessions ran in parallel).
@@ -117,6 +122,14 @@ type Session struct {
 	// Timeline is the ordered span sequence the durations above sum from, with
 	// runs of the same kind coalesced — the intra-day picture of the session.
 	Timeline []Span
+	// Agent is the herdr identity this row belongs to, or nil when the session
+	// was not herdr-hosted (ordinary interactive sessions, and everything that
+	// predates the herdr columns). See internal/recap/herdr.go.
+	Agent *Agent
+	// Ticks is how many session ids folded into this row: 1 for an ordinary
+	// session, and N for a herdr agent whose N short-lived ticks aggregated
+	// under it. ID is then the most recent of those ticks.
+	Ticks int
 }
 
 // SpanKind labels a stretch of a session's timeline.
@@ -171,9 +184,11 @@ type interval struct{ start, end int64 } // unix ms
 // Build aggregates events (any order; grouped internally) into a Digest for
 // [from, to]. lookup supplies transcript content; repoLookup supplies the stored
 // repo (nil disables it, falling back to the cwd heuristic for every session);
-// topN caps the detailed session list. Effort stats are computed only from events
-// already inside the window.
-func Build(events []db.Event, lookup Lookup, repoLookup RepoLookup, from, to time.Time, topN int) Digest {
+// agentLookup supplies the herdr identity behind a session (nil disables it, and
+// a lookup that resolves nothing is equivalent — every session then takes the
+// pre-herdr path, unchanged); topN caps the detailed session list. Effort stats
+// are computed only from events already inside the window.
+func Build(events []db.Event, lookup Lookup, repoLookup RepoLookup, agentLookup AgentLookup, from, to time.Time, topN int) Digest {
 	fromMS, toMS := from.UnixMilli(), to.UnixMilli()
 
 	// Group events per session, preserving ascending ts.
@@ -195,9 +210,10 @@ func Build(events []db.Event, lookup Lookup, repoLookup RepoLookup, from, to tim
 	}
 
 	var allBeats []interval
-	sessions := make([]Session, 0, len(order))
+	ticks := make([]tick, 0, len(order))
 	for _, sid := range order {
 		s, beats := summarize(bySession[sid], sid, toMS)
+		s.Ticks = 1
 		if m, ok := lookup(sid); ok {
 			if s.Topic == "" {
 				s.Topic = m.Title
@@ -224,15 +240,31 @@ func Build(events []db.Event, lookup Lookup, repoLookup RepoLookup, from, to tim
 		if s.Project == "" {
 			s.Project = "(unknown)"
 		}
+		// herdr attribution: the window title is the multiplexer's, shared by every
+		// pane in it, so it names nothing. The agent does. Applied last so it wins
+		// over both the in-window TitleChanged and the transcript title; a session
+		// with no herdr ids never gets here (see internal/recap/herdr.go).
+		if agentLookup != nil {
+			if a, ok := agentLookup(sid); ok {
+				a := a
+				s.Agent = &a
+				if label := a.Label(); label != "" {
+					s.Topic = label
+				}
+			}
+		}
 		s.Active = unionDur(beats)
 		// Skip sessions with no substance in the window — a bare resume ping or a
 		// lone title change is not work and would only pad the counts.
 		if s.Active == 0 && s.Turns == 0 && s.Questions == 0 && s.Prompts == 0 {
 			continue
 		}
-		sessions = append(sessions, s)
+		ticks = append(ticks, tick{s: s, beats: beats})
 		allBeats = append(allBeats, beats...)
 	}
+	// Fold each herdr agent's ticks into one row. A no-op for every session
+	// without an Agent, which is what keeps ordinary recaps byte-identical.
+	sessions := coalesceAgents(ticks)
 
 	// Totals + project roll-ups over every in-window session.
 	tot := Totals{Sessions: len(sessions), Active: unionDur(allBeats)}
@@ -241,6 +273,7 @@ func Build(events []db.Event, lookup Lookup, repoLookup RepoLookup, from, to tim
 	projDirs := map[string][]string{}
 	var sumActive time.Duration
 	for i, s := range sessions {
+		tot.Ticks += s.Ticks
 		tot.Turns += s.Turns
 		tot.Prompts += s.Prompts
 		tot.Questions += s.Questions
