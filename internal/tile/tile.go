@@ -113,9 +113,15 @@ type FleetInfo struct {
 	Working  int `json:"working"`
 	Blocked  int `json:"blocked"`
 	Idle     int `json:"idle,omitempty"`
-	Done     int `json:"done,omitempty"`
+	// Unknown counts agents present but unclassifiable (herdr's `unknown`, which is
+	// explicitly NOT "finished"). omitempty, so a claude-code fleet's payload is
+	// byte-identical to before — that path has no such rung.
+	Unknown int `json:"unknown,omitempty"`
+	Done    int `json:"done,omitempty"`
 	// Demands is one bead per agent: "awaits-human" | "working" | "blocked" |
-	// "idle" | "done".
+	// "idle" | "unknown" | "done". Worst first — the user's choice over
+	// stable-by-agent, so the alarm bead is always leftmost and a bead's POSITION
+	// does not encode which agent it is.
 	Demands  []string `json:"demands"`
 	Neediest string   `json:"neediest,omitempty"`
 	Needs    string   `json:"needs,omitempty"`
@@ -136,6 +142,10 @@ const (
 const (
 	ScopeWhole = "whole" // a console desktop: every agent on the machine
 	ScopeOwned = "owned" // the desktop whose session spawned these agents
+	// ScopeHerd: one herdr WORKSPACE's agents. Neither of the other two fits — the
+	// agents were not spawned by the session on this desktop (they are its
+	// SIBLINGS, panes of the same multiplexer) and the set is not machine-wide.
+	ScopeHerd = "herd"
 )
 
 // maxItemsPerTile caps the items array at the contract's maxItems (2). When a
@@ -300,7 +310,8 @@ func fleetItem(sum fleet.Summary, scope, folder string, winID int64, now time.Ti
 		Title:  fleetTitle(sum),
 		Fleet: &FleetInfo{
 			Total: sum.Total, Live: sum.Live, Awaiting: sum.Awaiting,
-			Working: sum.Working, Blocked: sum.Blocked, Idle: sum.Idle, Done: sum.Done,
+			Working: sum.Working, Blocked: sum.Blocked, Idle: sum.Idle,
+			Unknown: sum.Unknown, Done: sum.Done,
 			Demands: demandStrings(sum.Demands), Neediest: sum.Neediest,
 			Needs: sum.Needs, Scope: scope,
 		},
@@ -336,6 +347,12 @@ func fleetTitle(sum fleet.Summary) string {
 	switch {
 	case sum.Needs != "" && sum.Neediest != "":
 		return fmt.Sprintf("%s · %d awaiting · %s: %s", head, sum.Awaiting, sum.Neediest, sum.Needs)
+	// NAME THE AGENT even when there is no ask to quote. herdr has no equivalent of
+	// a background job's `needs` — nothing here invents one — but it does know WHICH
+	// pane is blocked, and "project-manager-7 wants you" is the whole difference
+	// between a herd row and the anonymous "something wants you" it replaces.
+	case sum.Awaiting > 0 && sum.Neediest != "":
+		return fmt.Sprintf("%s · %d awaiting · %s", head, sum.Awaiting, sum.Neediest)
 	case sum.Awaiting > 0:
 		return fmt.Sprintf("%s · %d awaiting you", head, sum.Awaiting)
 	case sum.Working > 0:
@@ -404,8 +421,13 @@ func PayloadFor(ws niri.Workspace, winsOnWs []niri.Window, sessionsOnWs []db.Ses
 // window it came from, and the session id for session rows (an app row leaves it
 // empty). Keeping them beside the Item avoids re-deriving them while sorting.
 type row struct {
-	item      Item
-	winID     int64
+	item  Item
+	winID int64
+	// sessionID is the row's stable tie-break string. For a session row it is the
+	// session id; for a HERD row it is the group key ("w1") instead, deliberately —
+	// a herdr host window holds several workspaces, so two herd rows can share one
+	// winID, and letting a session uuid break that tie would reinstate the exact
+	// row lottery this change exists to remove.
 	sessionID string
 	// isFleet keeps a fleet row ahead of an ordinary session row of the same state
 	// when the cap has to choose. A desktop with agents waiting on you must not
@@ -471,8 +493,53 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 		}
 	}
 	hasConsole := consoleWin != 0
+	// HERDR HOST WINDOWS. herdr is a multiplexer: N agents share ONE niri window,
+	// one terminal pid and (behind splits) one title, so before this the desktop
+	// contributed N indistinguishable session rows and the two-row cap resolved them
+	// by winID and then LEXICOGRAPHICALLY BY SESSION UUID — which agent you saw was
+	// random and reshuffled whenever a tick recycled. Measured live on desktop 3:
+	// two rows out of five candidates, three of four herdr agents simply absent, and
+	// the two survivors byte-identical (herdr's shared window title, and a folder
+	// that was a worktree basename).
+	//
+	// A WINDOW IS A HERDR HOST IFF THE SESSIONS RESOLVING TO IT CARRY A
+	// herdr_workspace_id. No title sniffing and no process-tree walking: the title
+	// is herdr's own, fanned out across every pane, and the fragile title premise is
+	// precisely what console.go just had to be gated on. The column is written by
+	// the hook from the pane's environment, so it is first-hand.
+	//
+	// Grouped by WORKSPACE and not by window, because one herdr window holds several
+	// workspaces — w1, w9 and wA were all live behind niri window 33 — and the
+	// workspace is the level bound to a git checkout, which is what a human means by
+	// "that herd".
+	herds := map[string]row{}
 	hosted := make(map[int]bool, len(sessionsOnWs))
 	rows := make([]row, 0, len(sessionsOnWs)+len(winsOnWs))
+	// An OWNER desktop keeps its own row and GAINS one for the agents it spawned —
+	// the two-row layout finally earning its keep. A closure because a herdr pane is
+	// an ordinary interactive session and may perfectly well have spawned background
+	// agents of its own: its session row is replaced by the herd row, but an ask from
+	// a background fleet it owns must not disappear with it. Unobserved in practice,
+	// and not worth being wrong about — a hidden attention signal is the one failure
+	// this whole epic is about.
+	addOwned := func(s db.Session, wid int64, folder string) {
+		// Unless a console row is already on this desktop: the agent view lists EVERY
+		// agent, so an owned set is a subset of what that row already shows. Emitting
+		// both spent the tile's two rows on the same agents counted twice and pushed
+		// the actual conversations off the tile (seen live: one desktop showing "7
+		// agents owned" beside "13 agents whole", with both sessions dropped).
+		if hasConsole {
+			return
+		}
+		if sum, ok := fv.ByOwner[s.SessionID]; ok && !sum.Empty() {
+			rows = append(rows, row{
+				item:      fleetItem(sum, ScopeOwned, folder, wid, now),
+				winID:     wid,
+				sessionID: s.SessionID,
+				isFleet:   true,
+			})
+		}
+	}
 	for _, s := range sessionsOnWs {
 		var wid int64
 		title := ""
@@ -505,27 +572,35 @@ func desktopRows(winsOnWs []niri.Window, sessionsOnWs []db.Session, fv FleetView
 			})
 			continue
 		}
-		rows = append(rows, row{item: sessionItem(s, title, now), winID: wid, sessionID: s.SessionID})
-		// An OWNER desktop keeps its conversation row and gains a second row for the
-		// agents it spawned — the two-row layout finally earning its keep.
+		// One pane of a herd gets NO row of its own — the herd gets one, and the
+		// pane's siblings collapse into it. The row is built once, from the group,
+		// so it says the same thing however many panes resolve here and whichever of
+		// them the daemon happened to iterate first. That is what makes it survive a
+		// tick recycling underneath: nothing about this row is derived from a member.
 		//
-		// Unless a console row is already on this desktop: the agent view lists
-		// EVERY agent, so an owned set is a subset of what that row already shows.
-		// Emitting both spent the tile's two rows on the same agents counted twice
-		// and pushed the actual conversations off the tile (seen live: one desktop
-		// showing "7 agents owned" beside "13 agents whole", with both sessions
-		// dropped).
-		if hasConsole {
+		// If there is no group for the workspace — no daemon, herdr asleep, or a
+		// workspace herdr no longer reports — the session falls through and the
+		// desktop renders exactly as it does today. The column alone is not enough;
+		// a herd has to actually be there.
+		if key, g, ok := herdOf(s, fv.Herds); ok {
+			h, seen := herds[key]
+			if !seen {
+				h = row{item: fleetItem(g.Summarize(), ScopeHerd, g.Label, wid, now),
+					winID: wid, sessionID: key, isFleet: true}
+			} else if wid != 0 && (h.winID == 0 || wid < h.winID) {
+				// Lowest window id wins, so a click lands somewhere stable when the
+				// herd's panes are spread over more than one window.
+				h.winID = wid
+			}
+			herds[key] = h
+			addOwned(s, wid, folder)
 			continue
 		}
-		if sum, ok := fv.ByOwner[s.SessionID]; ok && !sum.Empty() {
-			rows = append(rows, row{
-				item:      fleetItem(sum, ScopeOwned, folder, wid, now),
-				winID:     wid,
-				sessionID: s.SessionID,
-				isFleet:   true,
-			})
-		}
+		rows = append(rows, row{item: sessionItem(s, title, now), winID: wid, sessionID: s.SessionID})
+		addOwned(s, wid, folder)
+	}
+	for _, h := range herds {
+		rows = append(rows, h)
 	}
 	// Windows with no tracked session are ordinary apps. A window hosting one is
 	// already represented by its session row(s) — an app row for it would be a
@@ -1196,4 +1271,25 @@ func fmtAgo(d time.Duration) string {
 		}
 		return "99d"
 	}
+}
+
+// herdOf reports the herd a session belongs to, if any: its herdr_workspace_id, and
+// the group the daemon built for that workspace.
+//
+// THE WORKSPACE ID IS THE ONLY THING ASKED FOR. Not the pane id, which churns under
+// a live agent (w1:pCD -> w1:pCH -> w1:pCJ observed for one agent across ~20
+// minutes), and not the window title, which is herdr's and is shared by every pane
+// behind it.
+//
+// An empty group is treated as no herd: it would render a row saying "0 agents",
+// which is strictly worse than the session row it replaced.
+func herdOf(s db.Session, herds map[string]fleet.Group) (string, fleet.Group, bool) {
+	if len(herds) == 0 || !s.HerdrWorkspaceID.Valid || s.HerdrWorkspaceID.String == "" {
+		return "", fleet.Group{}, false
+	}
+	g, ok := herds[s.HerdrWorkspaceID.String]
+	if !ok || len(g.Members) == 0 {
+		return "", fleet.Group{}, false
+	}
+	return s.HerdrWorkspaceID.String, g, true
 }
