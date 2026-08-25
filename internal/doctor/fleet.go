@@ -11,6 +11,7 @@
 package doctor
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
 	"github.com/mrzor/claude-status/internal/fleet"
+	"github.com/mrzor/claude-status/internal/herdr"
 )
 
 // RunFleet executes the fleet subcommand. args is os.Args[2:].
@@ -33,6 +35,7 @@ func RunFleet(args []string) error {
 	sessionsDir := fs.String("sessions-dir", clauded.DefaultDir(), "Claude Code sessions directory")
 	jobsDir := fs.String("jobs-dir", fleet.DefaultJobsDir(), "Claude Code background-jobs directory")
 	rosterPath := fs.String("roster", fleet.DefaultRosterPath(), "background supervisor roster path")
+	herdrSession := fs.String("herdr-session", "", "herdr session.json for herd labels (empty uses herdr's own default)")
 	asJSON := fs.Bool("json", false, "emit JSON instead of tables")
 	crossCheck := fs.Bool("cross-check", false, "also run `claude agents --json` and diff it against our view")
 	if err := fs.Parse(args); err != nil {
@@ -43,6 +46,7 @@ func RunFleet(args []string) error {
 		sessionsDir: *sessionsDir,
 		jobsDir:     *jobsDir,
 		rosterPath:  *rosterPath,
+		herdrPath:   *herdrSession,
 		asJSON:      *asJSON,
 		crossCheck:  *crossCheck,
 	})
@@ -53,8 +57,15 @@ type fleetOpts struct {
 	sessionsDir string
 	jobsDir     string
 	rosterPath  string
-	asJSON      bool
-	crossCheck  bool
+	herdrPath   string
+	// herdrList, when set, replaces herdr's roster call. The seam exists so this
+	// command's tests never depend on a live herdr session on the machine running
+	// them (herdr IS installed on the development machine, so without it every test
+	// through buildFleetView would spawn a process and read real state) — the same
+	// reason execCommand is a var in this file.
+	herdrList  func(context.Context) ([]herdr.Agent, error)
+	asJSON     bool
+	crossCheck bool
 }
 
 // fleetView is everything the subcommand computes, and the shape of --json.
@@ -64,6 +75,7 @@ type fleetView struct {
 	Now      time.Time       `json:"now"`
 	Agents   []agentView     `json:"agents"`
 	Fleets   []rollupView    `json:"fleets"`
+	Groups   []groupView     `json:"groups"`
 	Roster   *rosterView     `json:"roster,omitempty"`
 	Warnings []string        `json:"warnings,omitempty"`
 	Diff     *crossCheckDiff `json:"crossCheck,omitempty"`
@@ -113,6 +125,48 @@ type rollupView struct {
 	// FleetIdleSeconds is what it would decay on if the fleet counted.
 	OwnIdleSeconds   float64 `json:"ownIdleSeconds"`
 	FleetIdleSeconds float64 `json:"fleetIdleSeconds"`
+}
+
+// groupView is one PROVIDER GROUP: the row shape the tile renders, printed here so
+// the two substrates can be read side by side and compared. A claude-code group is
+// one owner session's children; a herdr group is one workspace's agents.
+type groupView struct {
+	Provider string `json:"provider"`
+	// Key is the group's stable identity within its provider — a herdr workspace id,
+	// or an owning session id. Never a pane id and never one of the churning agent
+	// session ids.
+	Key      string `json:"key"`
+	Label    string `json:"label"`
+	Total    int    `json:"total"`
+	Live     int    `json:"live"`
+	Awaiting int    `json:"awaitingHuman"`
+	Working  int    `json:"working"`
+	Blocked  int    `json:"blocked"`
+	Idle     int    `json:"idle"`
+	Unknown  int    `json:"unknown"`
+	Done     int    `json:"done"`
+	Worst    string `json:"worst"`
+	Neediest string `json:"neediest,omitempty"`
+	Needs    string `json:"needs,omitempty"`
+	// IdleSeconds is the GROUP's age: how long since anything in it moved. This is
+	// the churn-resistant number — the max over members, ratcheted — and reading it
+	// against the members' own ages is how you see the churn being absorbed.
+	IdleSeconds float64      `json:"idleSeconds"`
+	Members     []memberView `json:"members"`
+}
+
+// memberView is one agent inside a group.
+type memberView struct {
+	Name string `json:"name,omitempty"`
+	// Ref is the provider's lookup handle (a herdr pane id, a job id) and NOT an
+	// identity: a pane id churns under a live agent.
+	Ref string `json:"ref,omitempty"`
+	// SessionID is our row for it, when the join found one. Empty is normal: a herdr
+	// pane between two ticks hosts no Claude session and is still an agent.
+	SessionID   string  `json:"sessionId,omitempty"`
+	Demand      string  `json:"demand"`
+	IdleSeconds float64 `json:"idleSeconds"`
+	Needs       string  `json:"needs,omitempty"`
 }
 
 type rosterView struct {
@@ -277,10 +331,74 @@ func buildFleetView(o fleetOpts) (*fleetView, error) {
 		}
 	}
 
+	view.Groups = buildGroups(o, rows, live, jobs, resolver, view.Now, view)
+
 	if o.crossCheck {
 		view.Diff = crossCheckAgents(children)
 	}
 	return view, nil
+}
+
+// buildGroups runs both providers over one Input and flattens the result.
+//
+// This is the section to read when judging the herdr work: it is the exact shape the
+// tile renders, from the exact code path the daemon runs, so a herd that looks wrong
+// on the bar looks wrong here too — without a daemon, a niri window or a pixel.
+//
+// The claude-code provider re-runs Attribute over inputs this function already
+// attributed once. That is deliberate and costs nothing measurable in a one-shot CLI:
+// it means this page exercises the provider rather than a hand-mirrored copy of it,
+// which is the mistake doctor.effectiveState made against daemon.firstPartyState.
+func buildGroups(o fleetOpts, rows []db.Session, live map[string]clauded.Session, jobs map[string]fleet.Job,
+	resolver *fleet.OwnerResolver, now time.Time, view *fleetView) []groupView {
+	in := fleet.Input{Rows: rows, Live: live, Jobs: jobs, Spawn: resolver, Now: now}
+	ctx := context.Background()
+
+	herd := fleet.NewHerdrProvider(o.herdrPath)
+	if o.herdrList != nil {
+		herd = fleet.NewHerdrProviderFrom(o.herdrList, o.herdrPath)
+	}
+	var groups []fleet.Group
+	for _, p := range []fleet.Provider{fleet.NewClaudeCodeProvider(), herd} {
+		gs, err := p.Groups(ctx, in)
+		if err != nil {
+			// A herdr-side refusal names something actionable ("server_not_running"
+			// -> start herdr), which is exactly what this page is for. The daemon
+			// swallows the same error and shows no herd.
+			view.Warnings = append(view.Warnings, fmt.Sprintf("provider %s: %v", p.ID(), err))
+			continue
+		}
+		groups = append(groups, gs...)
+	}
+	fleet.SortGroups(groups)
+
+	out := make([]groupView, 0, len(groups))
+	for _, g := range groups {
+		sum := g.Summarize()
+		gv := groupView{
+			Provider: string(g.Key.Provider), Key: g.Key.Key, Label: g.Label,
+			Total: sum.Total, Live: sum.Live, Awaiting: sum.Awaiting,
+			Working: sum.Working, Blocked: sum.Blocked, Idle: sum.Idle,
+			Unknown: sum.Unknown, Done: sum.Done, Worst: sum.Worst.String(),
+			Neediest: sum.Neediest, Needs: sum.Needs,
+			IdleSeconds: -1,
+		}
+		if sum.NewestActivity > 0 {
+			gv.IdleSeconds = since(now, time.UnixMilli(sum.NewestActivity))
+		}
+		members := make([]fleet.Member, len(g.Members))
+		copy(members, g.Members)
+		fleet.SortMembers(members)
+		for _, m := range members {
+			gv.Members = append(gv.Members, memberView{
+				Name: m.Name, Ref: m.Ref, SessionID: m.SessionID,
+				Demand: m.Demand.String(), Needs: m.Needs,
+				IdleSeconds: since(now, m.Activity),
+			})
+		}
+		out = append(out, gv)
+	}
+	return out
 }
 
 // staleRoster is the one line a dead supervisor gets instead of a supervisor line.
@@ -355,6 +473,34 @@ func printFleetView(w io.Writer, v *fleetView) {
 				ago(f.OwnIdleSeconds), ago(f.FleetIdleSeconds), dash(f.Neediest))
 		}
 		tw.Flush()
+	}
+
+	fmt.Fprintf(w, "\ngroups: %d\n", len(v.Groups))
+	if len(v.Groups) > 0 {
+		tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(tw, "  PROVIDER\tKEY\tLABEL\tAGENTS\tLIVE\tAWAIT\tWORK\tBLOCK\tIDLE\tUNKN\tDONE\tWORST\tGROUP_IDLE\tNEEDIEST")
+		for _, g := range v.Groups {
+			fmt.Fprintf(tw, "  %s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\n",
+				g.Provider, g.Key, dash(g.Label), g.Total, g.Live, g.Awaiting, g.Working,
+				g.Blocked, g.Idle, g.Unknown, g.Done, g.Worst, ago(g.IdleSeconds), dash(g.Neediest))
+		}
+		tw.Flush()
+		// The members are printed under their group because the GROUP's age and its
+		// members' ages are the comparison this whole exercise is about: a herd whose
+		// members are all seconds old while the group reads minutes means the join is
+		// broken, and a herd reading fresh while every member reads "never" means the
+		// ratchet is carrying a mark nothing supports any more.
+		for _, g := range v.Groups {
+			fmt.Fprintf(w, "  %s/%s (%s), group idle %s:\n", g.Provider, g.Key, dash(g.Label), ago(g.IdleSeconds))
+			tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+			fmt.Fprintln(tw, "    AGENT\tREF\tSESSION\tDEMAND\tIDLE\tNEEDS")
+			for _, m := range g.Members {
+				fmt.Fprintf(tw, "    %s\t%s\t%s\t%s\t%s\t%s\n",
+					dash(m.Name), dash(m.Ref), shortOrDash(m.SessionID), m.Demand,
+					ago(m.IdleSeconds), clip(dash(m.Needs), 44))
+			}
+			tw.Flush()
+		}
 	}
 
 	if d := v.Diff; d != nil {

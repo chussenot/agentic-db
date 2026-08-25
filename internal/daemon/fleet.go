@@ -29,7 +29,9 @@ package daemon
 // background agent.
 
 import (
+	"context"
 	"fmt"
+	"time"
 
 	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
@@ -214,5 +216,78 @@ func (d *daemon) logFleetChanges(next map[string]fleet.Rollup) {
 			logf("fleet %s: no agents left", shortID(id))
 			delete(d.lastFleetLog, id)
 		}
+	}
+}
+
+// herdrTickTimeout bounds the herdr roster call ON THE ACTOR GOROUTINE.
+//
+// Deliberately much shorter than herdr.CallTimeout (2s), which is the right bound
+// for a CLI and the wrong one here: this goroutine also serves the niri event
+// stream, the DB snapshots and the tile cache, so a wedged herdr socket must cost a
+// fraction of one tick rather than two whole ones. A missed roster reading is
+// invisible — the next tick asks again — while a stalled tick freezes every bar on
+// the machine, which is the same trade herdr.CallTimeout documents, just with the
+// tick's budget instead of a human's patience.
+const herdrTickTimeout = 400 * time.Millisecond
+
+// tickHerds refreshes the herd groups from herdr's live roster.
+//
+// SEPARATE FROM tickFleet, and not merged into it, because the two substrates fail
+// independently: tickFleet returns early when there is no jobs directory or no live
+// first-party session, and neither of those says anything about herdr. A herdr pane
+// is an ORDINARY interactive session (no jobId, no CLAUDE_PID), so every one of
+// them is invisible to the background-agent path by construction.
+//
+// This is the 1s tick and nothing else. The roster call is a process spawn, so it
+// must never reach the 13ms DB poll — see the cost note in package herdr.
+func (d *daemon) tickHerds(ctx context.Context, fp map[string]clauded.Session) {
+	if d.herdr == nil {
+		return
+	}
+	callCtx, cancel := context.WithTimeout(ctx, herdrTickTimeout)
+	defer cancel()
+
+	groups, err := d.herdr.Groups(callCtx, fleet.Input{
+		Rows: d.sessions,
+		Live: fp,
+		Now:  db.Now(),
+	})
+	if err != nil {
+		// Benign by construction (see fleet.HerdrProvider.Groups): a herdr that is
+		// asleep, or a socket that did not answer inside the tick's budget. Said
+		// once per distinct message, because the alternative is one line a second
+		// for as long as herdr is down.
+		if msg := err.Error(); msg != d.herdrQuiet {
+			d.herdrQuiet = msg
+			logf("herdr roster: %s", msg)
+		}
+		d.herds = nil
+		return
+	}
+	d.herdrQuiet = ""
+	d.herds = groups
+	d.logHerdChanges()
+}
+
+// logHerdChanges says something only when herdr's OWN change counters moved.
+//
+// That is the one place the roster fingerprint can be believed as "nothing happened":
+// it is derived from herdr's `revision`/`state_change_seq` plus the cheap fields, so
+// an unchanged fingerprint means no agent appeared, moved or changed status. It
+// deliberately does NOT gate the group rebuild — the members' freshness comes from our
+// own rows and advances while the roster is still — so this is the only work it skips.
+func (d *daemon) logHerdChanges() {
+	fp := d.herdr.Fingerprint()
+	if fp == d.lastHerdFP {
+		return
+	}
+	d.lastHerdFP = fp
+	for _, g := range d.herds {
+		sum := g.Summarize()
+		logf("herd %s (%s): %d/%d agent(s) live, worst=%s", g.Label, g.Key.Key,
+			sum.Live, sum.Total, sum.Worst)
+	}
+	if len(d.herds) == 0 {
+		logf("herd: no herdr agents")
 	}
 }

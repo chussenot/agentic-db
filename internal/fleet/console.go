@@ -135,7 +135,10 @@ type Summary struct {
 	Working  int
 	Blocked  int
 	Idle     int
-	Done     int
+	// Unknown counts agents present but unclassifiable — see DemandUnknown. Always
+	// zero on the claude-code path, which has no such rung.
+	Unknown int
+	Done    int
 	// Demands is one entry per agent, worst first — the bead strip, in order.
 	Demands []Demand
 	// Neediest names the agent that set the worst demand; Needs is its ask,

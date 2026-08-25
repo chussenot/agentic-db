@@ -202,6 +202,14 @@ type FleetView struct {
 	// Consoles is the set of niri window ids running the agent view — CANDIDATES:
 	// a marker can outlive the session that set it, which desktopRows filters.
 	Consoles map[int64]bool
+	// Herds is the herdr provider's groups, one per herdr workspace, keyed by
+	// workspace id. A window is matched to one of these through its sessions'
+	// herdr_workspace_id column, never by its title: a herdr host window's title is
+	// herdr's own, shared by every pane behind it, and the title premise is exactly
+	// what console.go just had to be gated on.
+	//
+	// Empty on the no-daemon fallback path, on purpose — see LiveFleetView.
+	Herds map[string]fleet.Group
 }
 
 // FleetViewFrom assembles the tile's view of background agents from the pieces the
@@ -218,11 +226,12 @@ type FleetView struct {
 // is a candidate, not a verdict: desktopRows gates each marker on its host session
 // still being alive. Both this path and LiveFleetView below go through it, so the
 // gate covers the daemon and the no-daemon fallback alike.
-func FleetViewFrom(children map[string]fleet.Child, rollups map[string]fleet.Rollup, consoles map[int64]bool) FleetView {
+func FleetViewFrom(children map[string]fleet.Child, rollups map[string]fleet.Rollup, consoles map[int64]bool, herds []fleet.Group) FleetView {
 	fv := FleetView{
 		ByOwner:  make(map[string]fleet.Summary, len(rollups)),
 		Whole:    fleet.WholeFleet(children),
 		Consoles: consoles,
+		Herds:    fleet.GroupsByKey(herds, fleet.ProviderHerdr),
 	}
 	for id, r := range rollups {
 		fv.ByOwner[id] = fleet.Summarize(r)
@@ -259,7 +268,13 @@ func LiveFleetView(rows []db.Session, windows []niri.Window, now time.Time) Flee
 			consoles[int64(w.ID)] = true
 		}
 	}
-	return FleetViewFrom(children, fleet.Rollups(children), consoles)
+	// NO HERD ON THIS PATH, deliberately. Reading herdr's roster costs a process
+	// spawn, and this function runs inside `tile-data`, which waybar re-runs ONCE
+	// PER TILE PER INTERVAL — a herdr spawn here would be several a second for data
+	// that changes at human speed. The daemon is the only caller that may pay it
+	// (see the cost note in package herdr), so with no daemon up a herdr host window
+	// degrades to the session rows it shows today.
+	return FleetViewFrom(children, fleet.Rollups(children), consoles, nil)
 }
 
 // fleetItem builds a fleet row: a valid session row carrying a FleetInfo.

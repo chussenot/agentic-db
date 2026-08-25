@@ -53,7 +53,22 @@ const (
 	DemandBlocked
 	// DemandIdle: alive and at rest.
 	DemandIdle
+	// DemandUnknown: present, but what it is doing cannot be classified. Only the
+	// herdr provider produces this rung (herdr's `unknown` status: an agent whose
+	// screen its detector cannot read — a transcript viewer, a model picker).
+	//
+	// It sits between idle and done, and BOTH neighbours are deliberate. Never
+	// done: an unclassifiable agent is emphatically not a finished one, and
+	// ranking it there would let a caller retire an agent that is mid-thought.
+	// Below idle: `idle` is a POSITIVE report that the agent is at rest and ready
+	// for a prompt, while this is an absence of evidence, so it must not outrank
+	// it and must never fabricate an attention signal by ranking higher still.
+	DemandUnknown
 	// DemandDone: finished. The process may still be around.
+	//
+	// Note that herdr's `done` status does NOT land here — it maps to DemandIdle.
+	// See DemandOfHerdrStatus for why (it is sticky, and therefore the common
+	// reading rather than an edge case).
 	DemandDone
 )
 
@@ -68,6 +83,8 @@ func (d Demand) String() string {
 		return "blocked"
 	case DemandIdle:
 		return "idle"
+	case DemandUnknown:
+		return "unknown"
 	case DemandDone:
 		return "done"
 	}
@@ -216,6 +233,28 @@ func demandOf(s clauded.Session, job Job, hasJob bool) Demand {
 // state, and our own last_talk_ts advances on the agent's hook traffic. A working
 // agent moves at least one of them.
 func childActivity(s clauded.Session, job Job, hasJob bool, row db.Session) time.Time {
+	newest := SessionActivity(s, row)
+	bump := func(t time.Time) {
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	if hasJob {
+		bump(job.FileModTime)
+		bump(job.UpdatedAt)
+	}
+	return newest
+}
+
+// SessionActivity is the freshest evidence ONE session did anything, from the two
+// sources every session has: its own first-party status file and our row for it.
+// Either may be a zero value — a session with no row yet, or a row whose process
+// we cannot see — and the answer is then just the other one.
+//
+// Split out of childActivity because the provider layer needs exactly this and
+// nothing more: a herdr agent has no job record to fold in, so the job-shaped
+// signals are the caller's business and the two universal ones are shared.
+func SessionActivity(s clauded.Session, row db.Session) time.Time {
 	var newest time.Time
 	bump := func(t time.Time) {
 		if t.After(newest) {
@@ -224,10 +263,6 @@ func childActivity(s clauded.Session, job Job, hasJob bool, row db.Session) time
 	}
 	bump(s.StatusUpdatedAt)
 	bump(s.UpdatedAt)
-	if hasJob {
-		bump(job.FileModTime)
-		bump(job.UpdatedAt)
-	}
 	if row.LastTalkTS.Valid {
 		bump(time.UnixMilli(row.LastTalkTS.Int64))
 	}

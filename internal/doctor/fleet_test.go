@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/mrzor/claude-status/internal/db"
 	"github.com/mrzor/claude-status/internal/fleet"
+	"github.com/mrzor/claude-status/internal/herdr"
 	"github.com/mrzor/claude-status/internal/state"
 )
 
@@ -98,8 +100,15 @@ func colonyFixture(t *testing.T) fleetOpts {
 		sessionsDir: sessionsDir,
 		jobsDir:     jobsDir,
 		rosterPath:  filepath.Join(root, "no-roster.json"),
+		// No herd in the base fixture, and stubbed rather than left to the machine:
+		// herdr is installed on the development box, so the default provider would
+		// spawn it and read whatever herd happens to be running.
+		herdrList: noHerdr,
 	}
 }
+
+// noHerdr is a roster call that reports no herdr at all.
+func noHerdr(context.Context) ([]herdr.Agent, error) { return nil, herdr.ErrNotInstalled }
 
 func TestFleetViewJoinsSourcesAndRanksDemand(t *testing.T) {
 	v, err := buildFleetView(colonyFixture(t))
@@ -205,6 +214,7 @@ func TestFleetViewWithNoBackgroundAgents(t *testing.T) {
 		sessionsDir: filepath.Join(root, "absent-sessions"),
 		jobsDir:     filepath.Join(root, "absent-jobs"),
 		rosterPath:  filepath.Join(root, "absent-roster.json"),
+		herdrList:   noHerdr,
 	})
 	if err != nil {
 		t.Fatalf("runFleet on a bare machine: %v", err)
@@ -468,5 +478,111 @@ func TestFleetViewStillReportsALiveSupervisor(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "supervisor: pid "+strconv.Itoa(os.Getpid())) {
 		t.Errorf("expected the supervisor line:\n%s", out.String())
+	}
+}
+
+// `claude-status fleet` is where the herd is judged: it prints the exact group shape
+// the tile renders, from the same provider the daemon runs, so a wrong herd is
+// visible without a daemon, a niri window or a pixel.
+func TestFleetViewShowsTheHerd(t *testing.T) {
+	opts := colonyFixture(t)
+	herdrDir := t.TempDir()
+	opts.herdrPath = filepath.Join(herdrDir, "session.json")
+	// Two workspaces on ONE repo: only custom_name tells them apart, which is why
+	// label resolution puts it first.
+	if err := os.WriteFile(opts.herdrPath, []byte(`{"version":3,"workspaces":[
+	  {"id":"w1","custom_name":null,"identity_cwd":"/repo",
+	   "worktree_space":{"key":"/repo/.git","label":"project-manager","repo_root":"/repo","checkout_path":"/repo","is_linked_worktree":false},
+	   "tabs":[{"panes":{"7":{"cwd":"/repo","agent_name":"keeper","managed_agent_kind":"claude"},
+	                     "8":{"cwd":"/repo","agent_name":"gone","managed_agent_kind":"claude"},
+	                     "9":{"cwd":"/repo","agent_name":null,"managed_agent_kind":null}}}]},
+	  {"id":"w9","custom_name":"project-manager-6","identity_cwd":"/wt/6","tabs":[]}
+	]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts.herdrList = func(context.Context) ([]herdr.Agent, error) {
+		return []herdr.Agent{
+			{Kind: "claude", Status: herdr.StatusBlocked, WorkspaceID: "w1", PaneID: "w1:pCJ", Name: "keeper"},
+			// No name: herdr clears it when a pane's occupant exits, and the pane is
+			// still an agent.
+			{Kind: "claude", Status: herdr.StatusDone, WorkspaceID: "w1", PaneID: "w1:pCK"},
+			{Kind: "claude", Status: herdr.StatusUnknown, WorkspaceID: "w9", PaneID: "w9:pA1", Name: "helpdesk"},
+		}, nil
+	}
+
+	v, err := buildFleetView(opts)
+	if err != nil {
+		t.Fatalf("buildFleetView: %v", err)
+	}
+	byKey := map[string]groupView{}
+	for _, g := range v.Groups {
+		if g.Provider == "herdr" {
+			byKey[g.Key] = g
+		}
+	}
+	if len(byKey) != 2 {
+		t.Fatalf("want a group per herdr workspace, got %+v", v.Groups)
+	}
+	w1 := byKey["w1"]
+	if w1.Label != "project-manager" {
+		t.Errorf("w1 label = %q, want the repo label", w1.Label)
+	}
+	// session.json lists THREE panes for w1; the roster lists two agents. Counting
+	// panes would inflate the strip.
+	if w1.Total != 2 || w1.Live != 2 {
+		t.Errorf("w1 = %d agents / %d live, want 2/2 (panes outlive their occupants; `done` stays live)", w1.Total, w1.Live)
+	}
+	if w1.Worst != "awaits-human" || w1.Neediest != "keeper" {
+		t.Errorf("w1 worst = %q via %q, want awaits-human via keeper", w1.Worst, w1.Neediest)
+	}
+	if byKey["w9"].Label != "project-manager-6" {
+		t.Errorf("w9 label = %q, want its custom name — label-first would print %q twice",
+			byKey["w9"].Label, "project-manager")
+	}
+	if byKey["w9"].Unknown != 1 || byKey["w9"].Done != 0 {
+		t.Errorf("w9 = %+v, want herdr's `unknown` on its own rung and never counted done", byKey["w9"])
+	}
+	// The claude-code substrate is still there — the two providers coexist.
+	var sawCC bool
+	for _, g := range v.Groups {
+		if g.Provider == "claude-code" {
+			sawCC = true
+		}
+	}
+	if !sawCC {
+		t.Error("the claude-code provider stopped reporting its group; both substrates are live")
+	}
+
+	var out strings.Builder
+	if err := runFleet(&out, opts); err != nil {
+		t.Fatalf("runFleet: %v", err)
+	}
+	text := out.String()
+	for _, want := range []string{"groups:", "herdr", "w1", "project-manager-6", "keeper"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the printed page never mentions %q:\n%s", want, text)
+		}
+	}
+}
+
+// A herdr that is asleep names something a human can act on, and it says so here
+// rather than silently showing no herd.
+func TestFleetViewWarnsWhenHerdrRefuses(t *testing.T) {
+	opts := colonyFixture(t)
+	opts.herdrList = func(context.Context) ([]herdr.Agent, error) {
+		return nil, &herdr.ServerError{Code: "server_not_running", Message: "no server on the socket"}
+	}
+	v, err := buildFleetView(opts)
+	if err != nil {
+		t.Fatalf("buildFleetView: %v", err)
+	}
+	var warned bool
+	for _, w := range v.Warnings {
+		if strings.Contains(w, "server_not_running") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no warning naming the herdr refusal: %+v", v.Warnings)
 	}
 }

@@ -81,6 +81,8 @@ func Run(args []string) error {
 	deb := fs.Duration("debounce", defaultDebounce, "reconcile debounce window (coalesces event bursts; keep <= poll to feel the poll rate)")
 	sessionsDir := fs.String("sessions-dir", clauded.DefaultDir(), "Claude Code sessions dir for first-party status overlay (empty disables the overlay)")
 	jobsDir := fs.String("jobs-dir", fleet.DefaultJobsDir(), "Claude Code background-jobs dir for background-agent tracking (empty disables it)")
+	herdrSession := fs.String("herdr-session", "", "herdr session.json for herd labels (empty uses herdr's own default)")
+	noHerdr := fs.Bool("no-herdr", false, "do not read herdr's agent roster")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -114,6 +116,9 @@ func Run(args []string) error {
 	}
 	if *jobsDir != "" {
 		d.fleetReader = fleet.NewReader(*jobsDir)
+	}
+	if !*noHerdr {
+		d.herdr = fleet.NewHerdrProvider(*herdrSession)
 	}
 	// Seed last-recorded titles so a restart only emits TitleChanged rows for
 	// titles that actually drifted while we were down. Best effort: on a read
@@ -195,6 +200,20 @@ type daemon struct {
 	// lastFleetLog is the last log line emitted per fleet, so a steady state stays
 	// silent (see logFleetChanges).
 	lastFleetLog map[string]string
+
+	// --- herdr herds (see fleet.go / tickHerds). All actor-owned. ---
+
+	// herdr is the herdr provider: one group per herdr workspace. Nil disables the
+	// roster read entirely (--no-herdr).
+	herdr *fleet.HerdrProvider
+	// herds is the latest group set, fed to the tile as FleetView.Herds.
+	herds []fleet.Group
+	// lastHerdFP is the roster fingerprint the log last spoke about, so a steady
+	// herd is silent (the group BUILD still runs every tick — see
+	// fleet.HerdrProvider.Fingerprint for why it must).
+	lastHerdFP string
+	// herdrQuiet suppresses repeats of the same herdr-side refusal.
+	herdrQuiet string
 
 	// lastTitle maps a live session_id to the niri window title we last recorded
 	// for it in the events log. captureTitleChanges diffs the model's current
@@ -281,6 +300,7 @@ func (d *daemon) run(ctx context.Context) error {
 			fp, fpAvailable := d.readFirstParty()
 			d.gc(fp, fpAvailable)
 			d.tickFleet(fp)
+			d.tickHerds(ctx, fp)
 			d.maybeWriteTiles()
 			markDirty()
 
@@ -455,7 +475,7 @@ func (d *daemon) writeTiles() {
 	}
 	d.noteConsoles(windows)
 	tiles := tile.BuildAll(d.model.Workspaces(), windows, d.sessions,
-		tile.FleetViewFrom(d.fleetChildren, d.fleetRollups, d.consoleWins), db.Now())
+		tile.FleetViewFrom(d.fleetChildren, d.fleetRollups, d.consoleWins, d.herds), db.Now())
 	data, err := json.Marshal(tiles)
 	if err != nil {
 		logf("marshal tile cache: %v", err)

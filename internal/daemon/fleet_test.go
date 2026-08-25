@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"github.com/mrzor/claude-status/internal/clauded"
 	"github.com/mrzor/claude-status/internal/db"
 	"github.com/mrzor/claude-status/internal/fleet"
+	"github.com/mrzor/claude-status/internal/herdr"
 	"github.com/mrzor/claude-status/internal/niri"
 	"github.com/mrzor/claude-status/internal/state"
 )
@@ -281,4 +283,74 @@ func TestNoteConsolesIsStickyUntilTheWindowCloses(t *testing.T) {
 	if len(d.consoleWins) != 0 {
 		t.Errorf("console set should be empty, got %v", d.consoleWins)
 	}
+}
+
+// herdrHarness builds a daemon whose herdr provider reads a fixed roster instead of
+// spawning herdr, plus a session.json for the labels.
+func herdrHarness(t *testing.T, sessionJSON string, agents []herdr.Agent) *daemon {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "session.json")
+	if err := os.WriteFile(path, []byte(sessionJSON), 0o600); err != nil {
+		t.Fatalf("write session.json: %v", err)
+	}
+	return &daemon{
+		herdr: fleet.NewHerdrProviderFrom(
+			func(context.Context) ([]herdr.Agent, error) { return agents, nil }, path),
+	}
+}
+
+const herdrSessionFixture = `{"version":3,"workspaces":[
+  {"id":"w1","custom_name":"project-manager-6","identity_cwd":"/home/e/pm",
+   "worktree_space":{"key":"/home/e/pm/.git","label":"project-manager","repo_root":"/home/e/pm","checkout_path":"/home/e/pm","is_linked_worktree":false},
+   "tabs":[{"panes":{"7":{"cwd":"/home/e/pm","agent_name":"keeper","managed_agent_kind":"claude"}}}]}
+]}`
+
+// The herd is read on the 1s tick and lands where the tile will look for it. A herdr
+// pane is an ORDINARY interactive session, so none of this can hang off the
+// background-agent path — hence tickHerds being separate from tickFleet.
+func TestTickHerdsBuildsGroupsFromTheRoster(t *testing.T) {
+	d := herdrHarness(t, herdrSessionFixture, []herdr.Agent{
+		{Kind: "claude", Status: herdr.StatusBlocked, WorkspaceID: "w1", PaneID: "w1:pA", Name: "keeper"},
+		{Kind: "claude", Status: herdr.StatusDone, WorkspaceID: "w1", PaneID: "w1:pB", Name: "helpdesk"},
+	})
+	d.tickHerds(context.Background(), map[string]clauded.Session{})
+
+	if len(d.herds) != 1 {
+		t.Fatalf("want one herd, got %+v", d.herds)
+	}
+	g := d.herds[0]
+	if g.Key.Provider != fleet.ProviderHerdr || g.Key.Key != "w1" {
+		t.Errorf("herd key = %+v, want herdr/w1", g.Key)
+	}
+	if g.Label != "project-manager-6" {
+		t.Errorf("label = %q, want the workspace's custom name", g.Label)
+	}
+	sum := g.Summarize()
+	if sum.Total != 2 || sum.Awaiting != 1 || sum.Live != 2 {
+		t.Errorf("summary = %+v, want 2 agents, 1 awaiting, 2 live (`done` is idle)", sum)
+	}
+}
+
+// A herdr that is not there must not leave a stale herd on the bar, and must not
+// take the tick down either.
+func TestTickHerdsClearsOnFailureAndToleratesNoProvider(t *testing.T) {
+	d := herdrHarness(t, herdrSessionFixture, []herdr.Agent{
+		{Kind: "claude", Status: herdr.StatusIdle, WorkspaceID: "w1", PaneID: "w1:pA", Name: "keeper"},
+	})
+	d.tickHerds(context.Background(), nil)
+	if len(d.herds) != 1 {
+		t.Fatalf("setup: want one herd, got %+v", d.herds)
+	}
+	d.herdr = fleet.NewHerdrProviderFrom(
+		func(context.Context) ([]herdr.Agent, error) {
+			return nil, &herdr.ServerError{Code: "server_not_running"}
+		},
+		filepath.Join(t.TempDir(), "session.json"))
+	d.tickHerds(context.Background(), nil)
+	if d.herds != nil {
+		t.Errorf("a refusal left %+v on the bar; an unreachable herdr means no herd, not the last one", d.herds)
+	}
+
+	d.herdr = nil
+	d.tickHerds(context.Background(), nil) // must not panic
 }
