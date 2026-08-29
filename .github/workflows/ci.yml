@@ -1,0 +1,35 @@
+# One job, one command: CI runs exactly `mise run check`, so local and CI are
+# identical. mise provisions the toolchain (Go mirrored from go.mod's pin,
+# cocogitto for the commit gate). Actions are pinned by SHA; dependabot keeps
+# the pins moving.
+#
+# No platform matrix, by decision (docs/adr/0003-yagni-deferral-register.md):
+# this tool targets one compositor on Linux. Anything needing a live
+# niri/waybar/systemd is exercised by fixture or fake here and by hand on the
+# real desktop.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # Full history: `cog check` walks the PR's commit range below.
+          fetch-depth: 0
+      - uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+      - run: mise run check
+      - name: cog check (PR commit range only)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: cog check "${BASE_SHA}..${HEAD_SHA}"
