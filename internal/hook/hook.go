@@ -45,6 +45,22 @@ var notifyPatterns = []string{
 // systemd, ~4 hops).
 const maxProcHops = 20
 
+// envJobDir is exported by Claude Code to BACKGROUND sessions only (claude
+// --bg and kin) and inherited by their children, this hook included — so its
+// presence is the background marker, readable for free with no file reads and
+// no IPC. A background agent has no terminal and thus no niri window to
+// resolve, ever.
+const envJobDir = "CLAUDE_JOB_DIR"
+
+// lookupEnv is the environment seam, so tests can mark the session background
+// without mutating process-wide state.
+var lookupEnv = os.Getenv
+
+// listWindows is the niri seam. It exists so a test can COUNT the calls: this
+// lookup spawns `niri msg -j windows`, and the hook is the hot path, so "how
+// often do we shell out" is a behaviour worth asserting rather than assuming.
+var listWindows = niri.ListWindows
+
 // hookEvent is the tolerant decode of the hook JSON delivered on stdin. Unknown
 // fields are ignored so future Claude Code additions don't break the hook.
 type hookEvent struct {
@@ -155,7 +171,14 @@ func run(r io.Reader, dbPath string, startPID int) error {
 
 	// Window resolution: only on SessionStart, or lazily when an existing row
 	// never got a window_id (covers DB wipes / daemon restarts mid-session).
-	if ev.HookEventName == "SessionStart" || !s.WindowID.Valid {
+	//
+	// A background agent is skipped outright. It has no terminal, so the walk
+	// could only ever end at the background supervisor — and because the lazy
+	// branch retries whenever window_id is NULL, which for an agent is FOREVER,
+	// resolution would re-run on every single hook. resolveWindow spawns
+	// `niri msg -j windows`, so a busy multi-agent setup would stream pointless
+	// niri IPC on the hot path. Skipping is both correct and cheap.
+	if lookupEnv(envJobDir) == "" && (ev.HookEventName == "SessionStart" || !s.WindowID.Valid) {
 		if winID, termPID, ok := resolveWindow(startPID, ev.Cwd); ok {
 			s.WindowID = sql.NullInt64{Int64: int64(winID), Valid: true}
 			s.TerminalPID = sql.NullInt64{Int64: int64(termPID), Valid: true}
@@ -271,7 +294,7 @@ const clientComm = "claude"
 // ok is false when neither strategy finds a window (remote/tmux/ssh, detached
 // background session, ambiguity) or niri is unavailable.
 func resolveWindow(startPID int, cwd string) (windowID, terminalPID int, ok bool) {
-	windows, err := niri.ListWindows()
+	windows, err := listWindows()
 	if err != nil || len(windows) == 0 {
 		return 0, 0, false
 	}

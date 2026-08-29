@@ -374,6 +374,69 @@ func TestWindowUnresolvedStaysNull(t *testing.T) {
 	}
 }
 
+// TestBackgroundSessionSkipsWindowResolution asserts the hot-path guarantee,
+// not just the NULL outcome: a background session (CLAUDE_JOB_DIR in the
+// environment) must never spawn `niri msg -j windows` — its window_id stays
+// NULL forever, so without the skip the lazy branch would re-run resolution on
+// every single hook.
+func TestBackgroundSessionSkipsWindowResolution(t *testing.T) {
+	dbPath := tempDBPath(t)
+	fixedClock(t, time.UnixMilli(1_700_000_000_000))
+
+	prevEnv := lookupEnv
+	lookupEnv = func(key string) string {
+		if key == envJobDir {
+			return "/home/u/.claude/jobs/deadbeef"
+		}
+		return ""
+	}
+	t.Cleanup(func() { lookupEnv = prevEnv })
+
+	calls := 0
+	prevList := listWindows
+	listWindows = func() ([]niri.Window, error) {
+		calls++
+		return nil, nil
+	}
+	t.Cleanup(func() { listWindows = prevList })
+
+	drive(t, dbPath, `{"session_id":"bg1","hook_event_name":"SessionStart"}`)
+	drive(t, dbPath, `{"session_id":"bg1","hook_event_name":"PostToolUse"}`)
+	if calls != 0 {
+		t.Errorf("listWindows called %d times for a background session, want 0", calls)
+	}
+	s, _ := getRow(t, dbPath, "bg1")
+	if s.WindowID.Valid {
+		t.Errorf("window_id = %v, want NULL for a background session", s.WindowID)
+	}
+}
+
+// TestInteractiveSessionStillResolves pins the other side of the gate: without
+// the background marker, SessionStart still reaches the niri lookup.
+func TestInteractiveSessionStillResolves(t *testing.T) {
+	dbPath := tempDBPath(t)
+	fixedClock(t, time.UnixMilli(1_700_000_000_000))
+
+	// Deterministic environment: the test process itself may run under a
+	// Claude session that exports the background marker.
+	prevEnv := lookupEnv
+	lookupEnv = func(string) string { return "" }
+	t.Cleanup(func() { lookupEnv = prevEnv })
+
+	calls := 0
+	prevList := listWindows
+	listWindows = func() ([]niri.Window, error) {
+		calls++
+		return nil, nil
+	}
+	t.Cleanup(func() { listWindows = prevList })
+
+	drive(t, dbPath, `{"session_id":"fg1","hook_event_name":"SessionStart"}`)
+	if calls == 0 {
+		t.Error("listWindows never called for an interactive SessionStart")
+	}
+}
+
 func TestCreatedTSPreservedAcrossEvents(t *testing.T) {
 	dbPath := tempDBPath(t)
 	created := fixedClock(t, time.UnixMilli(1_700_000_000_000))
