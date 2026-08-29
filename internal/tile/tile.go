@@ -250,14 +250,7 @@ func resolveAppIcon(appID string) string {
 	if v, ok := iconMemo.Load(appID); ok {
 		return v.(string)
 	}
-	res := findAppSVG(appID)
-	if res == "" {
-		if p := findAppPNG(appID); p != "" {
-			if svg, err := wrapPNGAsSVG(appID, p); err == nil {
-				res = svg
-			}
-		}
-	}
+	res := findIcon(appID)
 	if res == "" {
 		if p := findSnapIcon(appID); p != "" {
 			if strings.HasSuffix(strings.ToLower(p), ".svg") {
@@ -272,6 +265,103 @@ func resolveAppIcon(appID string) string {
 	}
 	iconMemo.Store(appID, res)
 	return res
+}
+
+// findIcon resolves an app_id to an absolute .svg path — a native scalable
+// icon or a generated PNG wrapper — or "". It tries, in order: the app_id
+// itself, then the Icon= of a matching freedesktop .desktop entry (which
+// bridges a WM-class app_id like "vesktop" to its differently-named icon
+// "dev.vencord.Vesktop"). For all keys it prefers a native SVG before falling
+// back to wrapping the best PNG, so pwetty's SVG-only renderer shows the real
+// logo instead of the generic "app" bubble.
+func findIcon(appID string) string {
+	keys := []string{appID}
+	if icon := desktopEntryIcon(appID); icon != "" && icon != appID {
+		keys = append(keys, icon)
+	}
+	for _, k := range keys {
+		if p := iconFromName(k); p != "" {
+			return p
+		}
+	}
+	for _, k := range keys {
+		if filepath.IsAbs(k) {
+			continue // an absolute Icon= is a file, not a theme name to size-search
+		}
+		if p := findAppPNG(k); p != "" {
+			if svg, err := wrapPNGAsSVG(appID, p); err == nil {
+				return svg
+			}
+		}
+	}
+	return ""
+}
+
+// iconFromName resolves an Icon= value (or app_id) to a native .svg: an
+// absolute path is honored directly (SVG only — pwetty can't draw a raw PNG
+// path), otherwise it is looked up as a freedesktop icon name.
+func iconFromName(name string) string {
+	if filepath.IsAbs(name) {
+		if strings.HasSuffix(name, ".svg") {
+			if fi, err := os.Stat(name); err == nil && !fi.IsDir() {
+				return name
+			}
+		}
+		return ""
+	}
+	return findAppSVG(name)
+}
+
+// appEntryDirs are the freedesktop application-entry directories searched for
+// a matching .desktop file, in precedence order (user, flatpak exports,
+// system). A var so tests can point it at a fixture directory.
+var appEntryDirs = defaultAppEntryDirs()
+
+func defaultAppEntryDirs() []string {
+	var dirs []string
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".local/share/applications"))
+	}
+	return append(dirs,
+		"/var/lib/flatpak/exports/share/applications",
+		"/usr/local/share/applications",
+		"/usr/share/applications",
+	)
+}
+
+// desktopEntryIcon returns the Icon= of the .desktop entry that matches appID
+// — first by filename (<appID>.desktop), then by a StartupWMClass= equal to
+// appID (case-insensitive). This bridges a Wayland/X11 app_id to a
+// differently-named icon (e.g. app_id "vesktop" -> Icon "dev.vencord.Vesktop").
+// "" if none.
+func desktopEntryIcon(appID string) string {
+	for _, dir := range appEntryDirs {
+		if data, err := os.ReadFile(filepath.Join(dir, appID+".desktop")); err == nil {
+			if _, icon, _ := parseDesktopEntry(data); icon != "" {
+				return icon
+			}
+		}
+	}
+	for _, dir := range appEntryDirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".desktop") {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			if err != nil {
+				continue
+			}
+			_, icon, wm := parseDesktopEntry(data)
+			if icon != "" && wm != "" && strings.EqualFold(wm, appID) {
+				return icon
+			}
+		}
+	}
+	return ""
 }
 
 // snapDesktopDir is where snapd publishes desktop entries for installed snap
@@ -301,7 +391,7 @@ func findSnapIcon(appID string) string {
 		if err != nil {
 			continue
 		}
-		name, icon := parseDesktopEntry(data)
+		name, icon, _ := parseDesktopEntry(data)
 		if icon == "" || strings.ToLower(name) != want {
 			continue
 		}
@@ -314,10 +404,10 @@ func findSnapIcon(appID string) string {
 	return ""
 }
 
-// parseDesktopEntry extracts the Name and Icon keys from the [Desktop Entry]
-// section of a .desktop file, ignoring any other section (e.g. [Desktop
-// Action ...]) that might redefine them.
-func parseDesktopEntry(data []byte) (name, icon string) {
+// parseDesktopEntry extracts the Name, Icon, and StartupWMClass keys from the
+// [Desktop Entry] section of a .desktop file, ignoring any other section
+// (e.g. [Desktop Action ...]) that might redefine them.
+func parseDesktopEntry(data []byte) (name, icon, wmClass string) {
 	inSection := false
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -329,12 +419,14 @@ func parseDesktopEntry(data []byte) (name, icon string) {
 			continue
 		}
 		if v, ok := strings.CutPrefix(line, "Name="); ok && name == "" {
-			name = v
+			name = strings.TrimSpace(v)
 		} else if v, ok := strings.CutPrefix(line, "Icon="); ok && icon == "" {
-			icon = v
+			icon = strings.TrimSpace(v)
+		} else if v, ok := strings.CutPrefix(line, "StartupWMClass="); ok && wmClass == "" {
+			wmClass = strings.TrimSpace(v)
 		}
 	}
-	return name, icon
+	return name, icon, wmClass
 }
 
 func findAppSVG(appID string) string {

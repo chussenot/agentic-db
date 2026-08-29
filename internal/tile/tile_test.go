@@ -286,10 +286,66 @@ func TestCacheRoundTrip(t *testing.T) {
 }
 
 func TestParseDesktopEntry(t *testing.T) {
-	data := []byte("[Desktop Entry]\nName=Proton Mail\nIcon=/snap/proton-mail/current/meta/gui/icon.svg\nExec=proton-mail\n\n[Desktop Action new-window]\nName=New Window\nIcon=wrong\n")
-	name, icon := parseDesktopEntry(data)
-	if name != "Proton Mail" || icon != "/snap/proton-mail/current/meta/gui/icon.svg" {
-		t.Errorf("parseDesktopEntry = (%q, %q), want (Proton Mail, .../icon.svg)", name, icon)
+	data := []byte("[Desktop Entry]\nName=Proton Mail\nIcon=/snap/proton-mail/current/meta/gui/icon.svg\nStartupWMClass=Proton Mail Bridge\nExec=proton-mail\n\n[Desktop Action new-window]\nName=New Window\nIcon=wrong\nStartupWMClass=wrong\n")
+	name, icon, wm := parseDesktopEntry(data)
+	if name != "Proton Mail" || icon != "/snap/proton-mail/current/meta/gui/icon.svg" || wm != "Proton Mail Bridge" {
+		t.Errorf("parseDesktopEntry = (%q, %q, %q), want (Proton Mail, .../icon.svg, Proton Mail Bridge)", name, icon, wm)
+	}
+}
+
+// TestDesktopEntryIcon covers the WM-class bridge: niri reports an app_id
+// ("vesktop") that names neither an icon nor a .desktop file, but a desktop
+// entry declares StartupWMClass=vesktop with the real icon name. Filename
+// match is preferred and case-insensitive WM-class match is the fallback.
+func TestDesktopEntryIcon(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("dev.vencord.Vesktop.desktop",
+		"[Desktop Entry]\nName=Vesktop\nIcon=dev.vencord.Vesktop\nStartupWMClass=vesktop\n")
+	write("firefox.desktop",
+		"[Desktop Entry]\nName=Firefox\nIcon=firefox-icon\n")
+
+	prev := appEntryDirs
+	appEntryDirs = []string{dir}
+	t.Cleanup(func() { appEntryDirs = prev })
+
+	if got := desktopEntryIcon("firefox"); got != "firefox-icon" {
+		t.Errorf("filename match: desktopEntryIcon(firefox) = %q, want firefox-icon", got)
+	}
+	if got := desktopEntryIcon("VesKtop"); got != "dev.vencord.Vesktop" {
+		t.Errorf("wm-class match: desktopEntryIcon(VesKtop) = %q, want dev.vencord.Vesktop", got)
+	}
+	if got := desktopEntryIcon("nothere"); got != "" {
+		t.Errorf("no match: desktopEntryIcon(nothere) = %q, want empty", got)
+	}
+}
+
+// TestIconFromName pins the absolute-path rule: an absolute Icon= is honored
+// only when it is an existing .svg — pwetty's renderer can't draw a raw PNG
+// path, so those fall through to the PNG-wrap stage instead.
+func TestIconFromName(t *testing.T) {
+	dir := t.TempDir()
+	svg := filepath.Join(dir, "a.svg")
+	if err := os.WriteFile(svg, []byte("<svg/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	png := filepath.Join(dir, "a.png")
+	if err := os.WriteFile(png, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := iconFromName(svg); got != svg {
+		t.Errorf("iconFromName(existing .svg) = %q, want %q", got, svg)
+	}
+	if got := iconFromName(png); got != "" {
+		t.Errorf("iconFromName(absolute .png) = %q, want empty", got)
+	}
+	if got := iconFromName(filepath.Join(dir, "missing.svg")); got != "" {
+		t.Errorf("iconFromName(missing .svg) = %q, want empty", got)
 	}
 }
 
