@@ -66,3 +66,11 @@
 # - github.token    → use GITHUB_TOKEN env var instead
 
 export.auto: false
+
+# Dolt-native cross-machine sync (bd dolt push / bd dolt pull). The remote is
+# this repo's own git remote in Dolt-compatible URL form; issue history rides
+# under refs/dolt/data there, separate from the source branches. With this set,
+# the post-merge/post-checkout hooks stop falling back to JSONL import.
+# Fresh clones: run `bd bootstrap`.
+sync:
+    remote: "git+ssh://git@github.com/chussenot/agentic-db.git"
