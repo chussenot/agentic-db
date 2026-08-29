@@ -1,0 +1,13 @@
+# Keeps the SHA-pinned actions in .github/workflows/ and the Go module graph
+# moving. The pins are by commit SHA (with a version comment dependabot
+# understands and rewrites).
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

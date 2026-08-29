@@ -1,0 +1,15 @@
+# cocogitto config — the conventional-commit gate and version-bump driver.
+#
+# The convention applies from the v0.1.0 baseline tag FORWARD, not from day
+# one: the repo predates the rule (history was already conventional in
+# practice; this gate makes it a rule). from_latest_tag keeps `cog check` and
+# `cog bump` from ever walking pre-convention history. In CI, `cog check`
+# additionally gates pull-request ranges (BASE..HEAD) only.
+#
+# Bumps happen via `cog bump` ONLY — never hand-edit a version or tag by hand.
+from_latest_tag = true
+ignore_merge_commits = true
+tag_prefix = "v"
+
+[changelog]
+path = "CHANGELOG.md"

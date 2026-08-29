@@ -1,9 +1,93 @@
 [tools]
+# The toolchain pin lives in go.mod (its `toolchain` directive is the Go-native
+# single source). This entry is a mechanical mirror so mise provisions the same
+# toolchain; `mise run pin-check` fails when the two drift.
 go = "1.26.4"
+# cog gates commit messages and drives changelog/version bumps (see cog.toml).
+cocogitto = "6.5.0"
 
 [tasks.build]
-description = "Build the static claude-status binary to ./claude-status"
-run = "CGO_ENABLED=0 go build -o claude-status ."
+description = "Build the static claude-status binary to ./claude-status (and prove it is static)"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+CGO_ENABLED=0 go build -o claude-status .
+# Prove the static promise instead of remembering it: the installer's
+# atomic-rename daemon flip (see the install task / ADR-0004) assumes the
+# binary carries no shared-library dependencies, so a dynamically linked
+# build is a build failure, not a surprise at flip time.
+out="$(ldd claude-status 2>&1 || true)"
+case "$out" in
+  *"not a dynamic executable"* | *"statically linked"*) ;;
+  *)
+    echo "build: claude-status is dynamically linked; the atomic-flip contract needs a static binary" >&2
+    echo "$out" >&2
+    exit 1
+    ;;
+esac
+'''
+
+[tasks.fmt-check]
+description = "Fail if any file is not gofmt-formatted (reports, never rewrites)"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+drift="$(gofmt -l .)"
+if [ -n "$drift" ]; then
+  echo "fmt-check: not gofmt-formatted (run gofmt -w on):" >&2
+  echo "$drift" >&2
+  exit 1
+fi
+'''
+
+[tasks.vet]
+description = "Run go vet over the whole module"
+run = "go vet ./..."
+
+# staticcheck is the ONE adopted linter beyond vet: it is the de-facto standard
+# Go analyzer for bug classes vet skips (dead code, std-API misuse, simplifiable
+# constructs), it is pure Go so `go run` pins and provisions it with no extra
+# toolchain, and v0.8.1 passes today's tree clean — so from day one a finding is
+# signal, not adoption noise. Second linters are deferred (ADR-0003).
+[tasks.lint]
+description = "Run staticcheck (the one adopted linter; see comment for the adoption reason)"
+run = "go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./..."
+
+[tasks.pin-check]
+description = "Assert mise's Go mirror matches go.mod's toolchain directive (the single source)"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+want="$(sed -n 's/^toolchain go//p' go.mod)"
+have="$(sed -n 's/^go = "\(.*\)"$/\1/p' mise.toml)"
+if [ -z "$want" ]; then
+  echo "pin-check: go.mod has no toolchain directive (it is the single source of the pin)" >&2
+  exit 1
+fi
+if [ "$want" != "$have" ]; then
+  echo "pin-check: go.mod pins toolchain go$want but mise.toml mirrors \"$have\"" >&2
+  exit 1
+fi
+'''
+
+[tasks.check-docs]
+description = "Gate docs: front matter, dead links/anchors, CLI-vs-docs drift"
+run = "scripts/check-docs"
+
+# The one gate: CI runs exactly `mise run check`, so local and CI are the same
+# command. Serial, in this order — build precedes check-docs because the CLI
+# drift check reads the built binary's --help.
+[tasks.check]
+description = "Run the full serial check suite (identical locally and in CI)"
+run = [
+  "mise run pin-check",
+  "mise run fmt-check",
+  "mise run vet",
+  "mise run lint",
+  "mise run test",
+  "mise run build",
+  "mise run check-docs",
+]
 
 [tasks.install]
 description = "Build, install the binary + recap timers, and flip a running daemon"

@@ -73,7 +73,7 @@ func TestIdleDecayRendersFullFade(t *testing.T) {
 		elapsed time.Duration
 		want    string
 	}{
-		{0, "ci1l0"},               // just stopped: bright ██
+		{0, "ci1l0"}, // just stopped: bright ██
 		{90 * time.Second, "ci1l1"},
 		{5 * time.Minute, "ci1l2"},
 		{12 * time.Minute, "ci1l3"},

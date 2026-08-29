@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# check-docs — the docs gate, run as `mise run check-docs` (part of `mise run check`).
+#
+# Three checks over the repo's tracked markdown:
+#   1. YAML front matter (title, status: draft|active|superseded, date) on every
+#      markdown file except tool-managed ones (AGENTS.md, CLAUDE.md, and the
+#      .beads/ / .agents/ / .codex/ trees, which their tools rewrite). ADRs
+#      additionally require decision-makers and supersedes.
+#   2. Dead relative links and anchors: every relative markdown link must point
+#      at an existing file, and a #fragment must match a heading in its target.
+#   3. CLI drift, in BOTH directions: the subcommand table in docs/cli.md is
+#      compared against the multi-call binary's own usage output. A documented
+#      subcommand the binary rejects is worse than an undocumented one — both
+#      fail here. Uses ./claude-status when built (mise run check builds first),
+#      falling back to `go run .`.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+fail=0
+err() {
+  echo "check-docs: $*" >&2
+  fail=1
+}
+
+# -co: tracked AND untracked-but-not-ignored, so a doc fails the gate before
+# its first commit, not after.
+mapfile -t mdfiles < <(git ls-files -co --exclude-standard '*.md' ':!:AGENTS.md' ':!:CLAUDE.md' ':!:.beads/**' ':!:.agents/**' ':!:.codex/**')
+
+# --- 1. front matter -------------------------------------------------------
+for f in "${mdfiles[@]}"; do
+  if [ "$(head -n 1 "$f")" != "---" ]; then
+    err "$f: missing YAML front matter"
+    continue
+  fi
+  fm="$(awk 'NR==1 { next } /^---$/ { exit } { print }' "$f")"
+  for key in title status date; do
+    printf '%s\n' "$fm" | grep -qE "^${key}:" || err "$f: front matter missing '$key'"
+  done
+  status="$(printf '%s\n' "$fm" | sed -n 's/^status:[[:space:]]*//p' | head -n 1)"
+  case "$status" in
+    draft | active | superseded) ;;
+    *) err "$f: front matter status '$status' is not draft|active|superseded" ;;
+  esac
+  case "$f" in
+    docs/adr/*)
+      for key in decision-makers supersedes; do
+        printf '%s\n' "$fm" | grep -qE "^${key}:" || err "$f: ADR front matter missing '$key'"
+      done
+      ;;
+  esac
+done
+
+# --- 2. dead links + anchors ------------------------------------------------
+# GitHub-style anchor slug: lowercase, drop everything but [a-z0-9 _-], spaces
+# to dashes. Good enough for this repo's headings; extend if a heading fails.
+slug() {
+  printf '%s\n' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9 _-]//g; s/ /-/g'
+}
+
+has_anchor() { # has_anchor <file> <fragment>
+  local file="$1" frag="$2" h
+  while IFS= read -r h; do
+    if [ "$(slug "$h")" = "$frag" ]; then
+      return 0
+    fi
+  done < <(sed -E -n 's/^#{1,6} +//p' "$file")
+  return 1
+}
+
+for f in "${mdfiles[@]}"; do
+  dir="$(dirname "$f")"
+  while IFS= read -r target; do
+    case "$target" in
+      http://* | https://* | mailto:*) continue ;;
+    esac
+    frag="${target#*#}"
+    path="${target%%#*}"
+    [ "$frag" = "$target" ] && frag="" # no '#' present
+    if [ -z "$path" ]; then
+      resolved="$f" # same-file anchor
+    else
+      resolved="$dir/$path"
+    fi
+    if [ ! -e "$resolved" ]; then
+      err "$f: dead link '$target' ($resolved does not exist)"
+      continue
+    fi
+    if [ -n "$frag" ] && [[ "$resolved" == *.md ]]; then
+      has_anchor "$resolved" "$frag" || err "$f: dead anchor '$target' (no heading slugs to '#$frag' in $resolved)"
+    fi
+  done < <(grep -oE '\]\([^)]+\)' "$f" | sed -E 's/^\]\(//; s/\)$//; s/[[:space:]]+"[^"]*"$//' || true)
+done
+
+# --- 3. CLI drift (both directions) -----------------------------------------
+cli_doc="docs/cli.md"
+if [ ! -f "$cli_doc" ]; then
+  err "$cli_doc missing (it holds the subcommand table the drift check reads)"
+else
+  if [ -x ./claude-status ]; then
+    usage="$(./claude-status 2>&1 || true)"
+  else
+    usage="$(go run . 2>&1 || true)"
+  fi
+  bin_cmds="$(printf '%s\n' "$usage" | awk '/^commands:/ { f = 1; next } f && /^  [a-z]/ { print $1 }' | sort)"
+  doc_cmds="$(awk -F'|' '/^\|/ { gsub(/[ `]/, "", $2); if ($2 != "" && $2 != "Command" && $2 !~ /^-+$/) print $2 }' "$cli_doc" | sort)"
+  if [ -z "$bin_cmds" ]; then
+    err "could not parse any subcommands out of the binary's usage output"
+  fi
+  ghosts="$(comm -23 <(printf '%s\n' "$doc_cmds") <(printf '%s\n' "$bin_cmds"))"
+  undocumented="$(comm -13 <(printf '%s\n' "$doc_cmds") <(printf '%s\n' "$bin_cmds"))"
+  if [ -n "$ghosts" ]; then
+    err "$cli_doc documents subcommand(s) the binary rejects (worse than undocumented): $(printf '%s' "$ghosts" | tr '\n' ' ')"
+  fi
+  if [ -n "$undocumented" ]; then
+    err "binary subcommand(s) missing from the $cli_doc table: $(printf '%s' "$undocumented" | tr '\n' ' ')"
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  exit 1
+fi
+echo "check-docs: front matter, links/anchors, and CLI surface all clean"

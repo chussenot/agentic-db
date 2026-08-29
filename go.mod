@@ -2,6 +2,10 @@ module github.com/mrzor/claude-status
 
 go 1.26
 
+// The single source of the toolchain pin. mise.toml's [tools] go entry is a
+// mechanical mirror of this line, enforced by `mise run pin-check`.
+toolchain go1.26.4
+
 require modernc.org/sqlite v1.52.0
 
 require (

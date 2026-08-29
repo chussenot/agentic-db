@@ -60,18 +60,41 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
+Tasks run through mise (`mise.toml`); there is no Makefile, by decision.
 
 ```bash
-# Example:
-# npm install
-# npm test
+mise run check       # the full serial gate — exactly what CI runs
+mise run test        # go test ./...
+mise run build       # static binary (CGO_ENABLED=0, proven by ldd)
+mise run fmt-check   # gofmt drift (reports, never rewrites)
+mise run vet         # go vet ./...
+mise run lint        # staticcheck (the one adopted linter)
+mise run check-docs  # front matter, dead links/anchors, CLI drift
 ```
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+A multi-call Go binary (`claude-status`): Claude Code hooks write session
+state to SQLite (`hook` — hot path, always exits 0); a single long-lived
+daemon reconciles DB + niri into workspace glyphs and a tile cache. See
+`docs/architecture.md` (diagrams, package layout) and `docs/adr/` (decisions,
+alternatives priced). The repo is agentic-db; binary/module/DB stay
+`claude-status` (recorded deferral).
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Conventional Commits **with a scope**; commit via `git commit -F <msgfile>
+  -- <explicit paths>`, never bare. Never mention any AI, model, or assistant
+  name in a commit, tag, or PR. Do not commit or push unless asked.
+- Versions are cut with `cog bump` only (`cog.toml`; gate applies from the
+  v0.1.0 baseline tag forward). CHANGELOG.md is two-layer — see its preamble
+  before touching it (cog insertion-anchor trap).
+- The Go toolchain is pinned ONCE, in go.mod's `toolchain` directive;
+  mise.toml mirrors it mechanically (`mise run pin-check` enforces the match).
+- Docs: front matter on every markdown file (except this file and AGENTS.md);
+  ADRs price their alternatives; diagrams are Mermaid in-markdown; cite the
+  tile contract by repo (waybar-pwetty-box `tiles/claude/schema.json`), never
+  by a machine path. `scripts/check-docs` gates all of it.
+- Recurring agent roles live in `.claude/agents/` (daemon-reconciler,
+  cli-surface-auditor, docs-writer); reference them in briefs, and edit them
+  in the same commit when a run teaches a role something.

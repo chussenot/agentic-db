@@ -3,8 +3,8 @@
 // shared payload model and the daemon-written tile cache.
 //
 // It emits, on stdout, the JSON data object the bundled pwetty `claude` tile
-// expects (contract: ~/Perso/pwetty-box-rs/tiles/claude/schema.json) for ONE
-// niri desktop, identified by its per-output workspace index.
+// expects (contract: tiles/claude/schema.json in the waybar-pwetty-box repo)
+// for ONE niri desktop, identified by its per-output workspace index.
 //
 // HOT PATH: a waybar `cffi/pwetty#i` module reruns this every interval, once per
 // tile. To keep that cheap (a regression once hammered niri with `niri msg` IPC
@@ -44,7 +44,7 @@ import (
 const defaultOutput = "HDMI-A-1"
 
 // Payload is the pwetty `claude` tile data object for ONE niri desktop. The tile
-// is data-driven (contract: ~/Perso/pwetty-box-rs/tiles/claude/schema.json): a
+// is data-driven (contract: tiles/claude/schema.json in waybar-pwetty-box): a
 // Claude desktop carries `sessions` (1 -> single layout, 2 -> stacked dual), an
 // ordinary window carries is_claude=false + app/app_icon/title. Fields use
 // omitempty so an absent value falls back to the tile's schema default.
