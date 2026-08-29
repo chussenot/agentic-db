@@ -66,6 +66,39 @@ claude-recap-job daily force                                         # plain ret
 claude-recap-job weekly force "keep ci-base and datadog-ci separate"  # steered redo
 ```
 
+## Desktop integration (niri + waybar, Linux)
+
+There is no automated "wire up niri/waybar" step — `claude-status install`
+prints the fragments below and leaves them to a manual, one-time edit of your
+own git-tracked dotfiles (see [docs/cli.md](cli.md)). In order, on a fresh
+Linux box:
+
+1. `mise run install` — builds and puts the binary at
+   `~/.local/bin/claude-status`.
+2. `claude-status install` — merges the hook commands into
+   `~/.claude/settings.json` and (unless `--no-shell`) adds the
+   `claude-resume` block to `.zshrc`.
+3. **niri** (`config.kdl`) — start the daemon at login:
+   ```kdl
+   spawn-sh-at-startup "exec ~/.local/bin/claude-status daemon"
+   ```
+   niri also starts waybar itself (`spawn-at-startup "waybar"`), so nothing
+   further is needed there.
+4. **waybar** — run `claude-status gen-waybar`, paste the emitted
+   `format-icons` JSON into `config.jsonc` and the CSS into `style.css`. Each
+   bar/output needs one `cffi/pwetty#N` module per niri workspace (the
+   waybar-pwetty-box `claude` tile — see [architecture.md](architecture.md))
+   whose `exec` calls `claude-status tile-watch N` (add `--output <name>` for
+   a bar pinned to a non-primary output, e.g. `tile-watch --output eDP-1 1`).
+5. Reload: `killall -SIGUSR2 waybar` after a CSS-only change, a full waybar
+   restart after a `config.jsonc` change, and a niri/session restart (or just
+   re-running step 3's command by hand) to pick up a new daemon build —
+   `mise run install` does this flip automatically when a daemon is already
+   running.
+
+`claude-status uninstall` reverses steps 1–2; reverting 3–4 is manual (see its
+printed guidance).
+
 ## Testing without a desktop
 
 CI (one job, `mise run check`) exercises everything that runs by fixture or
