@@ -5,6 +5,7 @@
 package install
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -67,6 +68,11 @@ func Run(args []string) error {
 			fmt.Fprintf(out, "[dry-run]   settings file does not exist; would create it\n")
 		}
 		printMergeSummary(out, command, added, alreadyPresent, true)
+	} else if existed && len(added) == 0 {
+		// Nothing to merge: leave the file byte-for-byte alone. Re-marshalling
+		// would reorder keys and churn a (usually git-tracked) settings.json.
+		fmt.Fprintf(out, "left %s unchanged\n", resolvedSettings)
+		printMergeSummary(out, command, added, alreadyPresent, false)
 	} else {
 		if err := writeSettings(resolvedSettings, settings, existed); err != nil {
 			return err
@@ -160,14 +166,15 @@ func RunUninstall(args []string) error {
 		fmt.Fprintf(out, "settings file %s does not exist; nothing to remove\n", resolvedSettings)
 	} else {
 		removed := removeHooks(settings)
-		if err := writeSettings(resolvedSettings, settings, existed); err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "removed our hook entries from %s\n", resolvedSettings)
-		fmt.Fprintf(out, "  backup written to %s.bak\n", resolvedSettings)
 		if len(removed) == 0 {
+			fmt.Fprintf(out, "left %s unchanged\n", resolvedSettings)
 			fmt.Fprintf(out, "  (no %q entries were present)\n", hookMarker)
 		} else {
+			if err := writeSettings(resolvedSettings, settings, existed); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "removed our hook entries from %s\n", resolvedSettings)
+			fmt.Fprintf(out, "  backup written to %s.bak\n", resolvedSettings)
 			fmt.Fprintf(out, "  removed our hook from: %s\n", strings.Join(removed, ", "))
 		}
 		fmt.Fprintf(out, "  (bd prime and any other hooks left untouched)\n")
@@ -278,12 +285,15 @@ func writeSettings(path string, settings map[string]any, existed bool) error {
 			return err
 		}
 	}
-	data, err := json.MarshalIndent(settings, "", "  ")
-	if err != nil {
+	// SetEscapeHTML(false): keep "&", "<", ">" literal instead of \u0026 etc.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(settings); err != nil {
 		return fmt.Errorf("marshalling settings: %w", err)
 	}
-	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return nil
