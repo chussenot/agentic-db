@@ -847,7 +847,8 @@ func iconFromName(name string) string {
 }
 
 // appDirs are the freedesktop application-entry directories searched for a
-// matching .desktop file, in precedence order (user, flatpak exports, system).
+// matching .desktop file, in precedence order (user, flatpak exports, snapd
+// exports, system).
 func appDirs() []string {
 	var dirs []string
 	if home, err := os.UserHomeDir(); err == nil {
@@ -855,6 +856,10 @@ func appDirs() []string {
 	}
 	return append(dirs,
 		"/var/lib/flatpak/exports/share/applications",
+		// snapd publishes one <snap>_<app>.desktop per installed snap app here;
+		// their Icon= is an absolute path into /snap/<name>/current/meta/gui/,
+		// outside every icon-theme dir, which iconFromName/wrappedPNGIcon honor.
+		"/var/lib/snapd/desktop/applications",
 		"/usr/local/share/applications",
 		"/usr/share/applications",
 	)
@@ -862,14 +867,19 @@ func appDirs() []string {
 
 // desktopEntryIcon returns the Icon= of the .desktop entry that matches appID —
 // first by filename (<appID>.desktop), then by a StartupWMClass= equal to appID
-// (case-insensitive). This bridges a Wayland/X11 app_id to a differently named
-// icon (e.g. app_id "vesktop" -> Icon "dev.vencord.Vesktop"). "" if none.
+// (case-insensitive), and last by a Name= equal to appID (case-insensitive).
+// The WM-class pass bridges a Wayland/X11 app_id to a differently named icon
+// (e.g. app_id "vesktop" -> Icon "dev.vencord.Vesktop"). The Name= pass covers
+// snap-packaged Electron/Qt apps, which hand niri their display name as the
+// app_id (e.g. "Proton Mail") while their entry is named <snap>_<app>.desktop
+// and carries no StartupWMClass=. "" if none.
 func desktopEntryIcon(appID string) string {
 	for _, dir := range appDirs() {
-		if icon, _ := parseDesktop(filepath.Join(dir, appID+".desktop")); icon != "" {
+		if icon, _, _ := parseDesktop(filepath.Join(dir, appID+".desktop")); icon != "" {
 			return icon
 		}
 	}
+	byName := ""
 	for _, dir := range appDirs() {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -879,22 +889,28 @@ func desktopEntryIcon(appID string) string {
 			if e.IsDir() || !strings.HasSuffix(e.Name(), ".desktop") {
 				continue
 			}
-			icon, wm := parseDesktop(filepath.Join(dir, e.Name()))
-			if icon != "" && wm != "" && strings.EqualFold(wm, appID) {
+			icon, wm, name := parseDesktop(filepath.Join(dir, e.Name()))
+			if icon == "" {
+				continue
+			}
+			if wm != "" && strings.EqualFold(wm, appID) {
 				return icon
+			}
+			if byName == "" && name != "" && strings.EqualFold(name, appID) {
+				byName = icon // weaker than a WM-class match; keep scanning
 			}
 		}
 	}
-	return ""
+	return byName
 }
 
-// parseDesktop reads a .desktop file's Icon= and StartupWMClass= from its
-// [Desktop Entry] group (later groups like [Desktop Action …] are ignored).
+// parseDesktop reads a .desktop file's Icon=, StartupWMClass= and Name= from
+// its [Desktop Entry] group (later groups like [Desktop Action …] are ignored).
 // Missing file/keys -> empty strings.
-func parseDesktop(path string) (icon, wmClass string) {
+func parseDesktop(path string) (icon, wmClass, name string) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", ""
+		return "", "", ""
 	}
 	defer f.Close()
 	inEntry := false
@@ -915,10 +931,12 @@ func parseDesktop(path string) (icon, wmClass string) {
 			icon = v
 		} else if v, ok := cutKey(line, "StartupWMClass"); ok && wmClass == "" {
 			wmClass = v
+		} else if v, ok := cutKey(line, "Name"); ok && name == "" {
+			name = v // exact key: cutKey rejects the localized Name[xx]= forms
 		}
 	}
 	_ = sc.Err() // best-effort parse; a truncated read just yields fewer keys
-	return icon, wmClass
+	return icon, wmClass, name
 }
 
 // cutKey returns the value of a `Key=value` line for exactly key (so "Icon"

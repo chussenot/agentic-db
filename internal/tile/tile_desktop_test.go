@@ -18,17 +18,82 @@ func TestParseDesktop(t *testing.T) {
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	icon, wm := parseDesktop(p)
+	icon, wm, name := parseDesktop(p)
 	if icon != "dev.vencord.Vesktop" {
 		t.Errorf("Icon = %q, want dev.vencord.Vesktop", icon)
 	}
 	if wm != "vesktop" {
 		t.Errorf("StartupWMClass = %q, want vesktop", wm)
 	}
+	if name != "Vesktop" {
+		t.Errorf("Name = %q, want Vesktop", name)
+	}
 
 	// Missing file -> empty, no panic.
-	if i, w := parseDesktop(filepath.Join(dir, "nope.desktop")); i != "" || w != "" {
-		t.Errorf("missing file gave %q,%q", i, w)
+	if i, w, n := parseDesktop(filepath.Join(dir, "nope.desktop")); i != "" || w != "" || n != "" {
+		t.Errorf("missing file gave %q,%q,%q", i, w, n)
+	}
+}
+
+// TestDesktopEntryIconByName covers the snap-packaged app shape: niri reports
+// the display name ("Proton Mail") as the app_id, the entry is named
+// <snap>_<app>.desktop with no StartupWMClass=, and Icon= is an absolute path
+// under the snap's own meta/gui/ tree. HOME is redirected so the per-user
+// applications dir stands in for /var/lib/snapd/desktop/applications.
+func TestDesktopEntryIconByName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	apps := filepath.Join(home, ".local/share/applications")
+	if err := os.MkdirAll(apps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	iconPath := filepath.Join(home, "meta-gui", "icon.svg")
+	if err := os.MkdirAll(filepath.Dir(iconPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(iconPath, []byte("<svg/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	entry := "[Desktop Entry]\nName=Zz Snap Mail\nIcon=" + iconPath + "\nExec=zz-snap-mail\n"
+	if err := os.WriteFile(filepath.Join(apps, "zz-snap-mail_zz-snap-mail.desktop"), []byte(entry), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := desktopEntryIcon("Zz Snap Mail"); got != iconPath {
+		t.Errorf("desktopEntryIcon(display name) = %q, want %q", got, iconPath)
+	}
+	if got := desktopEntryIcon("zz snap mail"); got != iconPath {
+		t.Errorf("desktopEntryIcon is not case-insensitive on Name=: got %q", got)
+	}
+	if got := desktopEntryIcon("Zz Other App"); got != "" {
+		t.Errorf("desktopEntryIcon(no match) = %q, want empty", got)
+	}
+	// End to end: the absolute SVG path is honored directly, so the tile gets
+	// the real icon instead of the generic "app" glyph.
+	if got := resolveAppIcon("Zz Snap Mail"); got != iconPath {
+		t.Errorf("resolveAppIcon = %q, want %q", got, iconPath)
+	}
+}
+
+// TestDesktopEntryIconWMClassBeatsName pins the precedence: a StartupWMClass=
+// match is the stronger signal and wins over an earlier Name= match.
+func TestDesktopEntryIconWMClassBeatsName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	apps := filepath.Join(home, ".local/share/applications")
+	if err := os.MkdirAll(apps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	byName := "[Desktop Entry]\nName=zzprec\nIcon=by-name\n"
+	byClass := "[Desktop Entry]\nName=Other\nIcon=by-class\nStartupWMClass=zzprec\n"
+	if err := os.WriteFile(filepath.Join(apps, "a_name.desktop"), []byte(byName), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(apps, "b_class.desktop"), []byte(byClass), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := desktopEntryIcon("zzprec"); got != "by-class" {
+		t.Errorf("desktopEntryIcon = %q, want by-class (WM class over Name)", got)
 	}
 }
 
