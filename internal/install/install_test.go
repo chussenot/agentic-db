@@ -8,6 +8,21 @@ import (
 	"testing"
 )
 
+// TestMain points HOME, ZDOTDIR and XDG_STATE_HOME at a throwaway dir so Run's
+// shell step and state dir never touch the developer's real dotfiles.
+func TestMain(m *testing.M) {
+	tmp, err := os.MkdirTemp("", "install-test-home-")
+	if err != nil {
+		panic(err)
+	}
+	for _, k := range []string{"HOME", "ZDOTDIR", "XDG_STATE_HOME"} {
+		os.Setenv(k, tmp)
+	}
+	code := m.Run()
+	os.RemoveAll(tmp)
+	os.Exit(code)
+}
+
 // fixtureSettings mirrors the real ~/.claude/settings.json shape: a model, a
 // SessionStart hook running `bd prime`, and enabledPlugins.
 const fixtureSettings = `{
@@ -179,6 +194,39 @@ func TestInstallIdempotent(t *testing.T) {
 	}
 	if bd != 1 {
 		t.Errorf("bd prime present %d times, want 1: %v", bd, ss)
+	}
+}
+
+// A no-op install must not rewrite settings.json: re-marshalling would sort
+// keys and escape "&", churning a git-tracked dotfile.
+func TestInstallNoOpLeavesBytesUntouched(t *testing.T) {
+	path := writeFixture(t, fixtureSettings)
+	if err := Run([]string{"--settings", path, "--bin", "claude-status"}); err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	// Hand-edit: unsorted keys and an "&" the marshaller would escape.
+	before := readSettings(t, path)
+	hooks, _ := json.Marshal(before["hooks"])
+	handEdited := []byte(`{"zz": "a & b", "hooks": ` + string(hooks) + "}\n")
+	if err := os.WriteFile(path, handEdited, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path + ".bak"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Run([]string{"--settings", path, "--bin", "claude-status"}); err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(handEdited) {
+		t.Errorf("no-op install rewrote settings:\n got: %s\nwant: %s", got, handEdited)
+	}
+	if _, err := os.Stat(path + ".bak"); !os.IsNotExist(err) {
+		t.Errorf("no-op install wrote a backup (stat err: %v)", err)
 	}
 }
 
