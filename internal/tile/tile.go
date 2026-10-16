@@ -166,16 +166,18 @@ func CachePath(dbPath string) string {
 	return filepath.Join(filepath.Dir(dbPath), "tiles.json")
 }
 
-// emptyPayload is the placeholder for an absent/empty desktop: the shortcut on a
-// fully-faded idle bar, expressed as a single dimmed idle session row — a
-// windowless desktop is really a different preset (the bundled `empty` tile), NOT
-// a 0-row items array, which the contract forbids. Selecting that preset per
-// desktop is claude-status-db-wsh.
+// emptyPayload is the placeholder for an absent/empty desktop: the shortcut
+// over a dim hollow "empty" ring (pwetty's `draw_status` state="empty"), as a
+// single session row so it satisfies the data-driven `items` contract — a
+// windowless desktop is NOT a 0-row items array, which the contract forbids.
+// Distinct from a real `idle` session: a desktop with nothing open never shows
+// the idle decay bar. (Selecting the bundled `empty` preset per desktop instead
+// is claude-status-db-wsh.)
 func emptyPayload(idx int, active bool) Payload {
 	return Payload{
 		Shortcut: idx,
 		Active:   active,
-		Items:    []Item{{Kind: KindSession, State: string(state.Idle), IdleLevel: state.DecayLevels - 1}},
+		Items:    []Item{{Kind: KindSession, State: "empty"}},
 	}
 }
 

@@ -266,7 +266,7 @@ func TestPayloadForEmptyDesktop(t *testing.T) {
 	if len(p.Items) != 1 || !p.Active {
 		t.Fatalf("empty desktop placeholder wrong: %+v", p)
 	}
-	if s := p.Items[0]; s.Kind != KindSession || s.State != "idle" || s.IdleLevel == 0 || s.Folder != "" {
+	if s := p.Items[0]; s.Kind != KindSession || s.State != "empty" || s.IdleLevel != 0 || s.Folder != "" {
 		t.Fatalf("empty placeholder row wrong: %+v", s)
 	}
 }
